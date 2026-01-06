@@ -71,8 +71,11 @@ def scatter_comparison(true_values, predicted_values, lipid ):
     true_max = np.nanmax(true_values)
     predicted_min = np.nanmin(predicted_values)
     predicted_max = np.nanmax(predicted_values)
+    
+    correlation = np.corrcoef(true_values.flatten(), predicted_values.flatten())[0, 1]
+
     ax.plot([true_min, true_max],[true_min, true_max], "k--", lw=2)
-    density_scatter(ax, true_value, predicted_value,
+    density_scatter(ax, true_values, predicted_values,
                     x_min=true_min, x_max=true_max,
                     y_min=predicted_min, y_max=predicted_max,
                     s=0.1, alpha=0.1)
