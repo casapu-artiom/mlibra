@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -839,20 +840,41 @@ class MaldiExperiment:
             self.lgp_model.load_state_dict(vae_model_weights)
             vae=self.lgp_model
             voxel_model_file = self.config.exp_path / "voxel_diffusion.pt"
-            self.load_train_data()
-                # Diffusion dataset, normalized between 0,1
-            train_data_min = self.train_data.min(dim=0).values
-            train_data_max = self.train_data.max(dim=0).values
+            
+            # Load true_values in original scale for diffusion training
+            # This follows voxel_diffusion.py which uses true_values.npy
+            true_values = torch.tensor(np.load(self.config.exp_path / "train" / "true_values.npy"))
+            true_values_min = true_values.min()
+            true_values_max = true_values.max()
+            
+            # Determine padding based on channel count to match UNet requirements (often multiple of 16/32)
+            # In voxel_diffusion.py, hardcoded padding=(0,3) for 173 channels => 176
+            # We will use dynamic padding to nearest multiple of 16
+            n_channels = true_values.shape[1]
+            target_len = ((n_channels - 1) // 16 + 1) * 16
+            pad_len = target_len - n_channels
+            padding = (0, pad_len)
+            logging.info(f"Using padding {padding} for channels {n_channels} -> {target_len}")
 
             if not voxel_model_file.exists():
-                diffusion_dataset = torch.utils.data.TensorDataset((self.train_data - train_data_min) / (train_data_max - train_data_min), self.coordinates_train)
+                # Normalize [0, 1] using global min/max
+                norm_values = (true_values - true_values_min) / (true_values_max - true_values_min)
+                
+                # Make sure coordinates are loaded
+                if self.coordinates_train is None:
+                    self.load_coord_train_data()
+                    
+                diffusion_dataset = torch.utils.data.TensorDataset(norm_values, self.coordinates_train)
                 data_loader_train = torch.utils.data.DataLoader(
                     diffusion_dataset,
                     batch_size=100,
                     shuffle=True,
                     num_workers=0)
-                ddpm.train(data_loader_train, epochs=10,lr=2e-4,vae=vae)
-                ddpm.save_model(self.config.exp_path / "voxel_diffusion.pt")
+                
+                # Train with schedule similar to voxel_diffusion.py?
+                # Using simple training call as in existing code, but ensure params match
+                ddpm.train(data_loader_train, epochs=10, lr=2e-4, vae=vae)
+                ddpm.save_model(voxel_model_file)
             else:
                 logging.info("Loading voxel diffusion model from file")
                 ddpm.load_model(voxel_model_file, self.config.device)
@@ -860,54 +882,99 @@ class MaldiExperiment:
 
             # predict training set
             logging.info("Predicting in the training set using the diffusion model")
-            ccf_dataset = torch.utils.data.TensorDataset(torch.Tensor(self.ccf_train) )
-            ccf_dataloader = torch.utils.data.DataLoader(ccf_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=0)
-            predictions_list = []
-            with torch.no_grad():
-                train_predictions_diffusion_file = train_path / "predictions_diffusion.npy"
-                if not train_predictions_diffusion_file.exists():
-                    pass
+            train_predictions_diffusion_file = train_path / "predictions_diffusion.npy"
+            
+            if not train_predictions_diffusion_file.exists():
+                if self.coordinates_train is None:
+                    self.load_coord_train_data()
+                    
+                ccf_dataset = torch.utils.data.TensorDataset(self.coordinates_train)
+                ccf_dataloader = torch.utils.data.DataLoader(ccf_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=0)
+                predictions_list = []
+                
+                with torch.no_grad():
+                    for batch in tqdm(ccf_dataloader):
+                        coordinates_batch = batch[0].to(self.config.device)
+                        # LGP prediction (cond)
+                        cond, gp_posterior = self.lgp_model.predict(coordinates_batch)
+                        
+                        # Prepare for DDPM
+                        x_t = torch.randn(cond.shape[0], 1, cond.shape[1] + pad_len, device=self.config.device)
+                        
+                        # Apply padding to condition
+                        cond_padded = F.pad(cond, padding, "constant", 0)
+                        cond_padded = cond_padded.unsqueeze(1).to(self.config.device)
+                        
+                        # Sample
+                        sample_dict = ddpm.sample(x_t, cond_padded, gp_posterior.mean, n_steps=500, clip_denoised=True)
+                        
+                        # Process output as per voxel_diffusion.py logic
+                        cond_orig = cond.detach().cpu() # Original LGP output (standardized space)
+                        
+                        # Get DDPM prediction and unpad
+                        predictions = sample_dict["500"].squeeze().detach().cpu()
+                        if pad_len > 0:
+                            predictions = predictions[:, :-pad_len]
+                        
+                        # Rescale to original domain [min, max]
+                        predictions = predictions * (true_values_max - true_values_min) + true_values_min
+                        
+                        # Apply the subtraction logic from voxel_diffusion.py:
+                        # predictions = cond - predictions
+                        # Note: cond is in standardized space (mean=0, std=1), predictions is in Original space.
+                        # This matches the notebook exactly, regardless of physical interpretation.
+                        predictions = cond_orig - predictions
+                        
+                        # Un-standardize result
+                        predictions = predictions * self.train_std.cpu() + self.train_mean.cpu()
+                        
+                        predictions = predictions.numpy()
+                        if self.config.log_transform:
+                            predictions = np.exp(predictions) - 1e-10
+                            
+                        predictions_list.append(predictions)
+                        
+                train_predictions_diffusion = np.concatenate(predictions_list, axis=0)
+                np.save(train_predictions_diffusion_file, train_predictions_diffusion)
 
-                    # for batch in tqdm(ccf_dataloader):
-                    #     coordinates_batch = batch[0].to(self.config.device)
-                    #     cond, gp_posterior = self.lgp_model.predict(coordinates_batch)
-                    #     x_t = torch.randn(cond.shape[0], 1, cond.shape[1], device=self.config.device)
-                    #     cond = cond.unsqueeze(1).to(self.config.device)
-                    #     sample_dict = ddpm.sample(x_t, cond, gp_posterior.mean,n_steps=500,clip_denoised=True)
-                    #     cond = cond.squeeze().detach().cpu()
-                    #     predictions = sample_dict["500"].squeeze().detach().cpu()
-                    #     predictions = predictions *(train_data_max - train_data_min) + train_data_min
-                    #     predictions = cond - predictions
-                    #     predictions = predictions * self.train_std.cpu() + self.train_mean.cpu()
-                    #     predictions = predictions.numpy()
-                    #     if self.config.log_transform:
-                    #         predictions = np.exp(predictions) - 1e-10
-                    #     predictions_list.append(predictions)
-                    # # predictions_list is a list of numpy arrays, we need to concatenate them
-                    # train_predictions_diffusion = np.concatenate(predictions_list, axis=0)
-                    # np.save(train_predictions_diffusion_file, train_predictions_diffusion)
-
-                # predict test set
+            # predict test set
+            test_predictions_diffusion_file = test_path / "predictions_diffusion.npy"
+            if not test_predictions_diffusion_file.exists():
+                logging.info("Predicting in the test set using the diffusion model")
                 self.load_coord_test_data()
 
                 ccf_dataset = torch.utils.data.TensorDataset(self.coordinates_test)
                 ccf_dataloader = torch.utils.data.DataLoader(ccf_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=0)
                 predictions_list = []
-                for batch in tqdm(ccf_dataloader):
-                    coordinates_batch = batch[0].to(self.config.device)
-                    cond, gp_posterior = self.lgp_model.predict(coordinates_batch)
-                    x_t = torch.randn(cond.shape[0], 1, cond.shape[1], device=self.config.device)
-                    cond = cond.unsqueeze(1).to(self.config.device)
-                    sample_dict = ddpm.sample(x_t, cond, gp_posterior.mean,n_steps=500,clip_denoised=True)
-                    cond = cond.squeeze().detach().cpu()
-                    predictions = sample_dict["500"].squeeze().detach().cpu()
-                    predictions = predictions *(train_data_max - train_data_min) + train_data_min
-                    predictions = predictions * self.train_std.cpu() + self.train_mean.cpu()
-                    predictions = predictions + (cond * self.train_std.cpu() + self.train_mean.cpu())
-                    predictions = predictions.numpy()
-                    if self.config.log_transform:
-                        predictions = np.exp(predictions) - 1e-10
-                    predictions_list.append(predictions)
+                
+                with torch.no_grad():
+                    for batch in tqdm(ccf_dataloader):
+                        coordinates_batch = batch[0].to(self.config.device)
+                        cond, gp_posterior = self.lgp_model.predict(coordinates_batch)
+                        
+                        x_t = torch.randn(cond.shape[0], 1, cond.shape[1] + pad_len, device=self.config.device)
+                        
+                        cond_padded = F.pad(cond, padding, "constant", 0)
+                        cond_padded = cond_padded.unsqueeze(1).to(self.config.device)
+                        
+                        sample_dict = ddpm.sample(x_t, cond_padded, gp_posterior.mean, n_steps=500, clip_denoised=True)
+                        
+                        cond_orig = cond.detach().cpu()
+                        predictions = sample_dict["500"].squeeze().detach().cpu()
+                        if pad_len > 0:
+                            predictions = predictions[:, :-pad_len]
+                            
+                        predictions = predictions * (true_values_max - true_values_min) + true_values_min
+                        
+                        # Apply same logic
+                        predictions = cond_orig - predictions
+                        predictions = predictions * self.train_std.cpu() + self.train_mean.cpu()
+                        
+                        predictions = predictions.numpy()
+                        if self.config.log_transform:
+                            predictions = np.exp(predictions) - 1e-10
+                            
+                        predictions_list.append(predictions)
+                        
                 test_predictions_diffusion = np.concatenate(predictions_list, axis=0)
-                test_predictions_diffusion_file = test_path / "predictions_diffusion.npy"
                 np.save(test_predictions_diffusion_file, test_predictions_diffusion)
