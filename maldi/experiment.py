@@ -609,8 +609,43 @@ class MaldiExperiment:
         else:
             logging.error("Model not found. Please run the experiment first.")
             return
+        
+        # Diffusion setup if enabled
+        ddpm = None
+        unet = None
+        true_values_min = None
+        true_values_max = None
+        padding = None
+        pad_len = 0
 
-        volume_path = self.config.exp_path / "volume"
+        if self.config.use_diffusion:
+            volume_path = self.config.exp_path / "volume_diffusion"
+            # load diffusion model
+            from l3di.simple_ddpm1d import SimpleDDPM1D, SimpleUNet1D
+            unet = SimpleUNet1D(in_channels=1, model_channels=64, out_channels=1, z_dim=self.config.latent_dim)
+            ddpm = SimpleDDPM1D(unet,T=1000,var_type="fixedsmall")
+            
+            voxel_model_file = self.config.exp_path / "voxel_diffusion.pt"
+            if not voxel_model_file.exists():
+                 logging.error("Voxel diffusion model not found. Run experiment with diffusion enabled first.")
+                 return
+            ddpm.load_model(voxel_model_file, self.config.device)
+            
+            # Need min/max for scaling
+            # Load true_values in original scale 
+            true_values = self.true_values_train
+            true_values = torch.tensor(true_values)
+            true_values_min = true_values.min()
+            true_values_max = true_values.max()
+            
+            # Padding
+            n_channels = true_values.shape[1]
+            target_len = ((n_channels - 1) // 16 + 1) * 16
+            pad_len = target_len - n_channels
+            padding = (0, pad_len)
+        else:
+            volume_path = self.config.exp_path / "volume"
+            
         volume_path.mkdir(parents=True, exist_ok=True)
         template_file = volume_path / "template_volume.npy"
         if not template_file.exists():
@@ -646,17 +681,51 @@ class MaldiExperiment:
                 coordinates_batch = batch[0].to(self.config.device)
                 indices_batch = batch[1]
                 predictions, gp_posterior = self.lgp_model.predict(coordinates_batch)
-                # we save the coordinates the indices and the predictions in a single file
-                predictions = predictions * self.train_std + self.train_mean
-                predictions = predictions.detach().cpu().numpy()
-                if self.config.log_transform:
-                    predictions = np.exp(predictions) - 1e-10
-                torch.save({
-                    "coordinates": coordinates_batch.cpu(),
-                    "indices": indices_batch.cpu(),
-                    "predictions": predictions,
-                    "posterior": gp_posterior.mean.detach().cpu()
-                }, batch_file)
+                
+                if self.config.use_diffusion and ddpm is not None:
+                    cond = predictions
+                    x_t = torch.randn(cond.shape[0], 1, cond.shape[1] + pad_len, device=self.config.device)
+                    
+                    cond_padded = F.pad(cond, padding, "constant", 0)
+                    cond_padded = cond_padded.unsqueeze(1).to(self.config.device)
+                    
+                    sample_dict = ddpm.sample(x_t, cond_padded, gp_posterior.mean, n_steps=500, clip_denoised=True)
+                    
+                    # Post processing
+                    # Get DDPM prediction and unpad
+                    ddpm_pred = sample_dict["500"].squeeze().detach().cpu()
+                    if pad_len > 0:
+                        ddpm_pred = ddpm_pred[:, :-pad_len]
+                    
+                    # Rescale to original domain [min, max]
+                    ddpm_pred = ddpm_pred * (true_values_max - true_values_min) + true_values_min
+                    
+                    # Apply subtraction logic: prediction = LGP - DDPM(residual)
+                    final_predictions = cond.detach().cpu() - ddpm_pred
+                    final_predictions = final_predictions * self.train_std.cpu() + self.train_mean.cpu()
+                    final_predictions = final_predictions.numpy()
+                    
+                    if self.config.log_transform:
+                         final_predictions = np.exp(final_predictions) - 1e-10
+                         
+                    torch.save({
+                        "coordinates": coordinates_batch.cpu(),
+                        "indices": indices_batch.cpu(),
+                        "predictions": final_predictions,
+                        # "posterior": gp_posterior.mean.detach().cpu() # Optional
+                    }, batch_file)
+                else:
+                    # we save the coordinates the indices and the predictions in a single file
+                    predictions = predictions * self.train_std + self.train_mean
+                    predictions = predictions.detach().cpu().numpy()
+                    if self.config.log_transform:
+                        predictions = np.exp(predictions) - 1e-10
+                    torch.save({
+                        "coordinates": coordinates_batch.cpu(),
+                        "indices": indices_batch.cpu(),
+                        "predictions": predictions,
+                        "posterior": gp_posterior.mean.detach().cpu()
+                    }, batch_file)
 
     def load_whole_brain_reconstruction(self, lipid):
         """
@@ -667,7 +736,13 @@ class MaldiExperiment:
         Args:
             lipid (int): The index of the lipid to reconstruct.
         """
-        volume_path = self.config.exp_path / "volume"
+        if self.config.use_diffusion:
+             volume_path = self.config.exp_path / "volume_diffusion"
+             suffix = "_diffusion"
+        else:
+             volume_path = self.config.exp_path / "volume"
+             suffix = ""
+
         template_file = volume_path / "template_volume.npy"
         if not template_file.exists():
             logging.error("Template volume does not exist. Please run whole_brain_reconstruction() first.")
@@ -678,7 +753,7 @@ class MaldiExperiment:
         template_volume = np.zeros_like(template_volume, dtype=np.float32)
 
         lipid_name = self.config.selected_lipids_names[lipid]
-        lipid_volume_name = self.config.exp_path / f"{lipid_name}_volume.npy"
+        lipid_volume_name = self.config.exp_path / f"{lipid_name}_volume{suffix}.npy"
         if lipid_volume_name.exists():
             logging.info(f"Lipid volume for {lipid_name} already exists, loading from file")
             lipid_volume = np.load(lipid_volume_name)
@@ -700,7 +775,7 @@ class MaldiExperiment:
             np.save(lipid_volume_name, template_volume)
             logging.info(f"Lipid volume for {lipid_name} saved to {lipid_volume_name}")
             template_volume = 255*( template_volume - np.nanmin(template_volume)) / (np.nanmax(template_volume)- np.nanmin(template_volume))
-            np.save(self.config.exp_path / f"{lipid_name}_volume255.npy", template_volume)
+            np.save(self.config.exp_path / f"{lipid_name}_volume255{suffix}.npy", template_volume)
             return template_volume
 
     def train_fit(self):
