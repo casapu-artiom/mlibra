@@ -1,1 +1,14 @@
 .aider*
+maldi/mouse_connectivity
+maldi/.DS_store
+maldi/output_images
+maldi/reference.py
+ralph.sh
+reflect.sh
+sshd_config
+.DS_Store
+CONVENTIONS.md
+MAP.md
+PRD.json
+REFLECT.md
+generate_map.py
