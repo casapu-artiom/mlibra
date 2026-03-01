@@ -15,7 +15,10 @@ KERNEL="symmetric"
 MODE="lgp"
 AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
 cd /myhome/mlibra/
-pip install -e .
+echo $PWD
+source /myhome/mlibra/.venv/bin/activate
+echo $PS1
+pip install --user /myhome/mlibra
 python /myhome/mlibra/maldi/lgp_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
