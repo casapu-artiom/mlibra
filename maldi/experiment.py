@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import gpytorch.settings
 from tqdm import tqdm
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -117,11 +118,38 @@ class MaldiExperiment:
                                                     columns=coordinates_names,
                                                     filters=self.train_filter).values
 
+    def load_train_pixel_index_coordinates(self):
+        logging.info("Loading training pixel coordinates")
+        # Using 'x' and 'y' as per your data
+        pixel_names = ["x_index", "y_index", "z_index"] 
+        self.pixel_index_coordinates_train = torch.tensor(pd.read_parquet(
+            self.config.maldi_file,
+            columns=pixel_names,
+            filters=self.train_filter
+        ).values, dtype=torch.float32)
+
+    def load_test_pixel_index_coordinates(self):
+        logging.info("Loading training pixel coordinates")
+        # Using 'x' and 'y' as per your data
+        pixel_names = ["x_index", "y_index", "z_index"] 
+        self.pixel_index_coordinates_test = torch.tensor(pd.read_parquet(
+            self.config.maldi_file,
+            columns=pixel_names,
+            filters=self.test_filter
+        ).values, dtype=torch.float32)
+
     def load_train_samples(self):
         logging.info("Loading training samples")
         self.train_samples = pd.read_parquet(self.config.maldi_file,
                                              columns=["Sample"],
                                              filters=self.train_filter)
+        
+    def load_test_samples(self):
+        logging.info("Loading training samples")
+        self.test_samples = pd.read_parquet(self.config.maldi_file,
+                                             columns=["Sample"],
+                                             filters=self.test_filter)
+
 
     def load_train_data(self):
         self.train_data = pd.read_parquet(self.config.maldi_file,
@@ -592,6 +620,47 @@ class MaldiExperiment:
         ax.set_ylabel(f"{lipid} (predicted)")
         plt.show()
 
+    def maybe_download_template_brainglobe(self, volume_path, template_file):
+        if not template_file.exists():
+            logging.info("Downloading template volume via BrainGlobe Atlas API...")
+            
+            # Import BrainGlobe instead of AllenSDK
+            from bg_atlasapi.bg_atlas import BrainGlobeAtlas
+            
+            # This automatically downloads, unpacks, and caches the 25um Allen CCF
+            atlas = BrainGlobeAtlas("allen_mouse_25um")
+            template_volume = atlas.reference
+            
+            logging.info(f"Template volume shape: {template_volume.shape}")
+            logging.info(f"Template volume data type: {template_volume.dtype}")
+            
+            volume_path.mkdir(parents=True, exist_ok=True)
+            np.save(template_file, template_volume)
+        else:
+            logging.info("Template volume already exists, loading from file")
+            template_volume = np.load(template_file)    
+
+        return template_volume
+
+    def maybe_download_template_allensdk(self, volume_path, template_file):
+        if not template_file.exists():
+            logging.info("Downloading template volume...")
+            from allensdk.core.mouse_connectivity_cache import MouseConnectivityCache
+            # Specify the resolution you want for the template volume (in microns)
+            resolution_um = 25
+            mcc = MouseConnectivityCache(resolution=resolution_um)
+            logging.info(f"Downloading/loading reference TEMPLATE volume at {resolution_um} um resolution...")
+            template_volume, _ = mcc.get_template_volume()
+            logging.info(f"Template volume shape: {template_volume.shape}")
+            logging.info(f"Template volume data type: {template_volume.dtype}")
+
+            volume_path.mkdir(parents=True, exist_ok=True)
+            np.save(template_file, template_volume)
+        else:
+            logging.info("Template volume already exists, loading from file")
+            template_volume = np.load(template_file)
+        return template_volume
+
     def whole_brain_reconstruction(self):
         """
         Reconstructs the whole brain volume for all lipids using the trained model.
@@ -648,20 +717,7 @@ class MaldiExperiment:
             
         volume_path.mkdir(parents=True, exist_ok=True)
         template_file = volume_path / "template_volume.npy"
-        if not template_file.exists():
-            logging.info("Downloading template volume...")
-            from allensdk.core.mouse_connectivity_cache import MouseConnectivityCache
-            # Specify the resolution you want for the template volume (in microns)
-            resolution_um = 25
-            mcc = MouseConnectivityCache(resolution=resolution_um)
-            logging.info(f"Downloading/loading reference TEMPLATE volume at {resolution_um} um resolution...")
-            template_volume, _ = mcc.get_template_volume()
-            logging.info(f"Template volume shape: {template_volume.shape}")
-            logging.info(f"Template volume data type: {template_volume.dtype}")
-            np.save(template_file, template_volume)
-        else:
-            logging.info("Template volume already exists, loading from file")
-            template_volume = np.load(template_file)
+        template_volume = self.maybe_download_template_brainglobe(volume_path, template_file)
         non_zero_indices = np.argwhere(template_volume > 5)
         # concert from 25 um to 1 mm
         non_zero_ccf = non_zero_indices * 0.025
@@ -763,7 +819,7 @@ class MaldiExperiment:
                 batch_file = volume_path / f"batch_{i}.pth"
                 if not batch_file.exists():
                     continue
-                batch_data = torch.load(batch_file)
+                batch_data = torch.load(batch_file, weights_only=False)
                 template_volume[batch_data["indices"][:, 0].long(),
                                 batch_data["indices"][:, 1].long(),
                                 batch_data["indices"][:, 2].long()] = batch_data["predictions"][:, lipid]
@@ -794,12 +850,13 @@ class MaldiExperiment:
             logging.info("Model file not found, starting training from scratch")
             if self.current_epoch < self.config.epochs:
                 logging.info(f"Starting training from epoch {self.current_epoch}")
-                self.lgp_model.train_model(self.config.exp_path,
-                                      dataloader_train,
-                                      optimizer,
-                                      epochs=self.config.epochs,
-                                      current_epoch=self.current_epoch,
-                                      print_every=1000)
+                with gpytorch.settings.cholesky_jitter(1e-3, 1e-4):
+                    self.lgp_model.train_model(self.config.exp_path,
+                                        dataloader_train,
+                                        optimizer,
+                                        epochs=self.config.epochs,
+                                        current_epoch=self.current_epoch,
+                                        print_every=1000)
 
     def predict_original_scale(self, train_predictions, test_predictions):
         if self.train_data is None:
@@ -825,6 +882,52 @@ class MaldiExperiment:
         np.save(self.config.exp_path / "test" / "predictions.npy", test_predictions.numpy())
         np.save(self.config.exp_path / "train" / "true_values.npy", train_data.numpy())
         np.save(self.config.exp_path / "test" / "true_values.npy", test_data.numpy())
+
+    def predict_original_scale_(self, train_predictions, test_predictions):
+        if self.train_data is None:
+            self.load_train_data()
+        if self.test_data is None:
+            self.load_test_data()
+            
+        logging.info("Evaluating predictions (Memory Safe Mode)")
+        
+        # Ensure std and mean are on CPU
+        stds = self.col_stds.cpu()
+        means = self.col_means.cpu()
+
+        # 1. IN-PLACE math on predictions (use .mul_() and .add_())
+        train_predictions.mul_(stds).add_(means)
+        test_predictions.mul_(stds).add_(means)
+
+        if self.config.log_transform:
+            # IN-PLACE NumPy exponentiation
+            np.exp(train_predictions.numpy(), out=train_predictions.numpy())
+            train_predictions.sub_(1e-10)
+            
+            np.exp(test_predictions.numpy(), out=test_predictions.numpy())
+            test_predictions.sub_(1e-10)
+
+        # 2. IN-PLACE math on original data
+        self.train_data.mul_(stds).add_(means)
+        self.test_data.mul_(stds).add_(means)
+
+        if self.config.log_transform:
+            np.exp(self.train_data.numpy(), out=self.train_data.numpy())
+            self.train_data.sub_(1e-10)
+            
+            np.exp(self.test_data.numpy(), out=self.test_data.numpy())
+            self.test_data.sub_(1e-10)
+
+        # 3. Save to disk (Releasing memory as it goes)
+        logging.info("Saving numpy files to disk...")
+        self.train_data_original = self.train_data.numpy()
+        self.test_data_original = self.test_data.numpy()
+        
+        np.save(self.config.exp_path / "train" / "predictions.npy", train_predictions.numpy())
+        np.save(self.config.exp_path / "test" / "predictions.npy", test_predictions.numpy())
+        np.save(self.config.exp_path / "train" / "true_values.npy", self.train_data_original)
+        np.save(self.config.exp_path / "test" / "true_values.npy", self.test_data_original)
+        logging.info("Predictions saved successfully.")
 
     def run(self):
         """Run the experiment."""
@@ -853,24 +956,34 @@ class MaldiExperiment:
         train_predictions_file = train_path / "predictions.pth"
         if not train_predictions_file.exists():
             self.load_coord_train_data()
+            self.load_train_pixel_index_coordinates()
             logging.info("Predicting in the train set")
             self.lgp_model.eval()
-            train_pred_dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(self.coordinates_train),
+            train_pred_dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(self.coordinates_train, self.pixel_index_coordinates_train),
                                                                 batch_size=self.config.batch_size,
                                                                 shuffle=False,
                                                                 num_workers=0)
             logging.info("Predicting in the train set using the model")
             predictions_list = []
             posterior_list = []
+            coordinates_list = []
+            coordinates_pixel_index_list = []
             for batch in tqdm(train_pred_dataloader):
                 coordinates_batch = batch[0].to(self.config.device)
+                coordinates_pixel_index = batch[1].to(self.config.device)
                 predictions, gp_posterior = self.lgp_model.predict(coordinates_batch)
+                coordinates_list.append(coordinates_batch.detach().cpu())
+                coordinates_pixel_index_list.append(coordinates_pixel_index.detach().cpu())
                 predictions_list.append(predictions.detach().cpu())
                 posterior_list.append(gp_posterior.mean.detach().cpu())
             train_predictions = torch.cat(predictions_list, dim=0)
             posterior = torch.cat(posterior_list, dim=0)
+            coordinates = torch.cat(coordinates_list, dim=0)
+            coordinates_pixel_index = torch.cat(coordinates_pixel_index_list, dim=0)
             torch.save(train_predictions, train_predictions_file)
             torch.save(posterior, train_predictions_file.with_name("posterior.pth"))
+            torch.save(coordinates, train_predictions_file.with_name("coordinates.pth"))
+            torch.save(coordinates_pixel_index, train_predictions_file.with_name("coordinates_pixel_index.pth"))
         else:
             logging.info("Train predictions already exist, loading from file")
             train_predictions = torch.load(train_predictions_file)
@@ -884,22 +997,31 @@ class MaldiExperiment:
             self.load_coord_test_data()
             logging.info("Predicting in the test set")
             self.lgp_model.eval()
-            self.load_coord_test_data()
-            test_pred_dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(self.coordinates_test),
+            self.load_test_pixel_index_coordinates()
+            test_pred_dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(self.coordinates_test, self.pixel_index_coordinates_test),
                                                                batch_size=self.config.batch_size,
                                                                shuffle=False,
                                                                num_workers=0)
             predictions_list = []
             posterior_list = []
+            coordinates_list = []
+            coordinates_pixel_index_list = []
             for batch in tqdm(test_pred_dataloader):
                 coordinates_batch = batch[0].to(self.config.device)
+                coordinates_pixel_index = batch[1].to(self.config.device)
                 predictions,posterior = self.lgp_model.predict(coordinates_batch)
+                coordinates_list.append(coordinates_batch.detach().cpu())
+                coordinates_pixel_index_list.append(coordinates_pixel_index.detach().cpu())
                 predictions_list.append(predictions.detach().cpu())
                 posterior_list.append(posterior.mean.detach().cpu())
             test_predictions = torch.cat(predictions_list, dim=0)
             posterior = torch.cat(posterior_list, dim=0)
+            coordinates = torch.cat(coordinates_list, dim=0)
+            coordinates_pixel_index = torch.cat(coordinates_pixel_index_list, dim=0)
             torch.save(test_predictions, test_predictions_file)
             torch.save(posterior, test_predictions_file.with_name("posterior.pth"))
+            torch.save(coordinates, test_predictions_file.with_name("coordinates.pth"))
+            torch.save(coordinates_pixel_index, test_predictions_file.with_name("coordinates_pixel_index.pth"))
         else:
             logging.info("Test predictions already exist, loading from file")
             test_predictions = torch.load(test_predictions_file)
@@ -907,7 +1029,7 @@ class MaldiExperiment:
         test_predictions_file = test_path / "predictions.npy"
         if not train_predictions_file.exists() or not test_predictions_file.exists():
             logging.info("Train and test numpy predictions do not exist, saving predictions to file")
-            predict_original_scale = self.predict_original_scale(train_predictions, test_predictions)
+            predict_original_scale = self.predict_original_scale_(train_predictions, test_predictions)
 
         if self.config.use_diffusion:
             logging.info("Using diffusion model for the experiment")

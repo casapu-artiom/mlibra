@@ -24,8 +24,6 @@ RUN python3 -m pip install --no-cache-dir -U pip && \
 RUN conda config --system --set channel_priority flexible && \
     conda clean --all -f -y
 
-
-
 FROM $BASE_IMAGE
 
 LABEL maintainer="Swiss Data Science Center <info@datascience.ch>"

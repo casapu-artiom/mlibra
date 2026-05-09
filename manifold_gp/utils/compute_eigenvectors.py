@@ -1,0 +1,479 @@
+#!/usr/bin/env python
+# encoding: utf-8
+"""
+Laplacian eigensolver for Riemann manifold kernels.
+
+Extracts the eigendecomposition of a graph Laplacian out of RiemannKernel into
+a standalone, cacheable component. Two reasons for this:
+
+  1. Eigendecomposition is the slowest part of building a manifold kernel
+     (minutes to hours for >1M-node graphs). Computing it once and reusing
+     across experiments saves a lot of wall time.
+
+  2. The eigenvectors only depend on graph topology, the bandwidth, and the
+     normalization choice -- they don't depend on the data, the GP
+     hyperparameters, or which downstream model uses them. Tying them to the
+     kernel's lifecycle made caching ad-hoc.
+
+Usage
+-----
+A) One-shot compute (no cache):
+
+       op = kernel.laplacian()                      # GraphLaplacianOperator
+       solver = LaplacianEigensolver(num_modes=200)
+       eigval, eigvec = solver.compute(op)
+       kernel.attach_eigenpairs(eigval, eigvec)
+
+B) Compute-or-load (with disk cache):
+
+       solver = LaplacianEigensolver(num_modes=200)
+       eigval, eigvec = solver.compute_or_load(
+           kernel.laplacian(),
+           cache_dir=Path("cache/eigvecs"),
+           key="allenccf_stride4_knn5_modes200_sym",
+           graphbandwidth=kernel.graphbandwidth.item(),
+           laplacian_normalization=kernel.laplacian_normalization,
+           extra={"stride": 4, "knn": 5, "template": "allen_25um"},
+       )
+       kernel.attach_eigenpairs(eigval, eigvec)
+
+Cache identity
+--------------
+You own the `key`. Compose it from whatever uniquely identifies your run --
+template name, stride, KNN method, K, threshold, num_modes, normalization,
+etc. The helper `make_key({...})` will format a dict deterministically into
+a filesystem-safe string.
+
+Alongside the cached arrays we store a fingerprint:
+    {n_nodes, n_edges, num_modes, normalization, graphbandwidth,
+     edge_value_mean, edge_value_std, backend}
+On load we verify it matches the operator passed at the call site. Mismatches
+emit a warning and trigger recompute (or raise, with strict_fingerprint=True).
+This catches the case where someone reuses a key across two runs that aren't
+really the same graph.
+
+If the cached file has MORE eigenvectors than requested, we just truncate.
+If it has fewer, that's a mismatch -> recompute.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+import wandb
+
+import numpy as np
+import torch
+from torch.nn.functional import normalize as l2_normalize
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint
+# ---------------------------------------------------------------------------
+@dataclass
+class EigenFingerprint:
+    """Structural summary of the Laplacian we eigendecomposed.
+
+    Stored next to the cached arrays, checked on load. Mismatches don't crash
+    by default -- they emit a warning and trigger recompute. Pass
+    strict_fingerprint=True to LaplacianEigensolver if you want hard failure.
+    """
+    n_nodes: int
+    n_edges: int
+    num_modes: int
+    laplacian_normalization: str
+    graphbandwidth: float
+    edge_value_mean: float
+    edge_value_std: float
+    backend: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "EigenFingerprint":
+        return cls(**{k: d[k] for k in cls.__dataclass_fields__})
+
+    def matches(self, other: "EigenFingerprint",
+                rtol: float = 1e-4) -> Tuple[bool, str]:
+        """Strict on shape/normalization, tolerant on floats.
+
+        Note we ALLOW cached.num_modes >= requested.num_modes -- if the cache
+        has 500 modes and you ask for 200, you get the first 200. We only
+        fail if the cache is too small.
+        """
+        if self.n_nodes != other.n_nodes:
+            return False, f"n_nodes {self.n_nodes} vs {other.n_nodes}"
+        if self.n_edges != other.n_edges:
+            return False, f"n_edges {self.n_edges} vs {other.n_edges}"
+        if self.laplacian_normalization != other.laplacian_normalization:
+            return False, (
+                f"normalization {self.laplacian_normalization!r} vs "
+                f"{other.laplacian_normalization!r}"
+            )
+        if self.num_modes < other.num_modes:
+            return False, (
+                f"cached has {self.num_modes} modes, requested {other.num_modes}"
+            )
+        for fld in ("graphbandwidth", "edge_value_mean", "edge_value_std"):
+            a, b = getattr(self, fld), getattr(other, fld)
+            if abs(a - b) > rtol * (abs(a) + abs(b) + 1e-12):
+                return False, f"{fld} differs: {a:.6g} vs {b:.6g}"
+        return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
+class LaplacianEigensolver:
+    """Compute (or load) the smallest eigenpairs of a graph Laplacian.
+
+    Backend
+    -------
+    'cupy'  -- GPU-accelerated CuPy Lanczos (cupyx.scipy.sparse.linalg.eigsh).
+               Default. Matches the original RiemannKernel behavior bit-for-bit.
+    'scipy' -- CPU fallback. Uses shift-invert at sigma=0, which CuPy doesn't
+               support; results are equivalent up to numerical noise.
+
+    Post-processing (the same regardless of backend, as it was inline in
+    RiemannKernel.eval before):
+      1. Truncate to num_modes (Lanczos sometimes overshoots).
+      2. Force the smallest eigenvalue to 0 exactly. Theoretical value for the
+         Laplacian on a connected graph; numerical noise pushes it to ~1e-12.
+      3. De-normalize the symmetric Laplacian eigenvectors to recover the
+         random-walk eigenvectors:  phi = D^(-1/2) phi_sym
+      4. L2-normalize each eigenvector column for numerical stability.
+    """
+
+    def __init__(self,
+                 num_modes: int = 200,
+                 backend: str = "cupy",
+                 tol: float = 1e-4,
+                 ncv_min: int = 1500,
+                 strict_fingerprint: bool = False,
+                 verbose: bool = True):
+        if backend not in ("cupy", "scipy"):
+            raise ValueError(f"Unknown backend: {backend!r}")
+        self.num_modes = num_modes
+        self.backend = backend
+        self.tol = tol
+        self.ncv_min = ncv_min
+        self.strict_fingerprint = strict_fingerprint
+        self.verbose = verbose
+
+    # -------------------------------------------------------------- compute
+    def compute(self, laplacian_op) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Solve for the bottom `num_modes` eigenpairs.
+
+        Args:
+          laplacian_op: GraphLaplacianOperator -- exposes .idx,
+                        .laplacian_triu, .laplacian_diag, .degree_mat,
+                        .operator_dimension. (Same object that
+                        RiemannKernel.laplacian() returns.)
+
+        Returns:
+          eigval: (num_modes,)   float on the operator's device
+          eigvec: (N, num_modes) float on the operator's device, with all the
+                  post-processing already applied -- the kernel just installs
+                  these directly.
+        """
+        if self.backend == "cupy":
+            evals, evecs = self._compute_cupy(laplacian_op)
+        else:
+            evals, evecs = self._compute_scipy(laplacian_op)
+        return self._postprocess(evals, evecs, laplacian_op)
+
+    def _compute_cupy(self, op) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Lazy imports so users without CuPy can still use the scipy backend.
+        import cupy as cp
+        import cupyx.scipy.sparse as cpsparse
+        import cupyx.scipy.sparse.linalg as cplinalg
+        import scipy.sparse as sp
+        from tqdm import tqdm
+
+        N = op.operator_dimension
+        idx = op.idx.cpu()
+        val = op.laplacian_triu.cpu()
+        diag = op.laplacian_diag.cpu()
+
+        # SciPy CSR is the easiest way to assemble the symmetric L from the
+        # upper triangle + diagonal that GraphLaplacianOperator gives us.
+        row, col = idx[0].numpy(), idx[1].numpy()
+        L_scipy = sp.csr_matrix((-val.numpy(), (row, col)), shape=(N, N))
+        L_scipy = L_scipy + L_scipy.T
+        L_scipy.setdiag(diag.numpy())
+
+        if self.verbose:
+            nnz = L_scipy.nnz
+            density = (nnz / (N * N)) * 100
+            print(f"[eigensolver] N={N:,}  NNZ={nnz:,}  density={density:.6f}%")
+
+        # Hand off to GPU
+        L_cp = cpsparse.csr_matrix(L_scipy)
+
+        # Wrap the SpMV with a tracker that reports to both tqdm and wandb
+        class _Tracked(cplinalg.LinearOperator):
+            def __init__(self, A, verbose):
+                super().__init__(A.dtype, A.shape)
+                self.A = A
+                self.pbar = tqdm(desc="[eigensolver] CuPy Lanczos SpMV",
+                                 leave=False, disable=not verbose)
+                
+                # Tracking state for W&B
+                self.iteration_count = 0
+                self.last_log_time = time.time()
+                self.log_interval_seconds = 2.0  # Only ping W&B every 2 seconds
+
+            def _matvec(self, x):
+                self.iteration_count += 1
+                self.pbar.update(1)
+                
+                # Throttled W&B logging
+                current_time = time.time()
+                if current_time - self.last_log_time > self.log_interval_seconds:
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log({
+                            "solver/spmv_iterations": self.iteration_count,
+                            "solver/iters_per_sec": self.iteration_count / max(1e-5, current_time - self.last_log_time + self.log_interval_seconds) # rough speed
+                        })
+                    self.last_log_time = current_time
+                    
+                return self.A @ x
+
+        op_tracked = _Tracked(L_cp, self.verbose)
+
+        # ncv (Krylov subspace size) > 2k helps when eigenvalues cluster, which
+        # they do for smooth manifold modes. Bumping to >=1500 was the original
+        # tuned default.
+        ncv = min(N, max(2 * self.num_modes + 1, self.ncv_min))
+
+        evals_cp, evecs_cp = cplinalg.eigsh(
+            op_tracked,
+            k=self.num_modes,
+            which="SA",   # smallest algebraic; CuPy doesn't support sigma=0
+            tol=self.tol,
+            ncv=ncv,
+        )
+        # Numerical noise can produce small negatives at the bottom of the
+        # spectrum, especially with disconnected components. Clamp them.
+        evals_cp = cp.clip(evals_cp, a_min=0.0, a_max=None)
+
+        cp.cuda.Stream.null.synchronize()
+        op_tracked.pbar.close()
+
+        # Drop the host-side scratch matrix; the GPU operator hangs onto its
+        # own copy until eigsh returns.
+        del L_scipy, L_cp
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # CuPy -> torch (zero-copy via dlpack when possible).
+        if hasattr(evecs_cp, "toDlpack"):
+            evals = torch.from_dlpack(evals_cp.toDlpack()).float()
+            evecs = torch.from_dlpack(evecs_cp.toDlpack()).float()
+        else:
+            evals = torch.from_numpy(cp.asnumpy(evals_cp)).float().cuda()
+            evecs = torch.from_numpy(cp.asnumpy(evecs_cp)).float().cuda()
+
+        return evals, evecs
+
+    def _compute_scipy(self, op) -> Tuple[torch.Tensor, torch.Tensor]:
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as sla
+
+        N = op.operator_dimension
+        idx = op.idx.cpu()
+        val = op.laplacian_triu.cpu()
+        diag = op.laplacian_diag.cpu()
+
+        row, col = idx[0].numpy(), idx[1].numpy()
+        L_scipy = sp.csr_matrix((-val.numpy(), (row, col)), shape=(N, N))
+        L_scipy = L_scipy + L_scipy.T
+        L_scipy.setdiag(diag.numpy())
+
+        if self.verbose:
+            print(f"[eigensolver] (scipy) N={N:,}  NNZ={L_scipy.nnz:,}")
+
+        # Shift-invert at sigma=0 finds eigenvalues closest to zero efficiently.
+        # This is the better choice on CPU; CuPy doesn't support it which is
+        # why the GPU path uses 'SA' instead.
+        evals_np, evecs_np = sla.eigsh(
+            L_scipy, k=self.num_modes, sigma=0, which="LM", tol=self.tol,
+        )
+        evals_np = np.clip(evals_np, a_min=0.0, a_max=None)
+
+        device = op.idx.device
+        evals = torch.from_numpy(evals_np).float().to(device)
+        evecs = torch.from_numpy(evecs_np).float().to(device)
+        return evals, evecs
+
+    def _postprocess(self, evals, evecs, op
+                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        evals = evals[: self.num_modes]
+        evecs = evecs[:, : self.num_modes]
+        evals[0] = 0.0
+        degree_safe = torch.clamp(op.degree_mat, min=1e-8)
+        evecs = evecs * degree_safe.pow(-0.5).view(-1, 1)
+        evecs = l2_normalize(evecs, p=2, dim=0)
+        return evals, evecs
+
+    # ---------------------------------------------------------- fingerprint
+    def fingerprint(self, op, graphbandwidth: float,
+                    laplacian_normalization: str) -> EigenFingerprint:
+        ev = op.laplacian_triu.detach()
+        return EigenFingerprint(
+            n_nodes=int(op.operator_dimension),
+            n_edges=int(op.idx.shape[1]),
+            num_modes=int(self.num_modes),
+            laplacian_normalization=str(laplacian_normalization),
+            graphbandwidth=float(graphbandwidth),
+            edge_value_mean=float(ev.mean().item()),
+            edge_value_std=float(ev.std().item()),
+            backend=self.backend,
+        )
+
+    # ----------------------------------------------------------- save/load
+    @staticmethod
+    def _paths(cache_dir: Path, key: str) -> Tuple[Path, Path]:
+        cache_dir = Path(cache_dir)
+        return (
+            cache_dir / f"{key}.eigpairs.npz",
+            cache_dir / f"{key}.eigpairs.meta.json",
+        )
+
+    def save(self,
+             cache_dir: Path, key: str,
+             eigval: torch.Tensor, eigvec: torch.Tensor,
+             fp: EigenFingerprint,
+             extra: Optional[Dict[str, Any]] = None) -> Path:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        npz_path, meta_path = self._paths(cache_dir, key)
+
+        np.savez(
+            npz_path,
+            eigval=eigval.detach().cpu().numpy(),
+            eigvec=eigvec.detach().cpu().numpy(),
+        )
+        meta = {
+            "key": key,
+            "fingerprint": fp.to_dict(),
+            "extra": extra or {},
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        if self.verbose:
+            print(f"[eigensolver] saved -> {npz_path}")
+        return npz_path
+
+    def load(self, cache_dir: Path, key: str, device=None
+             ) -> Optional[Tuple[torch.Tensor, torch.Tensor,
+                                 EigenFingerprint, Dict]]:
+        npz_path, meta_path = self._paths(cache_dir, key)
+        if not npz_path.exists() or not meta_path.exists():
+            return None
+        with open(meta_path) as f:
+            meta = json.load(f)
+        fp = EigenFingerprint.from_dict(meta["fingerprint"])
+        data = np.load(npz_path)
+        evals = torch.from_numpy(data["eigval"]).float()
+        evecs = torch.from_numpy(data["eigvec"]).float()
+        if device is not None:
+            evals = evals.to(device)
+            evecs = evecs.to(device)
+        return evals, evecs, fp, meta
+
+    # -------------------------------------------------------- compute_or_load
+    def compute_or_load(
+        self,
+        laplacian_op,
+        cache_dir: Path,
+        key: str,
+        graphbandwidth: float,
+        laplacian_normalization: str,
+        extra: Optional[Dict[str, Any]] = None,
+        force_recompute: bool = False,
+        device=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Try cache, fall back to compute, then save.
+
+        Args:
+          laplacian_op:    GraphLaplacianOperator from kernel.laplacian().
+          cache_dir:       directory for the cache files.
+          key:             stable name identifying this graph. You own the
+                           naming scheme; e.g. "allen25_stride4_knn5_modes200_sym".
+                           Use make_key({...}) below if you want a helper.
+          graphbandwidth:  the bandwidth used inside laplacian_op (we read it
+                           explicitly so the fingerprint includes it; the
+                           operator itself stores it as a tensor that's
+                           awkward to extract uniformly).
+          laplacian_normalization: 'symmetric' / 'random_walk' / 'unnormalized'.
+          extra:           free-form dict stored in the meta sidecar (stride,
+                           knn method, template name, etc.). Documentation
+                           only -- not used for matching.
+          force_recompute: skip cache lookup, always recompute.
+          device:          optional device to place loaded tensors on. If you
+                           pass the kernel's device here, you avoid an extra
+                           .to() at the call site.
+        """
+        wanted = self.fingerprint(laplacian_op, graphbandwidth,
+                                  laplacian_normalization)
+
+        if not force_recompute:
+            hit = self.load(cache_dir, key, device=device)
+            if hit is not None:
+                evals, evecs, cached_fp, _meta = hit
+                ok, why = cached_fp.matches(wanted)
+                if ok:
+                    if self.verbose:
+                        print(f"[eigensolver] HIT  {cache_dir}/{key}")
+                    # Trim if the cache has more modes than we need now.
+                    return evals[: self.num_modes], evecs[:, : self.num_modes]
+                msg = f"[eigensolver] cache mismatch for key={key!r}: {why}"
+                if self.strict_fingerprint:
+                    raise RuntimeError(msg + " (strict_fingerprint=True)")
+                logging.warning(msg + " -- recomputing.")
+
+        if self.verbose:
+            print(f"[eigensolver] MISS key={key} -- computing")
+        t0 = time.time()
+        evals, evecs = self.compute(laplacian_op)
+        if self.verbose:
+            print(f"[eigensolver] computed in {time.time() - t0:.1f}s")
+
+        self.save(cache_dir, key, evals, evecs, wanted, extra=extra)
+        # Honor the requested device for the freshly computed tensors too.
+        if device is not None:
+            evals = evals.to(device)
+            evecs = evecs.to(device)
+        return evals, evecs
+
+
+# ---------------------------------------------------------------------------
+# Helper: deterministic cache key from a config dict
+# ---------------------------------------------------------------------------
+def make_key(parts: Dict[str, Any]) -> str:
+    """Compose a filesystem-safe cache key from a config dict.
+
+    Sorted by key for stability. Floats are formatted with %g to round off
+    the noise that turns 1.0 into 0.9999999.
+
+    Example:
+      make_key({"template": "allen_25um", "stride": 4, "knn": 5,
+                "modes": 200, "norm": "sym"})
+      -> "knn=5_modes=200_norm=sym_stride=4_template=allen_25um"
+    """
+    pieces = []
+    for k in sorted(parts.keys()):
+        v = parts[k]
+        if isinstance(v, float):
+            v = f"{v:.6g}"
+        pieces.append(f"{k}={v}")
+    return "_".join(pieces).replace("/", "-").replace(" ", "")

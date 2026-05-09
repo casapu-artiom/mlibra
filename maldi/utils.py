@@ -41,7 +41,7 @@ def get_inducing_points(exp_path, dataset_path, num_inducing):
         logging.info("normalizing reference_image coordinates")
         # normalize the coordinates
         coord_mean = reference_image.mean(axis=0)
-        coord_std = reference_image.std(axis=0)
+        coord_std = reference_image.std()
         coord_mean = torch.tensor(coord_mean, dtype=torch.float32)
         coord_std = torch.tensor(coord_std, dtype=torch.float32)
         torch.save(coord_mean, colmean_file)

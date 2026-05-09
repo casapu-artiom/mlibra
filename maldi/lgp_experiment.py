@@ -77,3 +77,9 @@ if __name__ == "__main__":
     logging.info(f"Parsed arguments: {args}")
     experiment = setup_experiment(args)
     experiment.run()
+    experiment.whole_brain_reconstruction()
+    #selected_reconstructions = [0, 3, 5, 10, 131, 72, 16, 89, 4, 74]
+    #for i in selected_reconstructions:
+       #experiment.load_whole_brain_reconstruction(i)
+    #for i in range(172):
+    #    experiment.load_whole_brain_reconstruction(i)
