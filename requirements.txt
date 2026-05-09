@@ -1,22 +1,31 @@
+--find-links https://data.pyg.org/whl/torch-2.1.0+cu121.html
+
+# --- Heavy Dependencies ---
+# These will now be pulled from the link above instead of compiled
 setuptools
 matplotlib
-numpy
+numpy<1.26
+numba>=0.56.4,<0.57
+protobuf==3.20.3
 pandas
 scipy
 torch
+torch-scatter
+torch-sparse
+# --- Your other project dependencies ---
+faiss-gpu
+gpytorch
 tqdm
 ipython
+scikit-learn
 scikit-image
 imageio
-numba
-scikit-learn
 tables
 ipympl
 pyarrow
 fastdist
 wandb
-torch
 torch_geometric
-IPython
 torchvision
-gpytorch
+jaxtyping
+IPython
