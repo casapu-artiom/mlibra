@@ -10,9 +10,9 @@ echo "================================================="
 # Force Python to run in unbuffered mode for real-time Run:ai logs
 export PYTHONUNBUFFERED=1
 
-REFERENCE_VOLUME="/home/casap/mlibra/mlibra_data/reference_image.npy"
-ANNOTATION_VOLUME="/home/casap/mlibra/mlibra_data/level_15annot.npy"
-OUTPUT_PATH="/home/casap/mlibra/output/eigenvectors"
+REFERENCE_VOLUME="/mydata/mlibra_data/reference_image.npy"
+ANNOTATION_VOLUME="/mydata/mlibra_data/level_15annot.npy"
+OUTPUT_PATH="/myhome/mlibra/output/eigenvectors"
 
 # Eigensolver and Graph parameters
 STRIDE=4
