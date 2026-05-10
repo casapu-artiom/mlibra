@@ -163,44 +163,44 @@ class KnnGraphCache:
             edge_value_mean=float(ev.mean().item()),
             edge_value_std=float(ev.std().item()),
         )
- 
-    def save(self,
-             key: str,
-             knn: "NearestNeighbors",
-             edge_index: torch.Tensor,
-             edge_value: torch.Tensor,
-             method: str,
-             nlist: int,
-             extra: Optional[Dict[str, Any]] = None) -> Path:
-        """Persist a graph + the data needed to reconstruct its NearestNeighbors.
- 
-        We save `knn.x` (the coords FAISS was indexed on) plus `nlist` --
-        on load we rebuild the FAISS index from these. The index itself isn't
-        serialized; the rebuild takes ~1s.
-        """
+     
+    def save(self, key, knn, edge_index, edge_value, method, nlist, extra=None):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         npz_path, meta_path = self._paths(self.cache_dir, key)
- 
-        np.savez(
-            npz_path,
-            coords=knn.x.detach().cpu().numpy(),
-            edge_index=edge_index.detach().cpu().numpy(),
-            edge_value=edge_value.detach().cpu().numpy(),
-        )
+
         fp = self._fingerprint(knn.x, edge_index, edge_value, method)
         meta = {
-            "key": key,
-            "method": method,
-            "nlist": int(nlist),
+            "key": key, "method": method, "nlist": int(nlist),
             "fingerprint": fp.to_dict(),
             "extra": extra or {},
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+
+        # Stage to a regular filesystem, then move into place. np.savez writes a
+        # zip and zipfile.close() seeks back to patch the central directory --
+        # FUSE-backed S3 mounts (s3fs/goofys/mountpoint-s3) don't support
+        # seeks on write-open files (Errno 95 EOPNOTSUPP), so we can't write
+        # directly to the cache dir if it's on one. /tmp is local-disk scratch.
+        import tempfile, shutil
+        with tempfile.TemporaryDirectory(prefix="knngraph_") as tmpd:
+            tmp_npz = Path(tmpd) / npz_path.name
+            np.savez(
+                tmp_npz,
+                coords=knn.x.detach().cpu().numpy(),
+                edge_index=edge_index.detach().cpu().numpy(),
+                edge_value=edge_value.detach().cpu().numpy(),
+            )
+            shutil.copyfile(tmp_npz, npz_path)
+
+        # JSON is fine to write directly -- it's a single sequential write,
+        # no seeks involved.
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
+
         if self.verbose:
             print(f"[knn_graph] saved -> {npz_path}")
         return npz_path
+
  
     def load(self, key: str, device=None
              ) -> Optional[Tuple["NearestNeighbors", torch.Tensor, torch.Tensor,
