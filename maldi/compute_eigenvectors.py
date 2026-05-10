@@ -61,7 +61,7 @@ def main():
     knn_config = {
         "template": "allen_25um",
         "stride": args.stride,
-        "method": "anatomical_atlas",
+        "method": "faiss",
         "k": args.k,
         "thresh": 5.0
     }
@@ -73,7 +73,7 @@ def main():
     logging.info(f"Building Anatomical KNN Graph (stride={args.stride})...")
     knn_model, edge_index, edge_value = knn_cache.train_or_load(
         key=knn_key,
-        method="faiss",
+        method=knn_config["method"],
         k=args.k,
         coords=reference_coords,
         volume=sub_volume,
@@ -102,7 +102,6 @@ def main():
 
     eigen_config = {
         "knn_key": knn_key, 
-        "modes": args.modes, 
         "norm": "symmetric",
         "bw": args.bandwidth
     }
