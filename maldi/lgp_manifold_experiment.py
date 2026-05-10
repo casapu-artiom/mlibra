@@ -52,6 +52,7 @@ def parse_args():
                         choices=["symmetric", "randomwalk"])
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
     parser.add_argument("--knn-k", dest="knn_k", type=int, default=15, help="Number of knn neighbours for the Graph Laplacian.")
+    parser.add_argument("--n-list", type=int, default=1, help="FAISS nlist parameter")
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
@@ -119,7 +120,7 @@ def setup_experiment(args):
     threshold            = 5
     stride               = args.get("stride", 4)
     knn_k                = args.get("knn_k", 4)
-    nlist                = 1
+    nlist                = args.get("n_list", 1)
     num_modes            = args.get("num_modes", 200)
     bump_scale           = args.get("bump_scale", 3.0)
     bump_decay           = args.get("bump_scale", 0.05)

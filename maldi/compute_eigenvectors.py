@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--k", type=int, default=15, help="Number of nearest neighbors")
     parser.add_argument("--modes", type=int, default=200, help="Number of eigenmodes to compute")
     parser.add_argument("--bandwidth", type=float, default=1.0, help="Graph bandwidth for Laplacian")
+    parser.add_argument("--n-list", type=int, default=1, help="FAISS nlist parameter")
     
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--project", type=str, default="riemann-eigensolver", help="W&B Project name")
@@ -75,6 +76,7 @@ def main():
         key=knn_key,
         method=knn_config["method"],
         k=args.k,
+        nlist=args.n_list,
         coords=reference_coords,
         volume=sub_volume,
         threshold=5.0,
