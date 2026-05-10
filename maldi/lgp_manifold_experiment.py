@@ -156,7 +156,7 @@ def setup_experiment(args):
     graph_key = make_graph_key(graph_key_parts)
     logging.info(f"Graph cache key: {graph_key}")
  
-    wandb.init(project=config.exp_name + "_knn_eig", config=vars(args))
+    wandb.init(project=config.exp_name + "_knn_eig", config=args)
 
     if knn_method == "faiss":
         knn, edge_index, edge_value = graphs.train_or_load(
