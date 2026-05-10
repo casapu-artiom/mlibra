@@ -156,6 +156,7 @@ class LaplacianEigensolver:
                  ncv_min: int = 1500,
                  strict_fingerprint: bool = False,
                  verbose: bool = True):
+        print(f"[eigensolver] using backend: {backend}")
         if backend not in ("cupy", "scipy"):
             raise ValueError(f"Unknown backend: {backend!r}")
         self.num_modes = num_modes

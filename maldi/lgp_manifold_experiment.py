@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 from argparse import ArgumentParser
 
+import wandb
+
 from experiment import MaldiExperiment
 from config import MaldiConfig
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
@@ -154,6 +156,8 @@ def setup_experiment(args):
     graph_key = make_graph_key(graph_key_parts)
     logging.info(f"Graph cache key: {graph_key}")
  
+    wandb.init(project=config.exp_name + "_knn_eig", config=vars(args))
+
     if knn_method == "faiss":
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key,
@@ -266,6 +270,8 @@ def setup_experiment(args):
         device=config.device,
         gp_model=gp_model,
     )
+
+    wandb.finish()
  
     return MaldiExperiment(config, lgp_model, coord_mean, coord_std)
 
