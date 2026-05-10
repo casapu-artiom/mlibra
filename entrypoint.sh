@@ -8,6 +8,7 @@
 set -euo pipefail
 
 APP_USER="${APP_USER:-appuser}"
+APP_GID="${APP_GID:-100}"
 
 # ---- Generate SSH host keys on first boot ----
 if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
@@ -26,16 +27,45 @@ elif [ -f "/myhome/.ssh/id_rsa.pub" ]; then
 fi
 chmod 700 "$ssh_dir"
 [ -f "$ssh_dir/authorized_keys" ] && chmod 600 "$ssh_dir/authorized_keys"
-chown -R "${APP_USER}:${APP_USER}" "$ssh_dir"
+chown -R "${APP_USER}:${APP_GID}" "$ssh_dir"
+
+FAISS_DIR="/myhome/faiss"
+FAISS_VERSION="v1.14.1"
+CUDA_ARCHS="80;86;89;90;120"
+
+if [ -d "$FAISS_DIR/build" ]; then
+    echo "[entrypoint] Faiss build directory found. Skipping compilation and installing..."
+    cd "$FAISS_DIR"
+else
+    echo "[entrypoint] Faiss not built. Starting full compilation..."
+    git clone --depth 1 --branch ${FAISS_VERSION} https://github.com/facebookresearch/faiss.git "$FAISS_DIR"
+    cd "$FAISS_DIR"
+    
+    # 1. Configure and Build
+    cmake -B build . \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DFAISS_ENABLE_GPU=ON \
+        -DFAISS_ENABLE_PYTHON=ON \
+        -DBUILD_SHARED_LIBS=ON \
+        -DFAISS_OPT_LEVEL=avx2 \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+        -DPython_EXECUTABLE=$(which python)
+    
+    make -C build -j"$(nproc)" faiss faiss_avx2 swigfaiss swigfaiss_avx2
+fi
+
+# 2. Always Install (This links the existing build to the current container)
+echo "[entrypoint] Registering Faiss with system..."
+make -C build install
+(cd build/faiss/python && python setup.py install)
+ldconfig
 
 # ---- Maldi Repo Check and Install ----
-if [ ! -d "/myhome/mlibra" ]; then
-    echo "[entrypoint] /mydata/maldi not found. Cloning..."
-    git clone https://github.com/casapu-artiom/mlibra.git /myhome/mlibra
-else
-    echo "[entrypoint] /myhome/mlibra found. Updating..."
-    cd /myhome/mlibra && git pull
+if [ ! -d /myhome/mlibra ]; then
+echo "[entrypoint] recreating /mydata/maldi. Cloning..."
+    gosu "${APP_USER}" git clone https://github.com/casapu-artiom/mlibra.git /myhome/mlibra
 fi
+cd /myhome/mlibra
 
 # Editable install into the venv
 # We do this every boot to ensure the venv recognizes the local folder
@@ -79,7 +109,7 @@ if [ $# -eq 0 ]; then
         fi
 
         touch "$vscode_dir/.extensions-installed"
-        chown -R "${APP_USER}:${APP_USER}" "$vscode_dir"
+        chown -R "${APP_USER}:${APP_GID}" "$vscode_dir"
     fi
 
     echo "[entrypoint] Starting sshd on port 2222 (interactive mode)"
@@ -91,6 +121,5 @@ else
     # ============================================================
     # gosu drops privileges from root to APP_USER for proper
     # PID 1 signal handling (unlike su, gosu execs directly).
-    # exec gosu "${APP_USER}" bash -c 'source /opt/venv/bin/activate && exec "$@"' -- "$@"
-    exec gosu "${APP_USER}" "$@"
+    exec gosu "${APP_USER}" bash -c 'source /opt/venv/bin/activate && exec "$@"' -- "$@"
 fi

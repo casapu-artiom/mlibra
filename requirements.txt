@@ -4,16 +4,16 @@
 # These will now be pulled from the link above instead of compiled
 setuptools
 matplotlib
-numpy<1.26
-numba>=0.56.4,<0.57
-protobuf==3.20.3
+numpy
+cupy-cuda12x
+numba
+protobuf
 pandas
 scipy
 torch
 torch-scatter
 torch-sparse
 # --- Your other project dependencies ---
-faiss-gpu
 gpytorch
 tqdm
 ipython
