@@ -348,19 +348,30 @@ class LaplacianEigensolver:
         )
 
     def save(self,
-             cache_dir: Path, key: str,
-             eigval: torch.Tensor, eigvec: torch.Tensor,
-             fp: EigenFingerprint,
-             extra: Optional[Dict[str, Any]] = None) -> Path:
+            cache_dir: Path, key: str,
+            eigval: torch.Tensor, eigvec: torch.Tensor,
+            fp: EigenFingerprint,
+            extra: Optional[Dict[str, Any]] = None) -> Path:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         npz_path, meta_path = self._paths(cache_dir, key)
 
-        np.savez(
-            npz_path,
-            eigval=eigval.detach().cpu().numpy(),
-            eigvec=eigvec.detach().cpu().numpy(),
-        )
+        # Stage the npz to local scratch, then copy. np.savez writes a zip and
+        # zipfile.close() seeks back to patch the central directory -- FUSE-
+        # backed S3 mounts (s3fs/goofys/mountpoint-s3) don't support seeks on
+        # write-open files (Errno 95 EOPNOTSUPP), so we can't write directly
+        # if cache_dir is on one. /tmp is always a real filesystem.
+        import tempfile, shutil
+        with tempfile.TemporaryDirectory(prefix="eigensolver_") as tmpd:
+            tmp_npz = Path(tmpd) / npz_path.name
+            np.savez(
+                tmp_npz,
+                eigval=eigval.detach().cpu().numpy(),
+                eigvec=eigvec.detach().cpu().numpy(),
+            )
+            shutil.copyfile(tmp_npz, npz_path)
+
+        # JSON is a single sequential write -- no seeks, fine to write direct.
         meta = {
             "key": key,
             "fingerprint": fp.to_dict(),
@@ -369,6 +380,7 @@ class LaplacianEigensolver:
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
+
         if self.verbose:
             print(f"[eigensolver] saved -> {npz_path}")
         return npz_path
