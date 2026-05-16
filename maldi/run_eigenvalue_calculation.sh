@@ -15,7 +15,7 @@ ANNOTATION_VOLUME="/mydata/mlibra_data/level_15annot.npy"
 OUTPUT_PATH="/myhome/mlibra/output/eigenvectors"
 
 # Eigensolver and Graph parameters
-STRIDE=4
+STRIDE=2
 K_NEIGHBORS=15
 NUM_MODES=1000
 BANDWIDTH=1.0

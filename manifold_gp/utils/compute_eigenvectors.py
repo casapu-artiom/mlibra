@@ -125,6 +125,47 @@ class EigenFingerprint:
                 return False, f"{fld} differs: {a:.6g} vs {b:.6g}"
         return True, ""
 
+class _IterationTracker:
+    """Counts work units (SpMVs on cupy, OPinv solves on scipy) and reports
+    progress to tqdm + wandb. Same throttling for both backends so dashboards
+    line up across runs.
+ 
+    The unit of work differs by backend, but the wandb key names are kept
+    identical (`solver/spmv_iterations`, `solver/iters_per_sec`) so cross-
+    backend runs are directly comparable in the dashboard. The `unit` field
+    just controls the tqdm description and is exposed on the wandb run
+    config separately if you want to disambiguate.
+    """
+ 
+    def __init__(self, desc: str, verbose: bool, log_interval_seconds: float = 2.0):
+        from tqdm import tqdm  # local import keeps the module import light
+        self.pbar = tqdm(desc=desc, leave=False, disable=not verbose)
+        self.iteration_count = 0
+        self._iters_at_last_log = 0
+        self._last_log_time = time.time()
+        self._log_interval_seconds = log_interval_seconds
+ 
+    def tick(self) -> None:
+        self.iteration_count += 1
+        self.pbar.update(1)
+        now = time.time()
+        elapsed = now - self._last_log_time
+        if elapsed < self._log_interval_seconds:
+            return
+        # Rate over the *window* since the last log -- not the run-average,
+        # which would smear over the whole solve. Cheap and accurate.
+        delta = self.iteration_count - self._iters_at_last_log
+        rate = delta / elapsed if elapsed > 0 else 0.0
+        if wandb is not None and wandb.run is not None:
+            wandb.log({
+                "solver/spmv_iterations": self.iteration_count,
+                "solver/iters_per_sec": rate,
+            })
+        self._iters_at_last_log = self.iteration_count
+        self._last_log_time = now
+ 
+    def close(self) -> None:
+        self.pbar.close()
 
 # ---------------------------------------------------------------------------
 # Solver
@@ -287,28 +328,76 @@ class LaplacianEigensolver:
     def _compute_scipy(self, op) -> Tuple[torch.Tensor, torch.Tensor]:
         import scipy.sparse as sp
         import scipy.sparse.linalg as sla
-
+ 
         N = op.operator_dimension
         idx = op.idx.cpu()
         val = op.laplacian_triu.cpu()
         diag = op.laplacian_diag.cpu()
-
+ 
         row, col = idx[0].numpy(), idx[1].numpy()
         L_scipy = sp.csr_matrix((-val.numpy(), (row, col)), shape=(N, N))
         L_scipy = L_scipy + L_scipy.T
         L_scipy.setdiag(diag.numpy())
-
+ 
         if self.verbose:
             print(f"[eigensolver] (scipy) N={N:,}  NNZ={L_scipy.nnz:,}")
-
+ 
         # Shift-invert at sigma=0 finds eigenvalues closest to zero efficiently.
         # This is the better choice on CPU; CuPy doesn't support it which is
         # why the GPU path uses 'SA' instead.
-        evals_np, evecs_np = sla.eigsh(
-            L_scipy, k=self.num_modes, sigma=0, which="LM", tol=self.tol,
+        #
+        # In shift-invert mode ARPACK doesn't multiply by L per iteration -- it
+        # solves L x = b against a pre-factorized splu(L). So the unit of work
+        # we want to track is OPinv solves, not SpMVs of L. We factorize once
+        # up front (the dominant cost for moderate N), then wrap splu.solve in
+        # a LinearOperator that ticks the iteration tracker on every call.
+ 
+        if self.verbose:
+            print("[eigensolver] (scipy) factorizing L (shift-invert sigma=0)...")
+        t_fact = time.time()
+        splu_solver = sla.splu(L_scipy.tocsc())
+        factorization_seconds = time.time() - t_fact
+        if self.verbose:
+            print(
+                f"[eigensolver] (scipy) factorization done in "
+                f"{factorization_seconds:.1f}s"
+            )
+        if wandb is not None and wandb.run is not None:
+            wandb.log({"solver/factorization_seconds": factorization_seconds})
+ 
+        # Wrap splu.solve so each ARPACK shift-invert step shows up in tqdm
+        # and wandb. Same key names as the cupy path so dashboards line up.
+        class _TrackedOPinv(sla.LinearOperator):
+            def __init__(self, solver, dtype, shape, verbose):
+                super().__init__(dtype, shape)
+                self.solver = solver
+                self.tracker = _IterationTracker(
+                    desc="[eigensolver] SciPy Lanczos OPinv solve",
+                    verbose=verbose,
+                )
+ 
+            def _matvec(self, x):
+                self.tracker.tick()
+                return self.solver.solve(x)
+ 
+        op_tracked = _TrackedOPinv(
+            splu_solver, L_scipy.dtype, L_scipy.shape, self.verbose,
         )
+ 
+        try:
+            evals_np, evecs_np = sla.eigsh(
+                L_scipy,
+                k=self.num_modes,
+                sigma=0,
+                which="LM",
+                tol=self.tol,
+                OPinv=op_tracked,
+            )
+        finally:
+            op_tracked.tracker.close()
+ 
         evals_np = np.clip(evals_np, a_min=0.0, a_max=None)
-
+ 
         device = op.idx.device
         evals = torch.from_numpy(evals_np).float().to(device)
         evecs = torch.from_numpy(evecs_np).float().to(device)
