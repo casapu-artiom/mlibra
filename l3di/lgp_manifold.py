@@ -90,9 +90,10 @@ class ManifoldLGP(nn.Module):
     End-to-End architecture:
     Manifold Graph Coordinates -> Latent Riemann GP -> MLP -> 172 Channels
     """
-    def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model):
+    def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model, use_rsample=True):
         super().__init__()
         self.mode = "manifold_lgp"
+        self.use_rsample = use_rsample
         self.p = p  # number of channels (e.g., 172)
         self.d = d  # latent dimension (e.g., 10)
 
@@ -131,7 +132,7 @@ class ManifoldLGP(nn.Module):
         # REPARAMETERIZATION TRICK
         # rsample() keeps gradients attached during training. 
         # mean is used for deterministic output during evaluation.
-        if self.training:
+        if self.training and self.use_rsample:
             latent_forward = gp_posterior.rsample() 
         else:
             latent_forward = gp_posterior.mean    

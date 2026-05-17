@@ -213,7 +213,10 @@ def crop_or_stride_volume(reference_image, annotation_volume, stride, region_bbo
     if region_bbox is not None:
         zmin, zmax, ymin, ymax, xmin, xmax = region_bbox
         sub_volume = reference_image[zmin:zmax, ymin:ymax, xmin:xmax]
-        sub_atlas = annotation_volume[zmin:zmax, ymin:ymax, xmin:xmax]
+        if annotation_volume is not None:
+            sub_atlas = annotation_volume[zmin:zmax, ymin:ymax, xmin:xmax]
+        else:
+            sub_atlas = None
         voxel_offset = (zmin, ymin, xmin)
         voxel_scale_mm = 0.025
         logging.info(
@@ -222,7 +225,10 @@ def crop_or_stride_volume(reference_image, annotation_volume, stride, region_bbo
         )
     else:
         sub_volume = reference_image[::stride, ::stride, ::stride]
-        sub_atlas = annotation_volume[::stride, ::stride, ::stride]
+        if annotation_volume is not None:
+            sub_atlas = annotation_volume[::stride, ::stride, ::stride]
+        else:
+            sub_atlas = None
         voxel_offset = (0, 0, 0)
         voxel_scale_mm = stride * 0.025
         logging.info(

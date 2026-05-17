@@ -31,7 +31,6 @@ from utils import (
     reference_ccf_from_subvolume,
 )
 
-
 def parse_args():
     """Parse command line arguments."""
     parser = ArgumentParser(description="Run MALDI experiment with l3di (Riemann).")
@@ -43,6 +42,9 @@ def parse_args():
     parser.add_argument("--output-dir", dest="output_dir", type=str, required=True, help="Directory for output files.")
     parser.add_argument("--eigenvector-dir", dest="eigenvector_dir", type=str, required=True, help="Directory for eigenvector files.")
     parser.add_argument("--slices-dataset-file", dest="slices_dataset_file", type=str, required=True, help="File for slices dataset.")
+    parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="The reference image npy.")
+    parser.add_argument("--reference-file", dest="reference_file", type=str, required=True, help="The reference image npy.")
+    parser.add_argument("--annotations-file", dest="annotations_file", type=str, help="The annotations if needed.")
     parser.add_argument("--num-inducing", dest="num_inducing", type=int, default=500, help="Number of inducing points.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
@@ -66,6 +68,14 @@ def parse_args():
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
+    parser.add_argument("--use-rsample", dest="use_rsample", action='store_false', help="Use rsample instead of mean.")
+    parser.add_argument("--do-brain-reconstruction", dest="do_brain_reconstruction", action='store_true', help="Perform whole brain prediction")
+    parser.add_argument(
+        "--reconstruction-lipids", dest="reconstruction_lipids",
+        nargs="+", default=None,
+        help="Restrict reconstruction to these lipids. Accepts indices (0 5 10) "
+            "or names ('PA 36:4' 'PE 40:7'). Default: all lipids.",
+    )
 
     # ---- region restriction ----
     parser.add_argument(
@@ -79,50 +89,6 @@ def parse_args():
     )
 
     return vars(parser.parse_args())
-
-
-def coarsen_annotation(annotation, atlas, max_depth=4):
-    """Collapse leaf labels to a chosen ancestor depth in the structure tree."""
-    structures = atlas.structures
-    id_remap = {0: 0}
-    for sid, info in structures.items():
-        if sid == 0:
-            continue
-        path = info.get("structure_id_path", [sid])
-        if len(path) <= max_depth + 1:
-            id_remap[sid] = sid
-        else:
-            id_remap[sid] = path[max_depth]
-    max_id = int(annotation.max()) + 1
-    lut = np.zeros(max_id + 1, dtype=np.int32)
-    for src, dst in id_remap.items():
-        if src < lut.shape[0]:
-            lut[src] = dst
-    return lut[annotation]
-
-
-def _load_or_download_template(volume_path: Path):
-    from bg_atlasapi.bg_atlas import BrainGlobeAtlas
-    atlas = BrainGlobeAtlas("allen_mouse_25um")
-
-    template_file = volume_path / "template_volume.npy"
-    annotation_file = volume_path / "annotations.npy"
-
-    if not template_file.exists() or not annotation_file.exists():
-        logging.info("Downloading template volume via BrainGlobe Atlas API...")
-        template_volume = atlas.reference
-        annotation_volume = atlas.annotation
-        logging.info(f"Template volume shape: {template_volume.shape}")
-        volume_path.mkdir(parents=True, exist_ok=True)
-        np.save(template_file, template_volume)
-        np.save(annotation_file, annotation_volume)
-    else:
-        logging.info("Template volume already exists, loading from file")
-        template_volume = np.load(template_file)
-        annotation_volume = np.load(annotation_file)
-
-    return template_volume, annotation_volume, atlas
-
 
 def setup_experiment(args):
     config = MaldiConfig.from_args(args)
@@ -150,11 +116,12 @@ def setup_experiment(args):
     logging.info(f"Got {inducing_points.shape[0]} inducing points")
 
     # 3. Atlas: download (if needed), coarsen annotations, then crop or stride.
-    volume_path = config.exp_path / "volume"
-    template_volume, annotation_volume, atlas = _load_or_download_template(volume_path)
-    annotation_coarse = coarsen_annotation(annotation_volume, atlas, max_depth=4)
+    template_name = config.template_name
+    template_volume = np.load(config.reference_file)
+    annotations_volume = None
+    if config.annotations_file is not None:
+        annotations_volume = np.load(config.annotations_file)
 
-    template_name        = "allen_mouse_25um"
     threshold            = 5
     stride               = args.get("stride", 4)
     knn_k                = args.get("knn_k", 15)
@@ -167,7 +134,7 @@ def setup_experiment(args):
     knn_method           = args.get("knn_method", "faiss")
 
     sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
-        template_volume, annotation_coarse, stride, region_bbox,
+        template_volume, annotations_volume, stride, region_bbox,
     )
     reference_ccf = reference_ccf_from_subvolume(
         sub_volume, voxel_offset, voxel_scale_mm, threshold,
@@ -297,12 +264,12 @@ def setup_experiment(args):
         activation="silu",
         device=config.device,
         gp_model=gp_model,
+        use_rsample=args.get("use_rsample", True),
     )
 
     wandb.finish()
 
     return MaldiExperiment(config, lgp_model, coord_mean, coord_std), region_bbox
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -312,7 +279,17 @@ if __name__ == "__main__":
 
     experiment, region_bbox = setup_experiment(args)
     experiment.run()
-    if region_bbox is not None:
-        experiment.region_reconstruction(region_bbox)
-    else:
-        experiment.whole_brain_reconstruction()
+
+    if experiment.config.do_brain_reconstruction:
+        if experiment.config.reconstruction_lipids_by_index:
+            lipid_names = None
+            lipid_indices = experiment.config.reconstruction_lipids
+        else:
+            lipid_names = experiment.config.reconstruction_lipids
+            lipid_indices = None
+        if region_bbox is not None:
+            # Skip whole-brain reconstruction in region mode -- a GP trained
+            # only on points inside the bbox will extrapolate poorly outside it.
+            experiment.region_reconstruction(region_bbox, lipid_indices=lipid_indices, lipid_names=lipid_names)
+        else:
+            experiment.whole_brain_reconstruction(lipid_indices=lipid_indices, lipid_names=lipid_names)

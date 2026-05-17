@@ -12,7 +12,7 @@ from tqdm import tqdm
 from pathlib import Path
 import matplotlib.pyplot as plt
 import wandb
-from .config import MaldiConfig
+from config import MaldiConfig
 from l3di.lgp import LGP
 
 def density_scatter(ax, x, y, x_min, x_max, y_min, y_max, bins=50, **kwargs):
@@ -610,298 +610,393 @@ class MaldiExperiment:
         ax.set_ylabel(f"{lipid} (predicted)")
         plt.show()
 
-    def maybe_download_template_brainglobe(self, volume_path, template_file):
-        if not template_file.exists():
-            logging.info("Downloading template volume via BrainGlobe Atlas API...")
-            
-            # Import BrainGlobe instead of AllenSDK
-            from bg_atlasapi.bg_atlas import BrainGlobeAtlas
-            
-            # This automatically downloads, unpacks, and caches the 25um Allen CCF
-            atlas = BrainGlobeAtlas("allen_mouse_25um")
-            template_volume = atlas.reference
-            
-            logging.info(f"Template volume shape: {template_volume.shape}")
-            logging.info(f"Template volume data type: {template_volume.dtype}")
-            
-            volume_path.mkdir(parents=True, exist_ok=True)
-            np.save(template_file, template_volume)
-        else:
-            logging.info("Template volume already exists, loading from file")
-            template_volume = np.load(template_file)    
+    def whole_brain_reconstruction(self, lipid_indices=None, lipid_names=None):
+        """One-pass reconstruction. By default reconstructs all lipids; pass
+        lipid_indices (list of int) or lipid_names (list of str) to restrict.
 
-        return template_volume
+        Filtering happens AFTER the GPU forward pass — the model still predicts
+        all 172 lipids per voxel; we just persist a subset. This is intentional:
+        re-running the model is far more expensive than discarding columns, and
+        the consolidated `all_predictions.npy` then contains the full prediction
+        cube, so adding a lipid later only re-writes per-lipid volumes (no GPU
+        needed).
 
-    def maybe_download_template_allensdk(self, volume_path, template_file):
-        if not template_file.exists():
-            logging.info("Downloading template volume...")
-            from allensdk.core.mouse_connectivity_cache import MouseConnectivityCache
-            # Specify the resolution you want for the template volume (in microns)
-            resolution_um = 25
-            mcc = MouseConnectivityCache(resolution=resolution_um)
-            logging.info(f"Downloading/loading reference TEMPLATE volume at {resolution_um} um resolution...")
-            template_volume, _ = mcc.get_template_volume()
-            logging.info(f"Template volume shape: {template_volume.shape}")
-            logging.info(f"Template volume data type: {template_volume.dtype}")
-
-            volume_path.mkdir(parents=True, exist_ok=True)
-            np.save(template_file, template_volume)
-        else:
-            logging.info("Template volume already exists, loading from file")
-            template_volume = np.load(template_file)
-        return template_volume
-
-    def whole_brain_reconstruction(self):
+        If you want to ACTUALLY save GPU memory or disk by not even predicting
+        the unused lipids, see _make_lipid_filter — but for a standard LGP this
+        isn't a win because the decoder produces all 172 lipids in one matmul.
         """
-        Reconstructs the whole brain volume for all lipids using the trained model.
-
-        This function loads the model from the specified path, prepares the template volume,
-        and iterates through the non-zero indices of the template volume to predict lipid concentrations
-        using the trained model. The predictions are saved in batches to avoid memory issues.
-        The template volume is downloaded if it does not exist, and the predictions are saved in a specified directory.
-        The function assumes that the model has been trained and saved in the specified path.
-        """
-        if(self.config.exp_path / "model.pth").exists():
-            logging.info("Loading model from file")
-            self.lgp_model.load_state_dict(torch.load(self.config.exp_path / "model.pth", map_location=self.config.device))
-            logging.info("Model loaded successfully")
-        else:
-            logging.error("Model not found. Please run the experiment first.")
+        if not self._load_model_for_reconstruction():
             return
-        
-        # Diffusion setup if enabled
-        ddpm = None
-        unet = None
-        true_values_min = None
-        true_values_max = None
-        padding = None
-        pad_len = 0
-
-        if self.config.use_diffusion:
-            volume_path = self.config.exp_path / "volume_diffusion"
-            # load diffusion model
-            from l3di.simple_ddpm1d import SimpleDDPM1D, SimpleUNet1D
-            unet = SimpleUNet1D(in_channels=1, model_channels=64, out_channels=1, z_dim=self.config.latent_dim)
-            ddpm = SimpleDDPM1D(unet,T=1000,var_type="fixedsmall")
-            
-            voxel_model_file = self.config.exp_path / "voxel_diffusion.pt"
-            if not voxel_model_file.exists():
-                 logging.error("Voxel diffusion model not found. Run experiment with diffusion enabled first.")
-                 return
-            ddpm.load_model(voxel_model_file, self.config.device)
-            
-            # Need min/max for scaling
-            # Load true_values in original scale 
-            true_values = self.true_values_train
-            true_values = torch.tensor(true_values)
-            true_values_min = true_values.min()
-            true_values_max = true_values.max()
-            
-            # Padding
-            n_channels = true_values.shape[1]
-            target_len = ((n_channels - 1) // 16 + 1) * 16
-            pad_len = target_len - n_channels
-            padding = (0, pad_len)
-        else:
-            volume_path = self.config.exp_path / "volume"
-            
+        suffix = "_diffusion" if self.config.use_diffusion else ""
+        volume_path = self.config.exp_path / ("volume_diffusion"
+                                            if self.config.use_diffusion else "volume")
         volume_path.mkdir(parents=True, exist_ok=True)
         template_file = volume_path / "template_volume.npy"
         template_volume = self.maybe_download_template_brainglobe(volume_path, template_file)
-        non_zero_indices = np.argwhere(template_volume > 5)
-        # concert from 25 um to 1 mm
-        non_zero_ccf = non_zero_indices * 0.025
-        non_zero_ccf = torch.tensor(non_zero_ccf, dtype=torch.float32)
-        non_zero_ccf = (non_zero_ccf - self.coord_mean) / self.coord_std
-        ccf_dataset = torch.utils.data.TensorDataset(torch.tensor(non_zero_ccf, dtype=torch.float32), torch.tensor(non_zero_indices, dtype=torch.float32))
-        ccf_dataloader = torch.utils.data.DataLoader(ccf_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=0)
-        logging.info("Reconstructing whole brain volume...")
+        non_zero_indices = np.argwhere(template_volume > 5).astype(np.int32)
+        logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
 
-        self.lgp_model.eval()
-        with torch.no_grad():
-            for i,batch in enumerate(tqdm(ccf_dataloader)):
-                batch_file = volume_path / f"batch_{i}.pth"
-                if batch_file.exists():
-                    logging.info(f"Batch {i} already exists, skipping...")
-                    continue
-                coordinates_batch = batch[0].to(self.config.device)
-                indices_batch = batch[1]
-                predictions, gp_posterior = self.lgp_model.predict(coordinates_batch)
-                
-                if self.config.use_diffusion and ddpm is not None:
-                    cond = predictions
-                    x_t = torch.randn(cond.shape[0], 1, cond.shape[1] + pad_len, device=self.config.device)
-                    
-                    cond_padded = F.pad(cond, padding, "constant", 0)
-                    cond_padded = cond_padded.unsqueeze(1).to(self.config.device)
-                    
-                    sample_dict = ddpm.sample(x_t, cond_padded, gp_posterior.mean, n_steps=500, clip_denoised=True)
-                    
-                    # Post processing
-                    # Get DDPM prediction and unpad
-                    ddpm_pred = sample_dict["500"].squeeze().detach().cpu()
-                    if pad_len > 0:
-                        ddpm_pred = ddpm_pred[:, :-pad_len]
-                    
-                    # Rescale to original domain [min, max]
-                    ddpm_pred = ddpm_pred * (true_values_max - true_values_min) + true_values_min
-                    
-                    # Apply subtraction logic: prediction = LGP - DDPM(residual)
-                    final_predictions = cond.detach().cpu() - ddpm_pred
-                    final_predictions = final_predictions * self.train_std.cpu() + self.train_mean.cpu()
-                    final_predictions = final_predictions.numpy()
-                    
-                    if self.config.log_transform:
-                         final_predictions = np.exp(final_predictions) - 1e-10
-                         
-                    torch.save({
-                        "coordinates": coordinates_batch.cpu(),
-                        "indices": indices_batch.cpu(),
-                        "predictions": final_predictions,
-                        # "posterior": gp_posterior.mean.detach().cpu() # Optional
-                    }, batch_file)
-                else:
-                    # we save the coordinates the indices and the predictions in a single file
-                    predictions = predictions * self.train_std + self.train_mean
-                    predictions = predictions.detach().cpu().numpy()
-                    if self.config.log_transform:
-                        predictions = np.exp(predictions) - 1e-10
-                    torch.save({
-                        "coordinates": coordinates_batch.cpu(),
-                        "indices": indices_batch.cpu(),
-                        "predictions": predictions,
-                        "posterior": gp_posterior.mean.detach().cpu()
-                    }, batch_file)
+        lipid_filter = self._resolve_lipid_filter(lipid_indices, lipid_names)
+        self._reconstruct_voxels(
+            non_zero_indices, volume_path, template_volume.shape, suffix,
+            lipid_filter=lipid_filter,
+        )
 
-    def region_reconstruction(self, region_bbox, threshold: float = 5.0):
-        """
-        Like whole_brain_reconstruction, but only over voxels inside `region_bbox`.
 
-        Use this for region-restricted experiments so the trained GP isn't asked
-        to predict far outside its training support. Output shape mirrors that
-        of whole_brain_reconstruction (one batch_*.pth per dataloader batch in
-        a `volume_region_<bbox>` directory).
-
-        Parameters
-        ----------
-        region_bbox : sequence of 6 ints
-            (zmin, zmax, ymin, ymax, xmin, xmax) in voxel coords of the full-res
-            25um atlas.
-        threshold : float
-            Tissue threshold on the template volume (default 5.0, same as the
-            graph builder).
-        """
-        if (self.config.exp_path / "model.pth").exists():
-            logging.info("Loading model from file")
-            self.lgp_model.load_state_dict(
-                torch.load(self.config.exp_path / "model.pth", map_location=self.config.device)
-            )
-            logging.info("Model loaded successfully")
-        else:
-            logging.error("Model not found. Please run the experiment first.")
+    def region_reconstruction(self, region_bbox, threshold=5.0,
+                            lipid_indices=None, lipid_names=None):
+        """Same filtering for the regional path."""
+        if not self._load_model_for_reconstruction():
             return
-
         bbox_str = "_".join(str(int(b)) for b in region_bbox)
         volume_path = self.config.exp_path / f"volume_region_{bbox_str}"
         volume_path.mkdir(parents=True, exist_ok=True)
         template_file = volume_path / "template_volume.npy"
         template_volume = self.maybe_download_template_brainglobe(volume_path, template_file)
-
-        # Crop the template to the bbox; reconstruct full-res voxel indices.
         zmin, zmax, ymin, ymax, xmin, xmax = (int(b) for b in region_bbox)
         sub = template_volume[zmin:zmax, ymin:ymax, xmin:xmax]
         z, y, x = np.where(sub > threshold)
         if z.shape[0] == 0:
-            logging.warning(
-                f"No tissue voxels (>{threshold}) inside bbox {region_bbox}. "
-                "Nothing to reconstruct."
-            )
+            logging.warning(f"No tissue voxels (>{threshold}) inside bbox {region_bbox}.")
             return
-        non_zero_indices = np.stack([z + zmin, y + ymin, x + xmin], axis=1)
-        logging.info(
-            f"Region reconstruction: {non_zero_indices.shape[0]} voxels in bbox {region_bbox}"
+        non_zero_indices = np.stack([z + zmin, y + ymin, x + xmin], axis=1).astype(np.int32)
+        logging.info(f"Region reconstruction: {non_zero_indices.shape[0]:,} voxels in {region_bbox}")
+        lipid_filter = self._resolve_lipid_filter(lipid_indices, lipid_names)
+        self._reconstruct_voxels(
+            non_zero_indices, volume_path, template_volume.shape,
+            suffix=f"_region_{bbox_str}", lipid_filter=lipid_filter,
         )
 
-        non_zero_ccf = non_zero_indices.astype(np.float32) * 0.025
-        non_zero_ccf = torch.tensor(non_zero_ccf, dtype=torch.float32)
+
+    def _resolve_lipid_filter(self, lipid_indices=None, lipid_names=None):
+        """Resolve lipid filter precedence: explicit arg > config > all.
+
+        Returns a numpy int array of indices, or None to mean 'all lipids'.
+        Errors loudly on miss / ambiguity (no silent drops).
+        """
+        # Explicit args take precedence over config
+        if lipid_indices is None and lipid_names is None:
+            cfg_val = getattr(self.config, "reconstruction_lipids", None)
+            if cfg_val is None or len(cfg_val) == 0:
+                return None
+            # Allow either int or str entries in the config list
+            if all(isinstance(v, int) for v in cfg_val):
+                lipid_indices = list(cfg_val)
+            elif all(isinstance(v, str) for v in cfg_val):
+                lipid_names = list(cfg_val)
+            else:
+                raise ValueError("config.reconstruction_lipids must be all int or all str")
+
+        all_names = [str(n) for n in self.config.selected_lipids_names]
+
+        if lipid_names is not None:
+            resolved = []
+            for name in lipid_names:
+                target = name.strip()
+                exact = [i for i, n in enumerate(all_names) if n == target]
+                if len(exact) == 1:
+                    resolved.append(exact[0]); continue
+                if len(exact) > 1:
+                    raise ValueError(f"{name!r} matches multiple lipids exactly: {exact}")
+                sub = [i for i, n in enumerate(all_names) if target.lower() in n.lower()]
+                if len(sub) == 0:
+                    raise ValueError(f"No lipid matches {name!r}. First 10 names: "
+                                    f"{all_names[:10]}")
+                if len(sub) > 1:
+                    raise ValueError(
+                        f"Ambiguous lipid name {name!r}; matches: "
+                        + ", ".join(f"[{i}]{all_names[i]}" for i in sub)
+                    )
+                resolved.append(sub[0])
+            idx = np.asarray(resolved, dtype=np.int64)
+        else:
+            idx = np.asarray(lipid_indices, dtype=np.int64)
+            if idx.min() < 0 or idx.max() >= len(all_names):
+                raise ValueError(f"lipid index out of range [0, {len(all_names)})")
+
+        # Dedupe but preserve order
+        _, keep = np.unique(idx, return_index=True)
+        idx = idx[np.sort(keep)]
+
+        selected = [all_names[i] for i in idx]
+        logging.info(f"Reconstruction restricted to {len(idx)} lipid(s): {selected}")
+        return idx
+
+    def _load_model_for_reconstruction(self):
+        model_path = self.config.exp_path / "model.pth"
+        if not model_path.exists():
+            logging.error("Model not found. Please run the experiment first.")
+            return False
+        logging.info(f"Loading model from {model_path}")
+        self.lgp_model.load_state_dict(
+            torch.load(model_path, map_location=self.config.device)
+        )
+        return True
+
+    def _reconstruct_voxels(self, non_zero_indices, volume_path, template_shape,
+                            suffix="", write_per_latent_volumes=True):
+        """Core reconstruction loop. One forward pass over all voxels, then
+        write everything. Smart in three ways:
+        1. Resume: skip the GPU loop if consolidated arrays already exist
+        2. Per-latent volumes only when latent_dim is reasonable
+        3. Probe one batch to learn latent_dim before allocating
+        """
+        n_voxels = non_zero_indices.shape[0]
+        n_lipids = len(self.config.selected_lipids_names)
+
+        preds_file     = volume_path / "predictions.npy"
+        indices_file   = volume_path / "predictions_indices.npy"
+        post_mean_file = volume_path / "predictions_posterior_mean.npy"
+        post_var_file  = volume_path / "predictions_posterior_var.npy"
+
+        # --- Resume: if consolidated arrays exist, skip GPU loop ---
+        if preds_file.exists() and indices_file.exists():
+            saved_indices = np.load(indices_file)
+            if saved_indices.shape == non_zero_indices.shape and \
+            np.array_equal(saved_indices, non_zero_indices):
+                logging.info(f"Reusing cached predictions at {preds_file}")
+                all_preds = np.load(preds_file, mmap_mode="r")
+                post_mean = np.load(post_mean_file, mmap_mode="r") if post_mean_file.exists() else None
+                post_var  = np.load(post_var_file,  mmap_mode="r") if post_var_file.exists()  else None
+
+                self._write_per_lipid_volumes(
+                    all_preds, non_zero_indices, template_shape, suffix,
+                    lipid_filter=lipid_filter,
+                )
+                if post_mean is not None and write_per_latent_volumes:
+                    # Per-latent volumes are independent of which lipids you picked, so
+                    # they get written regardless.
+                    self._write_per_latent_volumes(all_post_mean, all_post_var,
+                                                    non_zero_indices, template_shape, suffix)
+                return
+            else:
+                logging.warning("Cached indices don't match current voxel set; recomputing.")
+
+        # --- Diffusion setup (unchanged from existing code) ---
+        ddpm = unet = true_values_min = true_values_max = padding = None
+        pad_len = 0
+        if self.config.use_diffusion:
+            from l3di.simple_ddpm1d import SimpleDDPM1D, SimpleUNet1D
+            unet = SimpleUNet1D(in_channels=1, model_channels=64, out_channels=1,
+                                z_dim=self.config.latent_dim)
+            ddpm = SimpleDDPM1D(unet, T=1000, var_type="fixedsmall")
+            voxel_model_file = self.config.exp_path / "voxel_diffusion.pt"
+            if not voxel_model_file.exists():
+                logging.error("Voxel diffusion model not found.")
+                return
+            ddpm.load_model(voxel_model_file, self.config.device)
+            true_values = torch.tensor(self.true_values_train)
+            true_values_min = true_values.min()
+            true_values_max = true_values.max()
+            n_channels = true_values.shape[1]
+            target_len = ((n_channels - 1) // 16 + 1) * 16
+            pad_len = target_len - n_channels
+            padding = (0, pad_len)
+
+        # --- Build coord tensor + dataloader ---
+        non_zero_ccf = torch.tensor(non_zero_indices.astype(np.float32) * 0.025,
+                                    dtype=torch.float32)
         non_zero_ccf = (non_zero_ccf - self.coord_mean) / self.coord_std
         ccf_dataset = torch.utils.data.TensorDataset(
-            non_zero_ccf, torch.tensor(non_zero_indices, dtype=torch.float32),
+            non_zero_ccf, torch.tensor(non_zero_indices, dtype=torch.int32),
         )
-        ccf_dataloader = torch.utils.data.DataLoader(
+        ccf_loader = torch.utils.data.DataLoader(
             ccf_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=0,
         )
 
+        # --- Probe one batch to learn shapes and whether posterior is available ---
         self.lgp_model.eval()
+        latent_dim = None
+        has_posterior = False
         with torch.no_grad():
-            for i, batch in enumerate(tqdm(ccf_dataloader)):
-                batch_file = volume_path / f"batch_{i}.pth"
-                if batch_file.exists():
-                    continue
-                coordinates_batch = batch[0].to(self.config.device)
-                indices_batch = batch[1]
-                predictions, gp_posterior = self.lgp_model.predict(coordinates_batch)
-                predictions = predictions * self.train_std + self.train_mean
-                predictions = predictions.detach().cpu().numpy()
+            probe_coords = non_zero_ccf[:min(8, n_voxels)].to(self.config.device)
+            _, probe_post = self.lgp_model.predict(probe_coords)
+            if probe_post is not None and hasattr(probe_post, "mean") and hasattr(probe_post, "variance"):
+                try:
+                    pm = probe_post.mean
+                    pv = probe_post.variance
+                    latent_dim = int(pm.shape[-1])
+                    # Sanity-check that variance is well-formed
+                    _ = pv.detach().cpu().numpy().reshape(-1, latent_dim)
+                    has_posterior = True
+                    logging.info(f"GP posterior available; latent_dim={latent_dim}")
+                except Exception as e:
+                    logging.warning(f"Posterior present but unusable ({e}); skipping posterior storage.")
+            else:
+                logging.info("Model has no usable GP posterior; storing predictions only.")
+
+        # --- Pre-allocate accumulators (peak RAM check) ---
+        pred_bytes = n_voxels * n_lipids * 4
+        post_bytes = (n_voxels * latent_dim * 4 * 2) if has_posterior else 0
+        logging.info(f"Allocating {(pred_bytes + post_bytes) / 1e9:.2f} GB for accumulators")
+        all_preds = np.empty((n_voxels, n_lipids), dtype=np.float32)
+        all_post_mean = np.empty((n_voxels, latent_dim), dtype=np.float32) if has_posterior else None
+        all_post_var  = np.empty((n_voxels, latent_dim), dtype=np.float32) if has_posterior else None
+
+        train_mean_np = self.train_mean.cpu().numpy()
+        train_std_np  = self.train_std.cpu().numpy()
+
+        cursor = 0
+        with torch.no_grad():
+            for batch in tqdm(ccf_loader, desc="reconstructing voxels"):
+                coords = batch[0].to(self.config.device)
+                preds, gp_posterior = self.lgp_model.predict(coords)
+
+                if self.config.use_diffusion and ddpm is not None:
+                    cond = preds
+                    x_t = torch.randn(cond.shape[0], 1, cond.shape[1] + pad_len,
+                                    device=self.config.device)
+                    cond_padded = F.pad(cond, padding, "constant", 0).unsqueeze(1)
+                    sample_dict = ddpm.sample(
+                        x_t, cond_padded, gp_posterior.mean,
+                        n_steps=500, clip_denoised=True,
+                    )
+                    ddpm_pred = sample_dict["500"].squeeze().detach().cpu()
+                    if pad_len > 0:
+                        ddpm_pred = ddpm_pred[:, :-pad_len]
+                    ddpm_pred = ddpm_pred * (true_values_max - true_values_min) + true_values_min
+                    preds_np = (cond.detach().cpu() - ddpm_pred).numpy()
+                else:
+                    preds_np = preds.detach().cpu().numpy()
+                preds_np = preds_np * train_std_np + train_mean_np
                 if self.config.log_transform:
-                    predictions = np.exp(predictions) - 1e-10
-                torch.save({
-                    "coordinates": coordinates_batch.cpu(),
-                    "indices": indices_batch.cpu(),
-                    "predictions": predictions,
-                    "posterior": gp_posterior.mean.detach().cpu(),
-                }, batch_file)
+                    preds_np = np.exp(preds_np) - 1e-10
+
+                n_b = preds_np.shape[0]
+                all_preds[cursor:cursor + n_b] = preds_np.astype(np.float32, copy=False)
+                if has_posterior:
+                    all_post_mean[cursor:cursor + n_b] = (
+                        gp_posterior.mean.detach().cpu().numpy()
+                    )
+                    all_post_var[cursor:cursor + n_b] = (
+                        gp_posterior.variance.detach().cpu().numpy()
+                    )
+                cursor += n_b
+
+        # --- Save consolidated arrays ---
+        np.save(preds_file, all_preds)
+        np.save(indices_file, non_zero_indices)
+        logging.info(f"Saved predictions: {all_preds.shape} → {preds_file}")
+        if has_posterior:
+            np.save(post_mean_file, all_post_mean)
+            np.save(post_var_file, all_post_var)
+            logging.info(f"Saved posterior mean/var: {all_post_mean.shape} → {post_mean_file}")
+
+        # --- Per-lipid volumes ---
+        self._write_per_lipid_volumes(all_preds, non_zero_indices, template_shape, suffix)
+
+        # --- Per-latent volumes + aggregate uncertainty ---
+        if has_posterior and write_per_latent_volumes:
+            self._write_per_latent_volumes(all_post_mean, all_post_var, non_zero_indices,
+                                            template_shape, suffix)
+
+    def _write_per_lipid_volumes(self, predictions, indices, template_shape,
+                                suffix="", lipid_filter=None):
+        z, y, x = indices[:, 0], indices[:, 1], indices[:, 2]
+        if lipid_filter is None:
+            lipid_iter = enumerate(self.config.selected_lipids_names)
+            total = len(self.config.selected_lipids_names)
+        else:
+            lipid_iter = ((int(i), self.config.selected_lipids_names[int(i)])
+                        for i in lipid_filter)
+            total = len(lipid_filter)
+        for li, lipid_name in tqdm(lipid_iter, total=total, desc="per-lipid volumes"):
+            out_path = self.config.exp_path / f"{lipid_name}_volume{suffix}.npy"
+            out_255  = self.config.exp_path / f"{lipid_name}_volume255{suffix}.npy"
+            if out_path.exists() and out_255.exists():
+                continue
+            vol = np.full(template_shape, np.nan, dtype=np.float32)
+            vol[z, y, x] = predictions[:, li]
+            np.save(out_path, vol)
+            vmin = np.nanmin(vol); vmax = np.nanmax(vol)
+            if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
+                np.save(out_255, 255.0 * (vol - vmin) / (vmax - vmin))
+            else:
+                np.save(out_255, vol)
+
+    def _write_per_latent_volumes(self, post_mean, post_var, indices,
+                                template_shape, suffix=""):
+        """Write one .npy per latent dim for both mean and variance, plus a
+        single 'total variance' (sum over latents) volume — that's the
+        most useful uncertainty heatmap for visualization."""
+        z, y, x = indices[:, 0], indices[:, 1], indices[:, 2]
+        latent_dim = post_mean.shape[1]
+        for k in tqdm(range(latent_dim), desc="per-latent volumes"):
+            mean_path = self.config.exp_path / f"latent_{k:02d}_mean{suffix}.npy"
+            var_path  = self.config.exp_path / f"latent_{k:02d}_var{suffix}.npy"
+            if not mean_path.exists():
+                vol = np.full(template_shape, np.nan, dtype=np.float32)
+                vol[z, y, x] = post_mean[:, k]
+                np.save(mean_path, vol)
+            if not var_path.exists():
+                vol = np.full(template_shape, np.nan, dtype=np.float32)
+                vol[z, y, x] = post_var[:, k]
+                np.save(var_path, vol)
+        # Aggregate: total variance (sum across latents) — single uncertainty heatmap
+        agg_path = self.config.exp_path / f"posterior_total_variance{suffix}.npy"
+        if not agg_path.exists():
+            vol = np.full(template_shape, np.nan, dtype=np.float32)
+            vol[z, y, x] = post_var.sum(axis=1)
+            np.save(agg_path, vol)
+            logging.info(f"Saved total-variance map (Σ over latents): {agg_path}")
 
     def load_whole_brain_reconstruction(self, lipid):
-        """
-        Loads and saves the whole brain reconstruction for a specific lipid.
-
-        This does not need gpu to be run, as all the data was already batched and saved.
-
-        Args:
-            lipid (int): The index of the lipid to reconstruct.
-        """
-        if self.config.use_diffusion:
-             volume_path = self.config.exp_path / "volume_diffusion"
-             suffix = "_diffusion"
-        else:
-             volume_path = self.config.exp_path / "volume"
-             suffix = ""
-
-        template_file = volume_path / "template_volume.npy"
-        if not template_file.exists():
-            logging.error("Template volume does not exist. Please run whole_brain_reconstruction() first.")
-            return None
-        template_volume = np.load(template_file)
-        non_zero_indices = np.argwhere(template_volume > 5)
-        # fill template volume with zeros
-        template_volume = np.zeros_like(template_volume, dtype=np.float32)
-
+        """Return per-lipid volume; builds on demand from consolidated array."""
+        suffix = "_diffusion" if self.config.use_diffusion else ""
         lipid_name = self.config.selected_lipids_names[lipid]
         lipid_volume_name = self.config.exp_path / f"{lipid_name}_volume{suffix}.npy"
         if lipid_volume_name.exists():
-            logging.info(f"Lipid volume for {lipid_name} already exists, loading from file")
-            lipid_volume = np.load(lipid_volume_name)
-            return lipid_volume
-        else:
-            for i in tqdm(range(len(non_zero_indices) // self.config.batch_size + 1)):
-                batch_file = volume_path / f"batch_{i}.pth"
-                if not batch_file.exists():
-                    continue
-                batch_data = torch.load(batch_file, weights_only=False)
-                template_volume[batch_data["indices"][:, 0].long(),
-                                batch_data["indices"][:, 1].long(),
-                                batch_data["indices"][:, 2].long()] = batch_data["predictions"][:, lipid]
-            # Save the reconstructed lipid volume
-            # We need to ensure the volume is saved in the same shape as the template
-            # set 0 to nan
-            template_volume[template_volume == 0] = np.nan
+            return np.load(lipid_volume_name)
 
-            np.save(lipid_volume_name, template_volume)
-            logging.info(f"Lipid volume for {lipid_name} saved to {lipid_volume_name}")
-            template_volume = 255*( template_volume - np.nanmin(template_volume)) / (np.nanmax(template_volume)- np.nanmin(template_volume))
-            np.save(self.config.exp_path / f"{lipid_name}_volume255{suffix}.npy", template_volume)
-            return template_volume
+        volume_path = self.config.exp_path / ("volume_diffusion"
+                                            if self.config.use_diffusion else "volume")
+        preds_file = volume_path / "all_predictions.npy"
+        idx_file   = volume_path / "all_indices.npy"
+        template_file = self.config.reference_file
+        if not (preds_file.exists() and idx_file.exists() and template_file.exists()):
+            logging.error("No consolidated predictions found. Run whole_brain_reconstruction().")
+            return None
+        template_shape = np.load(template_file).shape
+        indices = np.load(idx_file)
+        predictions = np.load(preds_file, mmap_mode="r")
+        vol = np.full(template_shape, np.nan, dtype=np.float32)
+        vol[indices[:, 0], indices[:, 1], indices[:, 2]] = predictions[:, lipid]
+        np.save(lipid_volume_name, vol)
+        return vol
+
+    def load_posterior_uncertainty(self, latent_idx=None):
+        """Return a 3D volume of GP posterior uncertainty.
+
+        Args:
+            latent_idx: int or None. None → returns the total variance summed
+                        over all latents (the 'overall uncertainty' map).
+                        int → returns the variance for that specific latent dim.
+        """
+        suffix = "_diffusion" if self.config.use_diffusion else ""
+        if latent_idx is None:
+            path = self.config.exp_path / f"posterior_total_variance{suffix}.npy"
+        else:
+            path = self.config.exp_path / f"latent_{latent_idx:02d}_var{suffix}.npy"
+        if path.exists():
+            return np.load(path)
+
+        # Build on demand from consolidated array
+        volume_path = self.config.exp_path / ("volume_diffusion"
+                                            if self.config.use_diffusion else "volume")
+        pv_file = volume_path / "predictions_posterior_var.npy"
+        idx_file = volume_path / "predictions_indices.npy"
+        template_file = self.config.reference_file
+        if not (pv_file.exists() and idx_file.exists() and template_file.exists()):
+            return None
+        template_shape = np.load(template_file).shape
+        indices = np.load(idx_file)
+        post_var = np.load(pv_file, mmap_mode="r")
+        vol = np.full(template_shape, np.nan, dtype=np.float32)
+        if latent_idx is None:
+            vol[indices[:, 0], indices[:, 1], indices[:, 2]] = np.asarray(post_var).sum(axis=1)
+        else:
+            vol[indices[:, 0], indices[:, 1], indices[:, 2]] = post_var[:, latent_idx]
+        return vol
 
     def train_fit(self):
             with torch.no_grad():

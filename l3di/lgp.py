@@ -61,7 +61,7 @@ class IndependentMultitaskGPModel(ApproximateGP):
     We define a GP prior for the latent space. The GP prior is defined by a mean and a covariance function.
     """
 
-    def __init__(self, inducing_points, num_tasks, kernel_type="rbf", nu=1.5, minimal_length_scale=1,input_dim=174):
+    def __init__(self, inducing_points, num_tasks, kernel_type="rbf", nu=1.5, minimal_length_scale=1, input_dim=174):
         """
         Construct the GPModel class.
 
@@ -137,9 +137,10 @@ class LGP(nn.Module):
     """
     Latent Gaussian Process model with a conditional likelihood on the latent space.
     """
-    def __init__(self, p, d, n_neurons, dropout, activation,  device, gp_model):
+    def __init__(self, p, d, n_neurons, dropout, activation,  device, gp_model, use_rsample=True):
         super(LGP, self).__init__()
         self.mode = "lgp"
+        self.use_rsample = use_rsample
         self.p = p  # number of channels
         self.d = d  # latent dimension
 
@@ -178,7 +179,7 @@ class LGP(nn.Module):
 
     def forward(self, coords):
         gp_posterior = self.gp_model(coords)
-        if self.training:
+        if self.training and self.use_rsample:
             latent_forward = gp_posterior.rsample()
         else:
             latent_forward = gp_posterior.mean

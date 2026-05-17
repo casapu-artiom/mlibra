@@ -28,6 +28,7 @@ class MaldiConfig:
     device: str
     kernel: str
     slices_dataset_file: str
+    template_name: str
     reference_file: str
     annotations_file: str
     log_transform: bool
@@ -41,6 +42,9 @@ class MaldiConfig:
     available_lipids: List[str]
     selected_channels: List[int]
     use_diffusion: bool = False
+    do_brain_reconstruction: bool = False
+    reconstruction_lipids: list = None
+    reconstruction_lipids_by_index: bool = False
 
     @staticmethod
     def from_args(args):
@@ -66,8 +70,9 @@ class MaldiConfig:
         available_lipids, selected_channels, selected_lipids_names = read_channels(selected_lipids_file, available_lipids_file)
         output_path = Path(args["output_dir"])
         slices_dataset_file = args['slices_dataset_file']
+        template_name = args.get("template_name", "allen_mouse_25um")
         reference_file = args['reference_file']
-        annotations_file = args['annotations_file']
+        annotations_file = args.get('annotations_file', None)
         # Train test split arguments
         section_filter, test_filter = extract_filters(slices_dataset_file)
         # GP arguments
@@ -85,8 +90,12 @@ class MaldiConfig:
         learning_rate = args.get("learning_rate", 0.001)
         exp_name = exp_name + str(args["n_pixels"])
         use_diffusion = args.get("use_diffusion", False)
-
-
+        do_brain_reconstruction = args.get("do_brain_reconstruction", False)
+        reconstruction_lipids = args.get("reconstruction_lipids", None)
+        reconstruction_lipids_by_index = False
+        if reconstruction_lipids and reconstruction_lipids[0].isdigit():
+            reconstruction_lipids = [int(i) for i in reconstruction_lipids]
+            reconstruction_lipids_by_index = True
         # Create paths
         if log_transform:
             exp_name = exp_name + "_log"
@@ -143,6 +152,7 @@ class MaldiConfig:
                            slices_dataset_file=slices_dataset_file,
                            reference_file=reference_file,
                            annotations_file=annotations_file,
+                           template_name=template_name,
                            log_transform=log_transform,
                            nu=nu,
                            n_pixels=n_pixels,
@@ -151,7 +161,10 @@ class MaldiConfig:
                            test_filter=test_filter,
                            selected_channels=selected_channels,
                            available_lipids=available_lipids,
-                           use_diffusion=use_diffusion)
+                           use_diffusion=use_diffusion,
+                           do_brain_reconstruction=do_brain_reconstruction,
+                           reconstruction_lipids=reconstruction_lipids,
+                           reconstruction_lipids_by_index=reconstruction_lipids_by_index)
 
     def to_dict(self):
         """
@@ -176,8 +189,9 @@ class MaldiConfig:
             "device": self.device,
             "kernel": self.kernel,
             "slices_dataset_file": self.slices_dataset_file,
-            'reference_file': self.reference_file,
-            'annotations_file': self.annotations_file,
+            "template_name": self.template_name,
+            "reference_file": self.reference_file,
+            "annotations_file": self.annotations_file,
             "log_transform": self.log_transform,
             "nu": self.nu,
             "n_pixels": self.n_pixels,
@@ -186,6 +200,8 @@ class MaldiConfig:
             "test_filter": self.test_filter,
             "selected_lipids_names": self.selected_lipids_names,
             "use_diffusion": self.use_diffusion,
+            "do_brain_reconstruction": self.do_brain_reconstruction,
+            "reconstruction_lipids": self.reconstruction_lipids,
         }
 
 def extract_filters(left_out_slice):
