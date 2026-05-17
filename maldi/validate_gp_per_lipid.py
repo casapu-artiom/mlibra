@@ -281,7 +281,7 @@ def evaluate_multitask_vgp(model, likelihood, test_x, test_y, batch_size, device
 def run_comparison(args, config, device, inducing_points, train_x, test_x,
                    train_data, test_data,  knn_k, num_modes,
                    bump_scale, bump_decay, laplacian_norm, graphbandwidth_init,
-                   edge_index, edge_value, eigval, eigvec):
+                   knn, edge_index, edge_value, eigval, eigvec):
     num_lipids = min(args.get("num_lipids"), len(config.selected_lipids_names))
     lipid_names = list(config.selected_lipids_names[:num_lipids])
 
@@ -326,6 +326,7 @@ def run_comparison(args, config, device, inducing_points, train_x, test_x,
     from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
     rie_kernel = RiemannMaternKernel(
         nu=config.nu,
+        knn=knn,
         edge_index=edge_index,
         edge_value=edge_value,
         eigval=eigval,
@@ -529,7 +530,7 @@ def main():
         bump_scale=bump_scale, bump_decay=bump_decay,
         laplacian_norm=laplacian_norm,
         graphbandwidth_init=graphbandwidth_init,
-        edge_index=edge_index, edge_value=edge_value,
+        knn=knn, edge_index=edge_index, edge_value=edge_value,
         eigval=eigval, eigvec=eigvec,
     )
 
