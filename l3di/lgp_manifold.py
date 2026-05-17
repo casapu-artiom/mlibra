@@ -62,7 +62,7 @@ class LatentRiemannGP(ApproximateGP):
         variational_strategy = IndependentMultitaskVariationalStrategy(
             VariationalStrategy(
                 self, inducing_points, variational_distribution, 
-                learn_inducing_locations=False  
+                learn_inducing_locations=True  
             ),
             num_tasks=num_tasks,
         )
@@ -134,8 +134,7 @@ class ManifoldLGP(nn.Module):
         if self.training:
             latent_forward = gp_posterior.rsample() 
         else:
-            latent_forward = gp_posterior.mean
-            
+            latent_forward = gp_posterior.mean    
         x_reconstructed = self.decode(latent_forward)
         return x_reconstructed, gp_posterior
 

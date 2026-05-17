@@ -15,6 +15,8 @@ from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as knn_m
 from manifold_gp.utils.compute_eigenvectors import LaplacianEigensolver, make_key as eigen_make_key
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 
+from utils import crop_or_stride_volume, reference_ccf_from_subvolume
+
 def main():
     parser = argparse.ArgumentParser(description="Pre-compute Graph & Eigenvectors for MALDI")
     parser.add_argument("--reference-volume", type=str, required=True, help="Base reference volume for calculations")
@@ -29,6 +31,13 @@ def main():
     
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--project", type=str, default="riemann-eigensolver", help="W&B Project name")
+
+    parser.add_argument(
+        "--region-bbox", type=int, nargs=6, default=None,
+        metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"),
+        help="Optional voxel bbox in the full-res 25um atlas. If set, "
+             "stride is ignored and the volume is cropped at full resolution.",
+    )
     args = parser.parse_args()
 
     # 1. Initialize W&B
@@ -40,31 +49,32 @@ def main():
     # --- Load + downsample (do this once; everything else derives from it) ---
     reference_image   = np.load(args.reference_volume)
     annotation_volume = np.load(args.annotations_volume)
-
-    sub_volume = reference_image[::args.stride, ::args.stride, ::args.stride]
-    sub_atlas  = annotation_volume[::args.stride, ::args.stride, ::args.stride]
     threshold  = 5.0
 
-    mask = sub_volume > threshold
-    z, y, x = np.where(mask)
-
-    voxel_idx = np.stack([z, y, x], axis=1).astype(np.float32)
-    mm_coords = voxel_idx * (args.stride * 0.025)
-
+    sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
+        reference_image, annotation_volume, args.stride, args.region_bbox,
+    )
+    mm_coords = reference_ccf_from_subvolume(
+        sub_volume, voxel_offset, voxel_scale_mm, threshold,
+    )
+    n_nodes = mm_coords.shape[0]
+    logging.info(f"Tissue nodes after threshold={threshold}: {n_nodes}")
+    wandb.log({"graph/num_nodes": n_nodes})
+ 
     coord_mean = mm_coords.mean(axis=0)
     coord_std  = mm_coords.std(axis=0)
-
+ 
     reference_coords = torch.from_numpy(
         (mm_coords - coord_mean) / coord_std
     ).float().to(device).contiguous()
-
     # ==========================================
     knn_config = {
         "template": "allen_25um",
         "stride": args.stride,
         "method": "faiss",
         "k": args.k,
-        "thresh": 5.0
+        "thresh": 5.0,
+        "bbox": tuple(args.region_bbox) if args.region_bbox is not None else None,
     }
     knn_key = knn_make_key(knn_config)
     

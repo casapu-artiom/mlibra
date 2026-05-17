@@ -12,7 +12,7 @@ from tqdm import tqdm
 from pathlib import Path
 import matplotlib.pyplot as plt
 import wandb
-from config import MaldiConfig
+from .config import MaldiConfig
 from l3di.lgp import LGP
 
 def density_scatter(ax, x, y, x_min, x_max, y_min, y_max, bins=50, **kwargs):
@@ -106,6 +106,17 @@ class MaldiExperiment:
         self.col_means = None
         self.col_stds = None
 
+    # ------------------------------------------------------------------
+    # Internal MALDI parquet reader: cuts down boilerplate and makes it
+    # trivial to swap the filter (e.g. when restricting to a region bbox).
+    # ------------------------------------------------------------------
+    def _read_maldi(self, columns, *, train=True, as_tensor=False, dtype=torch.float32):
+        flt = self.train_filter if train else self.test_filter
+        df = pd.read_parquet(self.config.maldi_file, columns=columns, filters=flt)
+        if as_tensor:
+            return torch.tensor(df.values, dtype=dtype)
+        return df
+
     def load_train_sections(self):
         self.train_sections = pd.read_parquet(self.config.maldi_file,
                                                   columns=["Section"],
@@ -113,42 +124,27 @@ class MaldiExperiment:
 
     def load_train_pixel_coordinates(self):
         logging.info("Loading training pixel coordinates")
-        coordinates_names = ["x", "y"]
-        self.pixel_coordinates_train = pd.read_parquet(self.config.maldi_file,
-                                                    columns=coordinates_names,
-                                                    filters=self.train_filter).values
+        self.pixel_coordinates_train = self._read_maldi(["x", "y"], train=True).values
 
     def load_train_pixel_index_coordinates(self):
-        logging.info("Loading training pixel coordinates")
-        # Using 'x' and 'y' as per your data
-        pixel_names = ["x_index", "y_index", "z_index"] 
-        self.pixel_index_coordinates_train = torch.tensor(pd.read_parquet(
-            self.config.maldi_file,
-            columns=pixel_names,
-            filters=self.train_filter
-        ).values, dtype=torch.float32)
+        logging.info("Loading training pixel index coordinates")
+        self.pixel_index_coordinates_train = self._read_maldi(
+            ["x_index", "y_index", "z_index"], train=True, as_tensor=True,
+        )
 
     def load_test_pixel_index_coordinates(self):
-        logging.info("Loading training pixel coordinates")
-        # Using 'x' and 'y' as per your data
-        pixel_names = ["x_index", "y_index", "z_index"] 
-        self.pixel_index_coordinates_test = torch.tensor(pd.read_parquet(
-            self.config.maldi_file,
-            columns=pixel_names,
-            filters=self.test_filter
-        ).values, dtype=torch.float32)
+        logging.info("Loading test pixel index coordinates")
+        self.pixel_index_coordinates_test = self._read_maldi(
+            ["x_index", "y_index", "z_index"], train=False, as_tensor=True,
+        )
 
     def load_train_samples(self):
         logging.info("Loading training samples")
-        self.train_samples = pd.read_parquet(self.config.maldi_file,
-                                             columns=["Sample"],
-                                             filters=self.train_filter)
-        
+        self.train_samples = self._read_maldi(["Sample"], train=True)
+
     def load_test_samples(self):
-        logging.info("Loading training samples")
-        self.test_samples = pd.read_parquet(self.config.maldi_file,
-                                             columns=["Sample"],
-                                             filters=self.test_filter)
+        logging.info("Loading test samples")
+        self.test_samples = self._read_maldi(["Sample"], train=False)
 
 
     def load_train_data(self):
@@ -248,35 +244,29 @@ class MaldiExperiment:
             torch.save(col_means, self.config.exp_path / "lipid_means.pth")
             torch.save(col_stds, self.config.exp_path / "lipid_stds.pth")
 
+    def _load_coords(self, train=True):
+        """Shared loader for {train,test}_coordinates: read xccf/yccf/zccf,
+        normalize with global coord_mean/coord_std, and cache on self."""
+        attr = "coordinates_train" if train else "coordinates_test"
+        if getattr(self, attr) is not None:
+            return
+        logging.info(f"Loading coordinates for {'training' if train else 'test'} data")
+        coords = self._read_maldi(
+            ["xccf", "yccf", "zccf"], train=train, as_tensor=True,
+        )
+        logging.info(f"Coordinates shape: {coords.shape}")
+        coords = (coords - self.coord_mean) / self.coord_std
+        n_nans = torch.isnan(coords).sum()
+        assert not torch.isnan(coords).any(), \
+            f"Coordinates contain NaNs: {n_nans} NaNs found in coordinates"
+        setattr(self, attr, coords)
+        logging.info("Coordinates normalization successful")
+
     def load_coord_train_data(self):
-        if self.coordinates_train is None:
-            logging.info("Loading coordinates for training data")
-            coordinates_names = ["xccf", "yccf", "zccf"]
-            self.coordinates_train = pd.read_parquet(self.config.maldi_file,
-                                                     columns=coordinates_names,
-                                                     filters=self.train_filter).values
-            self.coordinates_train = torch.tensor(self.coordinates_train, dtype=torch.float32)
-            logging.info(f"Coordinates shape: {self.coordinates_train.shape}")
-            logging.info("Normalizing coordinates")
-            self.coordinates_train = (self.coordinates_train - self.coord_mean) / self.coord_std
-            n_nans = torch.isnan(self.coordinates_train).sum()
-            assert not torch.isnan(self.coordinates_train).any(), f"Coordinates contain NaNs: {n_nans} NaNs found in coordinates"
-            logging.info("Coordinates normalization successful")
+        self._load_coords(train=True)
 
     def load_coord_test_data(self):
-        if self.coordinates_test is None:
-            logging.info("Loading coordinates for test data")
-            coordinates_names = ["xccf", "yccf", "zccf"]
-            self.coordinates_test = pd.read_parquet(self.config.maldi_file,
-                                                    columns=coordinates_names,
-                                                    filters=self.test_filter).values
-            self.coordinates_test = torch.tensor(self.coordinates_test, dtype=torch.float32)
-            logging.info(f"Coordinates shape: {self.coordinates_test.shape}")
-            logging.info("Normalizing coordinates")
-            self.coordinates_test = (self.coordinates_test - self.coord_mean) / self.coord_std
-            n_nans = torch.isnan(self.coordinates_test).sum()
-            assert not torch.isnan(self.coordinates_test).any(), f"Coordinates contain NaNs: {n_nans} NaNs found in coordinates"
-            logging.info("Coordinates normalization successful")
+        self._load_coords(train=False)
 
     def load_checkpoint(self):
         if len(list(self.config.checkpoint_path.glob("*.pth"))) > 0:
@@ -783,6 +773,85 @@ class MaldiExperiment:
                         "posterior": gp_posterior.mean.detach().cpu()
                     }, batch_file)
 
+    def region_reconstruction(self, region_bbox, threshold: float = 5.0):
+        """
+        Like whole_brain_reconstruction, but only over voxels inside `region_bbox`.
+
+        Use this for region-restricted experiments so the trained GP isn't asked
+        to predict far outside its training support. Output shape mirrors that
+        of whole_brain_reconstruction (one batch_*.pth per dataloader batch in
+        a `volume_region_<bbox>` directory).
+
+        Parameters
+        ----------
+        region_bbox : sequence of 6 ints
+            (zmin, zmax, ymin, ymax, xmin, xmax) in voxel coords of the full-res
+            25um atlas.
+        threshold : float
+            Tissue threshold on the template volume (default 5.0, same as the
+            graph builder).
+        """
+        if (self.config.exp_path / "model.pth").exists():
+            logging.info("Loading model from file")
+            self.lgp_model.load_state_dict(
+                torch.load(self.config.exp_path / "model.pth", map_location=self.config.device)
+            )
+            logging.info("Model loaded successfully")
+        else:
+            logging.error("Model not found. Please run the experiment first.")
+            return
+
+        bbox_str = "_".join(str(int(b)) for b in region_bbox)
+        volume_path = self.config.exp_path / f"volume_region_{bbox_str}"
+        volume_path.mkdir(parents=True, exist_ok=True)
+        template_file = volume_path / "template_volume.npy"
+        template_volume = self.maybe_download_template_brainglobe(volume_path, template_file)
+
+        # Crop the template to the bbox; reconstruct full-res voxel indices.
+        zmin, zmax, ymin, ymax, xmin, xmax = (int(b) for b in region_bbox)
+        sub = template_volume[zmin:zmax, ymin:ymax, xmin:xmax]
+        z, y, x = np.where(sub > threshold)
+        if z.shape[0] == 0:
+            logging.warning(
+                f"No tissue voxels (>{threshold}) inside bbox {region_bbox}. "
+                "Nothing to reconstruct."
+            )
+            return
+        non_zero_indices = np.stack([z + zmin, y + ymin, x + xmin], axis=1)
+        logging.info(
+            f"Region reconstruction: {non_zero_indices.shape[0]} voxels in bbox {region_bbox}"
+        )
+
+        non_zero_ccf = non_zero_indices.astype(np.float32) * 0.025
+        non_zero_ccf = torch.tensor(non_zero_ccf, dtype=torch.float32)
+        non_zero_ccf = (non_zero_ccf - self.coord_mean) / self.coord_std
+        ccf_dataset = torch.utils.data.TensorDataset(
+            non_zero_ccf, torch.tensor(non_zero_indices, dtype=torch.float32),
+        )
+        ccf_dataloader = torch.utils.data.DataLoader(
+            ccf_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=0,
+        )
+
+        self.lgp_model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(ccf_dataloader)):
+                batch_file = volume_path / f"batch_{i}.pth"
+                if batch_file.exists():
+                    continue
+                coordinates_batch = batch[0].to(self.config.device)
+                indices_batch = batch[1]
+                predictions, gp_posterior = self.lgp_model.predict(coordinates_batch)
+                predictions = predictions * self.train_std + self.train_mean
+                predictions = predictions.detach().cpu().numpy()
+                if self.config.log_transform:
+                    predictions = np.exp(predictions) - 1e-10
+                torch.save({
+                    "coordinates": coordinates_batch.cpu(),
+                    "indices": indices_batch.cpu(),
+                    "predictions": predictions,
+                    "posterior": gp_posterior.mean.detach().cpu(),
+                }, batch_file)
+
     def load_whole_brain_reconstruction(self, lipid):
         """
         Loads and saves the whole brain reconstruction for a specific lipid.
@@ -835,6 +904,20 @@ class MaldiExperiment:
             return template_volume
 
     def train_fit(self):
+            with torch.no_grad():
+                # Pull a small sample of training coords. Reuse the loader the experiment
+                # already built to avoid re-reading the parquet.
+                #coords_train = experiment.coordinates_train.to(experiment.config.device)
+                x1 = self.coordinates_train[:50].to(self.config.device).contiguous()
+                x2 = self.coordinates_train[50:100].to(self.config.device).contiguous()
+                kernel = self.lgp_model.gp_model.covar_module
+                K = kernel(x1, x2).evaluate()
+                print(f"[init kernel spread] K shape:  {tuple(K.shape)}")
+                print(f"[init kernel spread] K mean:   {K.mean().item():.4g}")
+                print(f"[init kernel spread] K std:    {K.std().item():.4g}")
+                print(f"[init kernel spread] K min/max:{K.min().item():.4g} / {K.max().item():.4g}")
+                print(f"[init kernel spread] std/|mean|: {(K.std() / K.abs().mean()).item():.4g}")
+
             # let's use ADAMW instead of ADAM
             optimizer = torch.optim.AdamW(self.lgp_model.parameters(), lr=self.config.learning_rate, weight_decay=1e-3)
             logging.info("ready to roll")
@@ -857,6 +940,17 @@ class MaldiExperiment:
                                         epochs=self.config.epochs,
                                         current_epoch=self.current_epoch,
                                         print_every=1000)
+                    
+            with torch.no_grad():
+                x1 = self.coordinates_train[:50].to(self.config.device).contiguous()
+                x2 = self.coordinates_train[50:100].to(self.config.device).contiguous()
+                kernel = self.lgp_model.gp_model.covar_module
+                K = kernel(x1, x2).evaluate()
+                print(f"[trained kernel spread] K shape:  {tuple(K.shape)}")
+                print(f"[trained kernel spread] K mean:   {K.mean().item():.4g}")
+                print(f"[trained kernel spread] K std:    {K.std().item():.4g}")
+                print(f"[trained kernel spread] std/|mean|: {(K.std() / K.abs().mean()).item():.4g}")
+
 
     def predict_original_scale(self, train_predictions, test_predictions):
         if self.train_data is None:
@@ -931,6 +1025,7 @@ class MaldiExperiment:
 
     def run(self):
         """Run the experiment."""
+        
         # Fit he model using the training data,
         logging.info("Starting training loop VAE")
         if(self.config.exp_path / "model.pth").exists():

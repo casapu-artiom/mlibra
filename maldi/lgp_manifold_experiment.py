@@ -1,30 +1,40 @@
-"""This script sets up and runs a MALDI experiment using the l3di library with a Riemann Manifold."""
+"""Riemann manifold MALDI experiment.
+
+Pair this with `lgp_experiment.py` (the Euclidean Matern baseline) for the
+kernel comparison. Both scripts share `--region-bbox` semantics via utils.py
+so a region run is configured the same way on either side.
+"""
 import logging
 from pathlib import Path
-import torch
-import pandas as pd
-import numpy as np
 from argparse import ArgumentParser
+
+import torch
+import numpy as np
 
 import wandb
 
 from experiment import MaldiExperiment
 from config import MaldiConfig
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
-from manifold_gp.utils.compute_eigenvectors import LaplacianEigensolver
-from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as make_graph_key
 from manifold_gp.utils.compute_eigenvectors import (
     LaplacianEigensolver, make_key as make_eig_key,
 )
-from utils import get_inducing_points
-
-# Import the new Manifold classes we added to lgp.py
-from l3di.lgp_manifold import LatentRiemannGP, ManifoldLGP
+from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as make_graph_key
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
+from l3di.lgp_manifold import LatentRiemannGP, ManifoldLGP
+
+from utils import (
+    get_inducing_points,
+    get_bbox_inducing_points,
+    apply_region_to_config,
+    crop_or_stride_volume,
+    reference_ccf_from_subvolume,
+)
+
 
 def parse_args():
     """Parse command line arguments."""
-    parser = ArgumentParser(description="Run MALDI experiment with l3di.")
+    parser = ArgumentParser(description="Run MALDI experiment with l3di (Riemann).")
     parser.add_argument("--mode", type=str, required=True, help="Experiment mode (e.g., 'train', 'test').")
     parser.add_argument("--dataset-path", dest="dataset_path", type=str, required=True, help="Path to the dataset.")
     parser.add_argument("--maldi-file", dest="maldi_file", type=str, required=True, help="Path to the MALDI file.")
@@ -37,8 +47,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
     parser.add_argument("--latent-dim", dest="latent_dim", type=int, default=10, help="Dimensionality of the latent space.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to run the experiment on (e.g., 'cpu', 'cuda').")
-    parser.add_argument("--kernel", type=str, default="rbf", help="Kernel type for the GP model.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to run the experiment on.")
+    parser.add_argument("--kernel", type=str, default="rbf", help="Kernel type for the GP model (legacy, ignored by Riemann).")
     parser.add_argument("--log-transform", dest="log_transform", action='store_true', help="Apply log transformation to the data.")
     parser.add_argument("--nu", type=float, default=1.0, help="Smoothness parameter for the Riemann GP model.")
     parser.add_argument("--n-pixels", dest="n_pixels", type=int, default=10, help="Number of pixels to consider in the experiment.")
@@ -48,7 +58,7 @@ def parse_args():
     parser.add_argument("--use-diffusion", dest="use_diffusion", action='store_true', help="Use diffusion model in the experiment.")
     parser.add_argument("--knn-method", dest="knn_method", type=str, default="faiss",
                         choices=["faiss", "anatomical_atlas"])
-    parser.add_argument("--laplacian-norm", dest="laplacian_norm", type=str, default="symmetric", help="Normalization for the graph laplacian",
+    parser.add_argument("--laplacian-norm", dest="laplacian_norm", type=str, default="symmetric",
                         choices=["symmetric", "randomwalk"])
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
     parser.add_argument("--knn-k", dest="knn_k", type=int, default=15, help="Number of knn neighbours for the Graph Laplacian.")
@@ -56,8 +66,20 @@ def parse_args():
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
-    
+
+    # ---- region restriction ----
+    parser.add_argument(
+        "--region-bbox", dest="region_bbox", type=int, nargs=6, default=None,
+        metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"),
+        help=("Optional bbox in voxel coords of the full-res 25um atlas. "
+              "If set: the atlas is cropped at full resolution (stride is "
+              "ignored), inducing points are placed inside the bbox via "
+              "k-means, and MALDI train/test points are filtered to the "
+              "same bbox in mm."),
+    )
+
     return vars(parser.parse_args())
+
 
 def coarsen_annotation(annotation, atlas, max_depth=4):
     """Collapse leaf labels to a chosen ancestor depth in the structure tree."""
@@ -78,13 +100,14 @@ def coarsen_annotation(annotation, atlas, max_depth=4):
             lut[src] = dst
     return lut[annotation]
 
+
 def _load_or_download_template(volume_path: Path):
     from bg_atlasapi.bg_atlas import BrainGlobeAtlas
     atlas = BrainGlobeAtlas("allen_mouse_25um")
- 
+
     template_file = volume_path / "template_volume.npy"
     annotation_file = volume_path / "annotations.npy"
- 
+
     if not template_file.exists() or not annotation_file.exists():
         logging.info("Downloading template volume via BrainGlobe Atlas API...")
         template_volume = atlas.reference
@@ -97,21 +120,36 @@ def _load_or_download_template(volume_path: Path):
         logging.info("Template volume already exists, loading from file")
         template_volume = np.load(template_file)
         annotation_volume = np.load(annotation_file)
- 
+
     return template_volume, annotation_volume, atlas
 
 
 def setup_experiment(args):
     config = MaldiConfig.from_args(args)
     logging.info("Configuration created successfully")
-    
-    # 1. We still use get_inducing_points to get the scaling factors
-    # (coord_mean and coord_std) to ensure normalization is consistent.
-    logging.info("Calculating coordinate normalization factors...")
-    inducing_points, coord_mean, coord_std = get_inducing_points(
-        config.exp_path, config.dataset_path, config.num_inducing
-    )
 
+    region_bbox = args.get("region_bbox", None)
+
+    # 1. Patch the config's MALDI parquet filters so train/test only sees
+    #    points inside the bbox. No-op when region_bbox is None.
+    apply_region_to_config(config, region_bbox)
+
+    # 2. Inducing points: bbox-restricted k-means when bbox is set, else
+    #    the original whole-brain symmetric k-means. Both routines use the
+    #    *global* coord_mean / coord_std so the standardized space matches.
+    logging.info("Calculating coordinate normalization factors and inducing points...")
+    if region_bbox is not None:
+        inducing_points, coord_mean, coord_std = get_bbox_inducing_points(
+            config.exp_path, config.dataset_path, config.num_inducing, region_bbox,
+        )
+        config.num_inducing = inducing_points.shape[0]
+    else:
+        inducing_points, coord_mean, coord_std = get_inducing_points(
+            config.exp_path, config.dataset_path, config.num_inducing,
+        )
+    logging.info(f"Got {inducing_points.shape[0]} inducing points")
+
+    # 3. Atlas: download (if needed), coarsen annotations, then crop or stride.
     volume_path = config.exp_path / "volume"
     template_volume, annotation_volume, atlas = _load_or_download_template(volume_path)
     annotation_coarse = coarsen_annotation(annotation_volume, atlas, max_depth=4)
@@ -119,44 +157,48 @@ def setup_experiment(args):
     template_name        = "allen_mouse_25um"
     threshold            = 5
     stride               = args.get("stride", 4)
-    knn_k                = args.get("knn_k", 4)
+    knn_k                = args.get("knn_k", 15)
     nlist                = args.get("n_list", 1)
     num_modes            = args.get("num_modes", 200)
-    bump_scale           = args.get("bump_scale", 3.0)
-    bump_decay           = args.get("bump_scale", 0.05)
+    bump_scale           = args.get("bump_scale", 20.0)
+    bump_decay           = args.get("bump_scale", 0.01)
     laplacian_norm       = "symmetric"
-    graphbandwidth_init  = 1.0   # pinned: used for the eigensolve AND for kernel init
+    graphbandwidth_init  = 1.0   # used for both eigensolve and kernel init
     knn_method           = args.get("knn_method", "faiss")
 
-    sub_volume = template_volume[::stride, ::stride, ::stride]
-    z, y, x = np.where(sub_volume > threshold)
-    reference_ccf = np.stack([z, y, x], axis=1) * stride * 0.025
+    sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
+        template_volume, annotation_coarse, stride, region_bbox,
+    )
+    reference_ccf = reference_ccf_from_subvolume(
+        sub_volume, voxel_offset, voxel_scale_mm, threshold,
+    )
     reference_nodes = torch.tensor(reference_ccf, dtype=torch.float32)
     reference_nodes = (reference_nodes - coord_mean) / coord_std
     reference_nodes = reference_nodes.to(config.device).contiguous()
 
-
+    # 4. Build (or load) the KNN graph.
     eigenvector_dir = Path(args.get("eigenvector_dir"))
     eigenvector_dir.mkdir(parents=True, exist_ok=True)
 
     graph_cache_dir = eigenvector_dir / "knn"
     graphs = KnnGraphCache(cache_dir=graph_cache_dir, verbose=True)
- 
+
     graph_key_parts = {
         "template": template_name,
-        "stride": stride,
+        "stride": stride if region_bbox is None else 1,
         "thresh": threshold,
         "method": knn_method,
         "k": knn_k,
         "nlist": nlist,
+        "bbox": tuple(region_bbox) if region_bbox is not None else None,
     }
     if knn_method == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
         graph_key_parts["conn"] = 3
- 
+
     graph_key = make_graph_key(graph_key_parts)
     logging.info(f"Graph cache key: {graph_key}")
- 
+
     wandb.init(project=config.exp_name + "_knn_eig", config=args)
 
     if knn_method == "faiss":
@@ -171,16 +213,12 @@ def setup_experiment(args):
             device=config.device,
         )
     elif knn_method == "anatomical_atlas":
-        # Same standardized coords as the FAISS path. The anatomical builder
-        # uses these for KNN distance and inter-region edge values; voxel
-        # indices for atlas lookup and grid-adjacency come from `volume` +
-        # `threshold` (np.where(volume > threshold) inside the builder).
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key,
             method="anatomical_atlas",
             volume=sub_volume,
             threshold=threshold,
-            atlas_volume=annotation_coarse,
+            atlas_volume=sub_atlas,
             connectivity=3,
             coords=reference_nodes,
             k=knn_k,
@@ -191,35 +229,28 @@ def setup_experiment(args):
         )
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
- 
-    # ----------------------------------------------------------------------
-    # 5. Eigenpairs: compute (or load from cache) BEFORE the kernel exists.
-    #
-    #    The kernel now requires eigvecs at construction, with no fallback,
-    #    so we have to do this step first. We build a transient
-    #    GraphLaplacianOperator from (edges, n_nodes, graphbandwidth_init,
-    #    laplacian_norm) and hand it to the solver. The same
-    #    `graphbandwidth_init` is also passed to the kernel below so the
-    #    eigvecs match the kernel's actual initial bandwidth.
-    # ----------------------------------------------------------------------
+
+    # 5. Eigenpairs: compute (or load from cache) before kernel construction.
     eigvec_cache_dir = eigenvector_dir / "eigvecs"
- 
     laplacian_op = GraphLaplacianOperator(
         edge_value, edge_index, knn.x.shape[0],
         torch.tensor(graphbandwidth_init, device=config.device),
         laplacian_norm,
     )
- 
+
     eigvec_key_parts = {
         "graph": graph_key,
         "norm": laplacian_norm,
         "bw": graphbandwidth_init,
+        "modes": num_modes,
     }
     eigvec_key = make_eig_key(eigvec_key_parts)
     logging.info(f"Eigenvector cache key: {eigvec_key}")
- 
+
+    # Lanczos basis must comfortably exceed num_modes; bump as needed.
+    ncv_min = max(1500, 3 * num_modes + 20)
     solver = LaplacianEigensolver(
-        num_modes=num_modes, backend="cupy", tol=1e-4, ncv_min=1500, verbose=True,
+        num_modes=num_modes, backend="cupy", tol=1e-4, ncv_min=ncv_min, verbose=True,
     )
     eigval, eigvec = solver.compute_or_load(
         laplacian_op,
@@ -231,10 +262,8 @@ def setup_experiment(args):
         force_recompute=bool(args.get("force_recompute_eigvecs", False)),
         device=config.device,
     )
- 
-    # ----------------------------------------------------------------------
-    # 6. Kernel: fully formed at construction. No attach, no eval-time setup.
-    # ----------------------------------------------------------------------
+
+    # 6. Riemann Matern kernel, fully formed at construction.
     logging.info("Building Riemann Kernel (knn + edges + eigenpairs at construction)...")
     manifold_kernel = RiemannMaternKernel(
         nu=config.nu,
@@ -251,30 +280,28 @@ def setup_experiment(args):
         graphbandwidth_init=graphbandwidth_init,
     ).to(config.device)
     manifold_kernel.eval()
- 
-    # ----------------------------------------------------------------------
-    # 7. Latent Riemann GP, then end-to-end Manifold LGP
-    # ----------------------------------------------------------------------
-    logging.info(f"Locking {config.num_inducing} anchor nodes on the graph...")
+
+    # 7. Latent Riemann GP, then end-to-end Manifold LGP.
+    logging.info(f"Locking {inducing_points.shape[0]} anchor nodes on the graph...")
     gp_model = LatentRiemannGP(
         inducing_points=inducing_points,
         num_tasks=config.latent_dim,
         manifold_kernel=manifold_kernel,
     ).to(config.device)
- 
+
     lgp_model = ManifoldLGP(
         p=len(config.selected_lipids_names),
         d=config.latent_dim,
-        n_neurons=[100, 100],
-        dropout=[0.1, 0.1],
-        activation="relu",
+        n_neurons=[256, 256, 128],
+        dropout=[0.1, 0.1, 0.1],
+        activation="silu",
         device=config.device,
         gp_model=gp_model,
     )
 
     wandb.finish()
- 
-    return MaldiExperiment(config, lgp_model, coord_mean, coord_std)
+
+    return MaldiExperiment(config, lgp_model, coord_mean, coord_std), region_bbox
 
 
 if __name__ == "__main__":
@@ -282,23 +309,10 @@ if __name__ == "__main__":
     logging.info("Starting MALDI experiment with Riemann Manifold")
     args = parse_args()
     logging.info(f"Parsed arguments: {args}")
-    
-    experiment = setup_experiment(args)
-    
-    # Standard execution pipeline
-    experiment.run()
-    experiment.whole_brain_reconstruction()
-    #selected_reconstructions = [0, 3, 5, 10, 131, 72, 16, 89, 4, 74]
-    #for i in selected_reconstructions:
-    #   experiment.load_whole_brain_reconstruction(i)
 
-    #experiment.run(num_patches=50, model_type="riemann")
-    
-    # 2. Stitch the specific lipids back together!
-    #selected_reconstructions = [0, 3, 5, 10, 131, 72, 16, 89, 4, 74]
-    
-    # for lipid_idx in selected_reconstructions:
-    #    volume = experiment.load_whole_brain_reconstruction_patches(
-    #        lipid=lipid_idx, 
-    #        model_type="riemann"
-    #    )
+    experiment, region_bbox = setup_experiment(args)
+    experiment.run()
+    if region_bbox is not None:
+        experiment.region_reconstruction(region_bbox)
+    else:
+        experiment.whole_brain_reconstruction()

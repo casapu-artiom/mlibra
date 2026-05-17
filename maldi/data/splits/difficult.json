@@ -1,0 +1,20 @@
+{
+    "train":[
+        ["Sample", "==", "Female1"],
+        ["Sample", "==", "Female2"],
+        ["Sample", "==", "Female3"],
+        ["Sample","==", "Male1"],
+        ["Sample", "==", "Male2"],
+        ["Sample", "==", "Male3"]
+    ],
+    "test":[
+        ["Sample","==", "ReferenceAtlas"],
+        ["Sample","==", "SecondAtlas"]
+    ],
+    "ignore":[
+        ["Sample","==", "GBA1"],
+        ["Sample","==", "Pregnant1"],
+        ["Sample","==", "Pregnant2"],
+        ["Sample","==", "Pregnant4"]
+    ]
+}

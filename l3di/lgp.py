@@ -160,7 +160,12 @@ class LGP(nn.Module):
         layers = []
         for i in range(len(n_neurons)):
             layers.append(nn.Linear(input_dim, n_neurons[i]))
-            layers.append(nn.ReLU() if activation == 'relu' else nn.Tanh())
+            if activation == 'relu':
+                layers.append(nn.ReLU())
+            elif activation == 'silu':
+                layers.append(nn.SiLU())
+            else:
+                layers.append(nn.Tanh())
             if dropout[i] > 0:
                 layers.append(nn.Dropout(dropout[i]))
             input_dim = n_neurons[i]
@@ -173,7 +178,10 @@ class LGP(nn.Module):
 
     def forward(self, coords):
         gp_posterior = self.gp_model(coords)
-        latent_forward = gp_posterior.mean
+        if self.training:
+            latent_forward = gp_posterior.rsample()
+        else:
+            latent_forward = gp_posterior.mean
         x_reconstructed = self.decode(latent_forward)
         return x_reconstructed, gp_posterior
 
