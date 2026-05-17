@@ -24,6 +24,9 @@
 
 cd /home/casap/mlibra_git/
 #pip install -e .
+
+EXP_NAME="DIFFICULT-MANIFOLD-RSAMPLE-$LATENT_DIM--$TEMPLATE_NAME-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$NU-$BUMP_SCALE-$BUMP_DECAY"
+
 python /home/casap/mlibra_git/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
