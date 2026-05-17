@@ -70,7 +70,7 @@ class MaldiConfig:
         available_lipids, selected_channels, selected_lipids_names = read_channels(selected_lipids_file, available_lipids_file)
         output_path = Path(args["output_dir"])
         slices_dataset_file = args['slices_dataset_file']
-        template_name = args.get("template_name", "allen_mouse_25um")
+        template_name = args.get("template_name", "unspecified")
         reference_file = args['reference_file']
         annotations_file = args.get('annotations_file', None)
         # Train test split arguments

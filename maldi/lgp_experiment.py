@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--available-lipids-file", dest="available_lipids_file", type=str, required=True, help="File with available lipids.")
     parser.add_argument("--output-dir", dest="output_dir", type=str, required=True, help="Directory for output files.")
     parser.add_argument("--slices-dataset-file", dest="slices_dataset_file", type=str, required=True, help="File for slices dataset.")
-    parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="The reference image npy.")
+    parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="The template name.")
     parser.add_argument("--reference-file", dest="reference_file", type=str, required=True, help="The reference image npy.")
     parser.add_argument("--annotations-file", dest="annotations_file", type=str, help="The annotations if needed.")
     parser.add_argument("--num-inducing", dest="num_inducing", type=int, default=100, help="Number of inducing points.")

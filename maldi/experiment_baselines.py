@@ -124,7 +124,7 @@ def parse_args():
     parser.add_argument("--xgb-lr", type=float, default=0.05)
 
     # Reconstruction
-    parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="The reference image npy.")
+    parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="Template name.")
     parser.add_argument("--reference-file", dest="reference_file", type=str, required=True, help="The reference image npy.")
     parser.add_argument("--annotations-file", dest="annotations_file", type=str, help="The annotations if needed.")
     parser.add_argument("--reconstruct", type=str, default="auto",
