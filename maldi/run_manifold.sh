@@ -3,7 +3,7 @@
 : "${NUM_MODES:=1000}"
 : "${LATENT_DIM:=5}"
 : "${BATCH_SIZE:=1000}"
-: "${N_EPOCHS:=10}"
+: "${N_EPOCHS:=1}"
 : "${LEARNING_RATE:=0.001}"
 : "${NU:=1}"
 : "${BUMP_SCALE:=20.0}"
@@ -20,7 +20,7 @@
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/difficult.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${KNN_METHOD:=faiss}"
+: "${KNN_METHOD:=anatomical_atlas}"
 
 cd /home/casap/mlibra_git/
 #pip install -e .
@@ -34,6 +34,7 @@ python /home/casap/mlibra_git/maldi/lgp_manifold_experiment.py \
     --output-dir $OUTPUT_DIR \
     --template-name $TEMPLATE_NAME \
     --reference-file $REFERENCE_FILE \
+    --annotations-file $ANNOTATION_FILE \
     --eigenvector-dir $EIGENVECTOR_DIR \
     --batch-size $BATCH_SIZE \
     --epochs $N_EPOCHS \
