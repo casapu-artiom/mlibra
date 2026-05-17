@@ -11,6 +11,7 @@
 : "${SEED:=416465}"
 : "${KERNEL:=symmetric}"
 : "${MODE:=lgp}"
+: "${TEMPLATE_NAME:=reference}"
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
 : "${OUTPUT_DIR:=/home/casap/mlibra/output}"
@@ -28,7 +29,7 @@ python /home/casap/mlibra_git/maldi/lgp_manifold_experiment.py \
     --dataset-path $DATA_PATH \
     --maldi-file $MALDI_FILE \
     --output-dir $OUTPUT_DIR \
-    --template-name "reference" \
+    --template-name $TEMPLATE_NAME \
     --reference-file $REFERENCE_FILE \
     --eigenvector-dir $EIGENVECTOR_DIR \
     --batch-size $BATCH_SIZE \
