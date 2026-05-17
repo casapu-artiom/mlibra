@@ -1,22 +1,26 @@
 #!/usr/bin/env sh
-NUM_INDUCING_POINTS=500
-NUM_MODES=700
-LATENT_DIM=5
-BATCH_SIZE=1000
-DATA_PATH="/home/casap/mlibra/mlibra_data"
-EIGENVECTOR_DIR="/home/casap/mlibra/output/eigenvectors"
-OUTPUT_DIR="/home/casap/mlibra/output"
-MALDI_FILE="/home/casap/mlibra/mlibra_data/maindata_minimal.parquet"
-REFERENCE_FILE="/home/casap/mlibra/mlibra_data/reference_image.npy"
-ANNOTATION_FILE="/home/casap/mlibra/mlibra_data/level_15annot.npy"
-N_EPOCHS=2
-LEARNING_RATE=0.001
-SEED=416465
-SLICES_DATASET_FILE="/home/casap/mlibra_git/maldi/data/splits/difficult.json"
-EXP_NAME="DIFFICULT-MANIFOLD-REGIONAL-RSAMPLE-LEARNED-INDUCING-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
-KERNEL="symmetric"
-MODE="lgp"
-AVAILABLE_LIPIDS_FILE="/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy"
+: "${NUM_INDUCING_POINTS:=500}"
+: "${NUM_MODES:=1000}"
+: "${LATENT_DIM:=5}"
+: "${BATCH_SIZE:=1000}"
+: "${N_EPOCHS:=10}"
+: "${LEARNING_RATE:=0.001}"
+: "${NU:=1}"
+: "${BUMP_SCALE:=20.0}"
+: "${BUMP_DECAY:=0.01}"
+: "${SEED:=416465}"
+: "${KERNEL:=symmetric}"
+: "${MODE:=lgp}"
+: "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
+: "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
+: "${OUTPUT_DIR:=/home/casap/mlibra/output}"
+: "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
+: "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
+: "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/difficult.json}"
+: "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
+: "${KNN_METHOD:=faiss}"
+
 cd /home/casap/mlibra_git/
 #pip install -e .
 python /home/casap/mlibra_git/maldi/lgp_manifold_experiment.py \
@@ -37,4 +41,8 @@ python /home/casap/mlibra_git/maldi/lgp_manifold_experiment.py \
     --num-modes $NUM_MODES \
     --kernel "$KERNEL" \
     --mode "$MODE" \
+    --nu $NU \
+    --bump-scale $BUMP_SCALE \
+    --bump-decay $BUMP_DECAY \
+    --knn-method $KNN_METHOD \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE
