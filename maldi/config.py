@@ -28,6 +28,8 @@ class MaldiConfig:
     device: str
     kernel: str
     slices_dataset_file: str
+    reference_file: str
+    annotations_file: str
     log_transform: bool
     nu: float
     n_pixels: int
@@ -64,6 +66,8 @@ class MaldiConfig:
         available_lipids, selected_channels, selected_lipids_names = read_channels(selected_lipids_file, available_lipids_file)
         output_path = Path(args["output_dir"])
         slices_dataset_file = args['slices_dataset_file']
+        reference_file = args['reference_file']
+        annotations_file = args['annotations_file']
         # Train test split arguments
         section_filter, test_filter = extract_filters(slices_dataset_file)
         # GP arguments
@@ -137,6 +141,8 @@ class MaldiConfig:
                            device=device,
                            kernel=kernel,
                            slices_dataset_file=slices_dataset_file,
+                           reference_file=reference_file,
+                           annotations_file=annotations_file,
                            log_transform=log_transform,
                            nu=nu,
                            n_pixels=n_pixels,
@@ -170,6 +176,8 @@ class MaldiConfig:
             "device": self.device,
             "kernel": self.kernel,
             "slices_dataset_file": self.slices_dataset_file,
+            'reference_file': self.reference_file,
+            'annotations_file': self.annotations_file,
             "log_transform": self.log_transform,
             "nu": self.nu,
             "n_pixels": self.n_pixels,
