@@ -124,6 +124,9 @@ def parse_args():
     parser.add_argument("--xgb-lr", type=float, default=0.05)
 
     # Reconstruction
+    parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="The reference image npy.")
+    parser.add_argument("--reference-file", dest="reference_file", type=str, required=True, help="The reference image npy.")
+    parser.add_argument("--annotations-file", dest="annotations_file", type=str, help="The annotations if needed.")
     parser.add_argument("--reconstruct", type=str, default="auto",
                         choices=["none", "auto", "whole_brain", "region"],
                         help="auto = whole_brain if no bbox, region if bbox.")
@@ -376,24 +379,7 @@ MODEL_REGISTRY = {
 }
 
 
-# ===========================================================================
-# Reconstruction (whole brain / region) — mirrors experiment.py's methods
-# ===========================================================================
-def _maybe_download_template(volume_path: Path, template_file: Path) -> np.ndarray:
-    if template_file.exists():
-        logging.info("Template volume already exists, loading from file")
-        return np.load(template_file)
-    logging.info("Downloading template volume via BrainGlobe Atlas API...")
-    from bg_atlasapi.bg_atlas import BrainGlobeAtlas
-    atlas = BrainGlobeAtlas("allen_mouse_25um")
-    template_volume = atlas.reference
-    logging.info(f"Template volume shape: {template_volume.shape}")
-    volume_path.mkdir(parents=True, exist_ok=True)
-    np.save(template_file, template_volume)
-    return template_volume
-
-
-def reconstruct(model, config, coord_mean, coord_std, col_means, col_stds,
+def reconstruct(model, config, template_volume, coord_mean, coord_std, col_means, col_stds,
                 mode: str, region_bbox, threshold: float, batch_size: int) -> None:
     """Walk the template voxel grid, batch-predict, write batch_*.pth.
 
@@ -404,8 +390,6 @@ def reconstruct(model, config, coord_mean, coord_std, col_means, col_stds,
     if mode == "whole_brain":
         volume_path = config.exp_path / "volume"
         volume_path.mkdir(parents=True, exist_ok=True)
-        template_file = volume_path / "template_volume.npy"
-        template_volume = _maybe_download_template(volume_path, template_file)
         non_zero_indices = np.argwhere(template_volume > threshold)
         logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
     elif mode == "region":
@@ -414,8 +398,6 @@ def reconstruct(model, config, coord_mean, coord_std, col_means, col_stds,
         bbox_str = "_".join(str(int(b)) for b in region_bbox)
         volume_path = config.exp_path / f"volume_region_{bbox_str}"
         volume_path.mkdir(parents=True, exist_ok=True)
-        template_file = volume_path / "template_volume.npy"
-        template_volume = _maybe_download_template(volume_path, template_file)
         zmin, zmax, ymin, ymax, xmin, xmax = (int(b) for b in region_bbox)
         sub = template_volume[zmin:zmax, ymin:ymax, xmin:xmax]
         z, y, x = np.where(sub > threshold)
@@ -570,8 +552,9 @@ def main():
     if rec_mode == "none":
         logging.info("Skipping reconstruction (--reconstruct none).")
     else:
+        template_volume=np.load(args["reference_file"])
         reconstruct(
-            model=model, config=config,
+            model=model, config=config, template_volume=template_volume,
             coord_mean=coord_mean, coord_std=coord_std,
             col_means=col_means, col_stds=col_stds,
             mode=rec_mode, region_bbox=region_bbox,
