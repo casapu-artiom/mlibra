@@ -24,7 +24,7 @@ cd $SRC_PATH
 
 EXP_NAME="DIFFICULT-BASELINES-REGIONAL-BOTTLENECK-MLP-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
 
-python /home/casap/mlibra_git/maldi/experiment_baselines.py \
+python $SRC_PATH/maldi/experiment_baselines.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
     --maldi-file $MALDI_FILE \

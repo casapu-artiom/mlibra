@@ -20,7 +20,7 @@ EXP_NAME="DIFFICULT-LGPALL-RSAMPLE-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
 
 cd $SRC_PATH
 #pip install -e .
-python /home/casap/mlibra_git/maldi/lgp_experiment.py \
+python $SRC_PATH/maldi/lgp_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
     --maldi-file $MALDI_FILE \
