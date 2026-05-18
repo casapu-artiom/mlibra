@@ -36,6 +36,7 @@ submit() {
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
         --auto-deletion-time-after-completion 1h \
+        -e EXP_PREFIX="$EXP_PREFIX" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e DATA_PATH="$S3_DATA_PATH" \
         -e OUTPUT_DIR="$S3_OUTPUT_DIR" \
