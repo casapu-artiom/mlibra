@@ -21,13 +21,14 @@
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/difficult.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${KNN_METHOD:=anatomical_atlas}"
+: "${SRC_PATH:=/home/casap/mlibra_git}"
 
-cd /home/casap/mlibra_git/
+cd $SRC_PATH
 #pip install -e .
 
 EXP_NAME="DIFFICULT-MANIFOLD-RSAMPLE-$LATENT_DIM--$TEMPLATE_NAME-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$NU-$BUMP_SCALE-$BUMP_DECAY"
 
-python /home/casap/mlibra_git/maldi/lgp_manifold_experiment.py \
+python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
     --maldi-file $MALDI_FILE \
@@ -50,4 +51,5 @@ python /home/casap/mlibra_git/maldi/lgp_manifold_experiment.py \
     --bump-scale $BUMP_SCALE \
     --bump-decay $BUMP_DECAY \
     --knn-method $KNN_METHOD \
-    --available-lipids-file $AVAILABLE_LIPIDS_FILE
+    --available-lipids-file $AVAILABLE_LIPIDS_FILE \
+    "$@"
