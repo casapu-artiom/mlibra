@@ -28,7 +28,7 @@ S3_ANNOTATION_FILE_BG="/s3/mlibra/mlibra-data/bg_annotations.npy"
 SRC_PATH="/myhome/mlibra"
 
 EXP_PREFIX="FOLD-3"
-EXP_SUFFIX="artiom-9"
+EXP_SUFFIX="artiom-11"
 
 submit() {
     local job_name=$1 template=$2 ref=$3 annot=$4 knn=$5 nu=$6
@@ -41,6 +41,7 @@ submit() {
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
         --auto-deletion-time-after-completion 1h \
+        -e EXP_PREFIX="$EXP_PREFIX" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e DATA_PATH="$S3_DATA_PATH" \
         -e OUTPUT_DIR="$S3_OUTPUT_DIR" \
@@ -57,14 +58,23 @@ submit() {
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 
-submit "gp-exp-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1     
-submit "gp-exp-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1
-submit "gp-exp-faiss-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             1
-submit "gp-exp-atlas-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  1
-submit "gp-exp-faiss-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             2     
-submit "gp-exp-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2
-submit "gp-exp-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2
-submit "gp-exp-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2
+# submit "gp-exp-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1     
+# submit "gp-exp-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1
+# submit "gp-exp-faiss-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             1
+# submit "gp-exp-atlas-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  1
+# submit "gp-exp-faiss-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             2     
+# submit "gp-exp-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2
+# submit "gp-exp-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2
+# submit "gp-exp-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2
+submit "gp-exp-log-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1  --log-transform
+submit "gp-exp-log-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1  --log-transform
+submit "gp-exp-log-faiss-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             1  --log-transform
+submit "gp-exp-log-atlas-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  1  --log-transform
+submit "gp-exp-log-faiss-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             2  --log-transform
+submit "gp-exp-log-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2  --log-transform
+submit "gp-exp-log-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2  --log-transform
+submit "gp-exp-log-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2  --log-transform
+
 
 # KNN_METHOD="faiss"
 # NU=2

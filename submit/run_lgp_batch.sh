@@ -50,5 +50,5 @@ submit() {
         -- ./maldi/run_final.sh "${extra_args[@]}"
 }
 
-submit "gp-lgp-${EXP_SUFFIX}" 
-submit "gp-lgp-log-${EXP_SUFFIX}" --log-transform
+submit "gp-lgp-fold-3-${EXP_SUFFIX}" 
+submit "gp-lgp-fold-3-log-${EXP_SUFFIX}" --log-transform
