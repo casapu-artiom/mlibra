@@ -17,11 +17,10 @@
 : "${XGB_N_ESTIMATORS:=400}"
 : "${XGB_MAX_DEPTH:=6}"
 : "${XGB_LR:=0}"
-: "${SRC_PATH:/home/casap/mlibra_git/}"
+: "${SRC_PATH:=/home/casap/mlibra_git}"
 
 cd $SRC_PATH
 #pip install -e .
-pip install -r requirements.txt
 
 EXP_NAME="DIFFICULT-BASELINES-REGIONAL-MLP-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
 

@@ -14,13 +14,12 @@
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/difficult.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${SRC_PATH:/home/casap/mlibra_git/}"
+: "${SRC_PATH:=/home/casap/mlibra_git}"
 
 EXP_NAME="DIFFICULT-LGPALL-RSAMPLE-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
 
 cd $SRC_PATH
 #pip install -e .
-pip install -r requirements.txt
 
 python $SRC_PATH/maldi/lgp_experiment.py \
     --exp-name $EXP_NAME \
