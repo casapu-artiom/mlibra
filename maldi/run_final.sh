@@ -15,8 +15,9 @@
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/difficult.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
+: "${EXP_PREFIX:=DIFFICULT}"
 
-EXP_NAME="DIFFICULT-LGPALL-RSAMPLE-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
+EXP_NAME="$EXP_PREFIX-LGPALL-RSAMPLE-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
 
 cd $SRC_PATH
 #pip install -e .

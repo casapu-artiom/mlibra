@@ -22,11 +22,12 @@
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${KNN_METHOD:=anatomical_atlas}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
+: "${EXP_PREFIX:=DIFFICULT}"
 
 cd $SRC_PATH
 #pip install -e .
 
-EXP_NAME="DIFFICULT-MANIFOLD-RSAMPLE-$LATENT_DIM--$TEMPLATE_NAME-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$NU-$BUMP_SCALE-$BUMP_DECAY"
+EXP_NAME="$EXP_PREFIX-MANIFOLD-RSAMPLE-$LATENT_DIM--$TEMPLATE_NAME-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$NU-$BUMP_SCALE-$BUMP_DECAY"
 
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
