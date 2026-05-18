@@ -1,0 +1,82 @@
+##!/usr/bin/env sh
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    source "$SCRIPT_DIR/../.env"
+else
+    echo "ERROR: .env not found at $SCRIPT_DIR/.env" >&2
+    echo "Create it with: export WANDB_API_KEY=..." >&2
+    exit 1
+fi
+
+MEM=32G
+CPU=4
+GPU=0.5
+
+S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
+S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom"
+S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
+S3_TEMPLATE_NAME="reference"
+S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
+S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_15annot.npy"
+S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/difficult.json"
+S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
+SRC_PATH="/myhome/mlibra"
+
+EXP_SUFFIX="artiom-9"
+
+submit() {
+    local job_name=$1
+	shift 1
+	local extra_args=("$@")    # everything remaining goes here
+    echo ">>> Submitting $job_name"
+    runai training submit "$job_name" \
+        -i artiomartiom/sdsc:maldi_manifold_latest \
+        --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
+        --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
+        --gpu-request-type portion --gpu-portion-request "$GPU" \
+        --auto-deletion-time-after-completion 1h \
+        -e WANDB_API_KEY="$WANDB_API_KEY" \
+        -e MODEL="mlp" \
+        -e DATA_PATH="$S3_DATA_PATH" \
+        -e OUTPUT_DIR="$S3_OUTPUT_DIR" \
+        -e MALDI_FILE="$S3_MALDI_FILE" \
+        -e SLICES_DATASET_FILE="$S3_SLICES_DATASET_FILE" \
+        -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
+        -e TEMPLATE_NAME="reference" \
+        -e REFERENCE_FILE="$REFERENCE_FILE" \
+        -e ANNOTATION_FILE="$ANNOTATION_FILE" \
+        -e SRC_PATH="$SRC_PATH" \
+        -- ./maldi/run_baseline.sh "${extra_args[@]}"
+}
+
+submit_bottleneck() {
+    local job_name=$1
+	shift 1
+	local extra_args=("$@")    # everything remaining goes here
+    echo ">>> Submitting $job_name"
+    runai training submit "$job_name" \
+        -i artiomartiom/sdsc:maldi_manifold_latest \
+        --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
+        --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
+        --gpu-request-type portion --gpu-portion-request "$GPU" \
+        --auto-deletion-time-after-completion 1h \
+        -e WANDB_API_KEY="$WANDB_API_KEY" \
+        -e MODEL="mlp" \
+        -e DATA_PATH="$S3_DATA_PATH" \
+        -e OUTPUT_DIR="$S3_OUTPUT_DIR" \
+        -e MALDI_FILE="$S3_MALDI_FILE" \
+        -e SLICES_DATASET_FILE="$S3_SLICES_DATASET_FILE" \
+        -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
+        -e TEMPLATE_NAME="reference" \
+        -e REFERENCE_FILE="$REFERENCE_FILE" \
+        -e ANNOTATION_FILE="$ANNOTATION_FILE" \
+        -e SRC_PATH="$SRC_PATH" \
+        -- ./maldi/run_baseline_bottleneck.sh "${extra_args[@]}"
+}
+
+submit "gp-exp-mlp-${EXP_SUFFIX}"
+submit "gp-exp-mlp-log-${EXP_SUFFIX}" --log-transform
+submit_bottleneck "gp-exp-mlp-bn-${EXP_SUFFIX}"
+submit_bottleneck "gp-exp-mlp-bn-log-${EXP_SUFFIX}" --log-transform
