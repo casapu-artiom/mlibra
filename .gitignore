@@ -3,8 +3,16 @@ maldi/mouse_connectivity
 maldi/.DS_store
 maldi/output_images
 maldi/reference.py
+analysis
+dragon_model
+experiments
+kernel_investigations
+submit
+wandb
 reflect.sh
 sshd_config
 .DS_Store
 **_pycache__
 **.egg-info
+tasklist.md
+.env
