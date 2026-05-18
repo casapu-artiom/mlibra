@@ -12,7 +12,7 @@
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${MODEL:=mlp}"
 : "${RIDGE_ALHPA:=1.0}"
-: "${MLP_HIDDEN:=256 256 128}"
+: "${MLP_HIDDEN:=256 5 256 256 128}"
 : "${MLP_DROPOUT:=0.1}"
 : "${XGB_N_ESTIMATORS:=400}"
 : "${XGB_MAX_DEPTH:=6}"
@@ -22,7 +22,7 @@
 cd $SRC_PATH
 #pip install -e .
 
-EXP_NAME="DIFFICULT-BASELINES-REGIONAL-MLP-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
+EXP_NAME="DIFFICULT-BASELINES-REGIONAL-BOTTLENECK-MLP-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
 
 python /home/casap/mlibra_git/maldi/experiment_baselines.py \
     --exp-name $EXP_NAME \
