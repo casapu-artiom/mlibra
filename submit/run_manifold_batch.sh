@@ -25,6 +25,7 @@ S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_availabl
 S3_BG_TEMPLATE_NAME="brainglobe"
 S3_REFERENCE_FILE_BG="/s3/mlibra/mlibra-data/bg_template.npy"
 S3_ANNOTATION_FILE_BG="/s3/mlibra/mlibra-data/bg_annotations.npy"
+SRC_PATH="/myhome/mlibra"
 
 EXP_SUFFIX="artiom-9"
 
@@ -51,6 +52,7 @@ submit() {
         -e ANNOTATION_FILE="$annot" \
         -e KNN_METHOD="$knn" \
         -e NU="$nu" \
+		-e SRC_PATH="$SRC_PATH" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 

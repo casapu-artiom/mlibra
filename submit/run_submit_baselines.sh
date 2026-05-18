@@ -1,8 +1,8 @@
 ##!/usr/bin/env sh
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
-if [ -f "$SCRIPT_DIR/../.env" ]; then
-    source "$SCRIPT_DIR/../.env"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    source "$SCRIPT_DIR/.env"
 else
     echo "ERROR: .env not found at $SCRIPT_DIR/.env" >&2
     echo "Create it with: export WANDB_API_KEY=..." >&2
@@ -24,7 +24,7 @@ S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/difficult.json"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
 SRC_PATH="/myhome/mlibra"
 
-EXP_SUFFIX="artiom-9"
+EXP_SUFFIX="artiom-10"
 
 submit() {
     local job_name=$1
