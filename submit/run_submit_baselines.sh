@@ -20,9 +20,10 @@ S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
 S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_15annot.npy"
-S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/difficult.json"
+S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
 SRC_PATH="/myhome/mlibra"
+EXP_PREFIX="FOLD-3"
 
 EXP_SUFFIX="artiom-10"
 
