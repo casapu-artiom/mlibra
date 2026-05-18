@@ -21,6 +21,7 @@
 
 cd $SRC_PATH
 #pip install -e .
+pip install -r requirements.txt
 
 EXP_NAME="DIFFICULT-BASELINES-REGIONAL-BOTTLENECK-MLP-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
 
