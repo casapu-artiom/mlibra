@@ -129,13 +129,14 @@ def setup_experiment(args):
     num_modes            = args.get("num_modes", 200)
     bump_scale           = args.get("bump_scale", 20.0)
     bump_decay           = args.get("bump_scale", 0.01)
-    laplacian_norm       = "symmetric"
+    laplacian_norm       = args.get("laplacian_norm", "symmetric")
     graphbandwidth_init  = 1.0   # used for both eigensolve and kernel init
     knn_method           = args.get("knn_method", "faiss")
 
     sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
         template_volume, annotations_volume, stride, region_bbox,
     )
+    
     reference_ccf = reference_ccf_from_subvolume(
         sub_volume, voxel_offset, voxel_scale_mm, threshold,
     )
