@@ -28,7 +28,7 @@ S3_ANNOTATION_FILE_BG="/s3/mlibra/mlibra-data/bg_annotations.npy"
 SRC_PATH="/myhome/mlibra"
 
 EXP_PREFIX="FOLD-3"
-EXP_SUFFIX="artiom-11"
+EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
     local job_name=$1 template=$2 ref=$3 annot=$4 knn=$5 nu=$6
@@ -40,7 +40,6 @@ submit() {
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
-        --auto-deletion-time-after-completion 1h \
         -e EXP_PREFIX="$EXP_PREFIX" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e DATA_PATH="$S3_DATA_PATH" \

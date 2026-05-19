@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-: "${BATCH_SIZE:=1000}"
+: "${BATCH_SIZE:=256}"
 : "${N_EPOCHS:=20}"
 : "${LEARNING_RATE:=0.001}"
 : "${SEED:=416465}"
@@ -23,7 +23,7 @@
 cd $SRC_PATH
 #pip install -e .
 
-EXP_NAME="$EXP_PREFIX-BASELINES-REGIONAL-MLP-$LATENT_DIM-$NUM_INDUCING_POINTS-$BATCH_SIZE"
+EXP_NAME="$EXP_PREFIX-BASELINES-MLP-$BATCH_SIZE"
 
 python $SRC_PATH/maldi/experiment_baselines.py \
     --exp-name $EXP_NAME \

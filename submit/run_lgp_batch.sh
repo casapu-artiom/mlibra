@@ -23,7 +23,7 @@ S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
 SRC_PATH="/myhome/mlibra"
 EXP_PREFIX="FOLD-3"
-EXP_SUFFIX="artiom-10"
+EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
     local job_name=$1
@@ -35,7 +35,6 @@ submit() {
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
-        --auto-deletion-time-after-completion 1h \
         -e EXP_PREFIX="$EXP_PREFIX" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e DATA_PATH="$S3_DATA_PATH" \
