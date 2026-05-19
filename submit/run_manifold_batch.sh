@@ -15,7 +15,7 @@ GPU=0.5
 
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_2"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -27,12 +27,12 @@ S3_REFERENCE_FILE_BG="/s3/mlibra/mlibra-data/bg_template.npy"
 S3_ANNOTATION_FILE_BG="/s3/mlibra/mlibra-data/bg_annotations.npy"
 SRC_PATH="/myhome/mlibra"
 
-EXP_PREFIX="FOLD-3"
+EXP_PREFIX=("DIFFICULT" "FOLD-3")
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
-    local job_name=$1 template=$2 ref=$3 annot=$4 knn=$5 nu=$6
-	shift 6
+    local job_name=$1 template=$2 ref=$3 annot=$4 knn=$5 nu=$6 graphbandwidth=$7 bumpscale=$8 bumpdecay=$9 prefix=$10
+	shift 11
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
@@ -54,8 +54,19 @@ submit() {
         -e KNN_METHOD="$knn" \
         -e NU="$nu" \
 		-e SRC_PATH="$SRC_PATH" \
+        -e GRAPHBANDWIDTH="$graphbandwidth" \
+        -e BUMP_SCALE="$bumpscale" \
+        -e BUMP_DECAY="$bumpdecay" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
+
+submit "gp-exp-difficult-${EXP_SUFFIX}-exp-1"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.01 "DIFFICULT"
+submit "gp-exp-difficult-${EXP_SUFFIX}-exp-2"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.05 "DIFFICULT"
+submit "gp-exp-difficult-${EXP_SUFFIX}-exp-3"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.1 "DIFFICULT"
+submit "gp-exp-fold-3-${EXP_SUFFIX}-exp-4"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.01 "FOLD-3"
+submit "gp-exp-fold-3-${EXP_SUFFIX}-exp-5"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.05 "FOLD-3"
+submit "gp-exp-fold-3-${EXP_SUFFIX}-exp-6"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.1 "FOLD-3"
+
 
 # submit "gp-exp-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1     
 # submit "gp-exp-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1
@@ -65,116 +76,11 @@ submit() {
 # submit "gp-exp-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2
 # submit "gp-exp-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2
 # submit "gp-exp-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2
-submit "gp-exp-log-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1  --log-transform
-submit "gp-exp-log-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1  --log-transform
-submit "gp-exp-log-faiss-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             1  --log-transform
-submit "gp-exp-log-atlas-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  1  --log-transform
-submit "gp-exp-log-faiss-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             2  --log-transform
-submit "gp-exp-log-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2  --log-transform
-submit "gp-exp-log-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2  --log-transform
-submit "gp-exp-log-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2  --log-transform
-
-
-# KNN_METHOD="faiss"
-# NU=2
-# TEMPLATE_NAME=$S3_TEMPLATE_NAME
-# JOB_NAME="gp-exp-${KNN_METHOD}-${NU}-${TEMPLATE_NAME}-${EXP_SUFFIX}"
-# runai training submit "$JOB_NAME" \
-# 	-i artiomartiom/sdsc:maldi_manifold_latest \
-# 	--cpu-core-limit $CPU \
-#     --cpu-core-request $CPU \
-#     --cpu-memory-limit $MEM \
-#     --cpu-memory-request $MEM \
-# 	--gpu-request-type portion \
-# 	--gpu-portion-request 0.5 \
-# 	-e WANDB_API_KEY=$WANDB_API_KEY \
-# 	-e DATA_PATH=$S3_DATA_PATH \
-# 	-e OUTPUT_DIR=$S3_OUTPUT_DIR \
-# 	-e EIGENVECTOR_DIR=$S3_EIGENVECTOR_DIR \
-# 	-e MALDI_FILE=$S3_MALDI_FILE \
-# 	-e TEMPLATE_NAME=$TEMPLATE_NAME \
-# 	-e REFERENCE_FILE=$S3_REFERENCE_FILE \
-# 	-e ANNOTATION_FILE=$S3_ANNOTATION_FILE \
-# 	-e SLICES_DATASET_FILE=$S3_SLICES_DATASET_FILE \
-# 	-e AVAILABLE_LIPIDS_FILE=$S3_AVAILABLE_LIPIDS_FILE \
-# 	-e KNN_METHOD=$KNN_METHOD \
-# 	-e NU=$NU \
-# 	-- "./maldi/run_manifold.sh"
-
-# KNN_METHOD="anatomical_atlas"
-# NU=2
-# TEMPLATE_NAME=$S3_TEMPLATE_NAME
-# JOB_NAME="gp-exp-anatomicalatlas-${NU}-${TEMPLATE_NAME}-${EXP_SUFFIX}"
-# runai training submit "$JOB_NAME" \
-# 	-i artiomartiom/sdsc:maldi_manifold_latest \
-# 	--cpu-core-limit $CPU \
-#     --cpu-core-request $CPU \
-#     --cpu-memory-limit $MEM \
-#     --cpu-memory-request $MEM \
-# 	--gpu-request-type portion \
-# 	--gpu-portion-request 0.5 \
-# 	-e WANDB_API_KEY=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 \
-# 	-e DATA_PATH=$S3_DATA_PATH \
-# 	-e OUTPUT_DIR=$S3_OUTPUT_DIR \
-# 	-e EIGENVECTOR_DIR=$S3_EIGENVECTOR_DIR \
-# 	-e MALDI_FILE=$S3_MALDI_FILE \
-# 	-e TEMPLATE_NAME=$TEMPLATE_NAME \
-# 	-e REFERENCE_FILE=$S3_REFERENCE_FILE \
-# 	-e ANNOTATION_FILE=$S3_ANNOTATION_FILE \
-# 	-e SLICES_DATASET_FILE=$S3_SLICES_DATASET_FILE \
-# 	-e AVAILABLE_LIPIDS_FILE=$S3_AVAILABLE_LIPIDS_FILE \
-# 	-e KNN_METHOD=$KNN_METHOD \
-# 	-e NU=$NU \
-# 	-- "./maldi/run_manifold.sh"
-
-# KNN_METHOD="faiss"
-# NU=2
-# TEMPLATE_NAME=$S3_BG_TEMPLATE_NAME
-# JOB_NAME="gp-exp-${KNN_METHOD}-${NU}-${TEMPLATE_NAME}-${EXP_SUFFIX}"
-# runai training submit "$JOB_NAME" \
-# 	-i artiomartiom/sdsc:maldi_manifold_latest \
-# 	--cpu-core-limit $CPU \
-#     --cpu-core-request $CPU \
-#     --cpu-memory-limit $MEM \
-#     --cpu-memory-request $MEM \
-# 	--gpu-request-type portion \
-# 	--gpu-portion-request 0.5 \
-# 	-e WANDB_API_KEY=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 \
-# 	-e DATA_PATH=$S3_DATA_PATH \
-# 	-e OUTPUT_DIR=$S3_OUTPUT_DIR \
-# 	-e EIGENVECTOR_DIR=$S3_EIGENVECTOR_DIR \
-# 	-e MALDI_FILE=$S3_MALDI_FILE \
-# 	-e TEMPLATE_NAME=$TEMPLATE_NAME \
-# 	-e REFERENCE_FILE=$S3_REFERENCE_FILE_BG \
-# 	-e ANNOTATION_FILE=$S3_ANNOTATION_FILE_BG \
-# 	-e SLICES_DATASET_FILE=$S3_SLICES_DATASET_FILE \
-# 	-e AVAILABLE_LIPIDS_FILE=$S3_AVAILABLE_LIPIDS_FILE \
-# 	-e KNN_METHOD=$KNN_METHOD \
-# 	-e NU=$NU \
-# 	-- "./maldi/run_manifold.sh"
-
-# KNN_METHOD="anatomical_atlas"
-# NU=2
-# TEMPLATE_NAME=$S3_BG_TEMPLATE_NAME
-# JOB_NAME="gp-exp-anatomicalatlas-${NU}-${TEMPLATE_NAME}-${EXP_SUFFIX}"
-# runai training submit "$JOB_NAME" \
-# 	-i artiomartiom/sdsc:maldi_manifold_latest \
-# 	--cpu-core-limit $CPU \
-#     --cpu-core-request $CPU \
-#     --cpu-memory-limit $MEM \
-#     --cpu-memory-request $MEM \
-# 	--gpu-request-type portion \
-# 	--gpu-portion-request 0.5 \
-# 	-e WANDB_API_KEY=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 \
-# 	-e DATA_PATH=$S3_DATA_PATH \
-# 	-e OUTPUT_DIR=$S3_OUTPUT_DIR \
-# 	-e EIGENVECTOR_DIR=$S3_EIGENVECTOR_DIR \
-# 	-e MALDI_FILE=$S3_MALDI_FILE \
-# 	-e TEMPLATE_NAME=$TEMPLATE_NAME \
-# 	-e REFERENCE_FILE=$S3_REFERENCE_FILE_BG \
-# 	-e ANNOTATION_FILE=$S3_ANNOTATION_FILE_BG \
-# 	-e SLICES_DATASET_FILE=$S3_SLICES_DATASET_FILE \
-# 	-e AVAILABLE_LIPIDS_FILE=$S3_AVAILABLE_LIPIDS_FILE \
-# 	-e KNN_METHOD=$KNN_METHOD \
-# 	-e NU=$NU \
-# 	-- "./maldi/run_manifold.sh"
+# submit "gp-exp-log-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1  --log-transform
+# submit "gp-exp-log-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1  --log-transform
+# submit "gp-exp-log-faiss-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             1  --log-transform
+# submit "gp-exp-log-atlas-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  1  --log-transform
+# submit "gp-exp-log-faiss-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             2  --log-transform
+# submit "gp-exp-log-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2  --log-transform
+# submit "gp-exp-log-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2  --log-transform
+# submit "gp-exp-log-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2  --log-transform
