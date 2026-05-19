@@ -6,6 +6,7 @@
 : "${BATCH_SIZE:=1000}"
 : "${N_EPOCHS:=1}"
 : "${LEARNING_RATE:=0.001}"
+: "${GRAPHBANDWIDTH:=1.0}"
 : "${NU:=1}"
 : "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
@@ -28,7 +29,7 @@
 cd $SRC_PATH
 #pip install -e .
 
-EXP_NAME="$EXP_PREFIX-MANIFOLD-RSAMPLE-$LATENT_DIM-$STRIDE-$TEMPLATE_NAME-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$NU-$BUMP_SCALE-$BUMP_DECAY"
+EXP_NAME="$EXP_PREFIX-MANIFOLD-RSAMPLE-$LATENT_DIM-$STRIDE-$TEMPLATE_NAME-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH"
 
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
@@ -52,6 +53,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --nu $NU \
     --bump-scale $BUMP_SCALE \
     --bump-decay $BUMP_DECAY \
+    --graphbandwidth-init $GRAPHBANDWIDTH \
     --knn-method $KNN_METHOD \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     "$@"

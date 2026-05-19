@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
     parser.add_argument("--knn-k", dest="knn_k", type=int, default=15, help="Number of knn neighbours for the Graph Laplacian.")
     parser.add_argument("--n-list", type=int, default=1, help="FAISS nlist parameter")
+    parser.add_argument("--graphbandwidth-init", dest="graphbandwidth_init", type=float, default=1.0, help="Initial graph bandwidth.")
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
@@ -130,7 +131,7 @@ def setup_experiment(args):
     bump_scale           = args.get("bump_scale", 20.0)
     bump_decay           = args.get("bump_scale", 0.01)
     laplacian_norm       = args.get("laplacian_norm", "symmetric")
-    graphbandwidth_init  = 1.0   # used for both eigensolve and kernel init
+    graphbandwidth_init  = args.get("graphbandwidth_init", 1.0)   # used for both eigensolve and kernel init
     knn_method           = args.get("knn_method", "faiss")
 
     sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
