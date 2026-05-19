@@ -55,5 +55,5 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --bump-decay $BUMP_DECAY \
     --graphbandwidth-init $GRAPHBANDWIDTH \
     --knn-method $KNN_METHOD \
-    --available-lipids-file $AVAILABLE_LIPIDS_FILE \
+    --available-lipids-file $AVAILABLE_LIPIDS_FILE
     "$@"

@@ -631,14 +631,14 @@ class MaldiExperiment:
         volume_path = self.config.exp_path / ("volume_diffusion"
                                             if self.config.use_diffusion else "volume")
         volume_path.mkdir(parents=True, exist_ok=True)
-        template_file = volume_path / "template_volume.npy"
-        template_volume = self.maybe_download_template_brainglobe(volume_path, template_file)
+        self.config.reference_file
+        template_volume = np.load(self.config.reference_file)
         non_zero_indices = np.argwhere(template_volume > 5).astype(np.int32)
         logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
 
         lipid_filter = self._resolve_lipid_filter(lipid_indices, lipid_names)
         self._reconstruct_voxels(
-            non_zero_indices, volume_path, template_volume.shape, suffix,
+            non_zero_indices, volume_path, template_volume.shape, suffix=suffix,
             lipid_filter=lipid_filter,
         )
 
@@ -651,8 +651,7 @@ class MaldiExperiment:
         bbox_str = "_".join(str(int(b)) for b in region_bbox)
         volume_path = self.config.exp_path / f"volume_region_{bbox_str}"
         volume_path.mkdir(parents=True, exist_ok=True)
-        template_file = volume_path / "template_volume.npy"
-        template_volume = self.maybe_download_template_brainglobe(volume_path, template_file)
+        template_volume = np.load(self.config.reference_file)
         zmin, zmax, ymin, ymax, xmin, xmax = (int(b) for b in region_bbox)
         sub = template_volume[zmin:zmax, ymin:ymax, xmin:xmax]
         z, y, x = np.where(sub > threshold)
@@ -734,7 +733,7 @@ class MaldiExperiment:
         return True
 
     def _reconstruct_voxels(self, non_zero_indices, volume_path, template_shape,
-                            suffix="", write_per_latent_volumes=True):
+                            suffix="", write_per_latent_volumes=False, lipid_filter=None):
         """Core reconstruction loop. One forward pass over all voxels, then
         write everything. Smart in three ways:
         1. Resume: skip the GPU loop if consolidated arrays already exist
