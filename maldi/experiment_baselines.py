@@ -133,9 +133,21 @@ def parse_args():
     parser.add_argument("--reconstruct-threshold", type=float, default=5.0)
     parser.add_argument("--skip-training", action="store_true",
                         help="Skip fitting; only run reconstruction from a saved model.")
+    parser.add_argument(
+        "--reconstruction-lipids", dest="reconstruction_lipids",
+        nargs="+", default=None,
+        help=("Restrict reconstruction to these lipids. Accepts indices "
+              "(0 5 10) or names ('PA 36:4' 'PE 40:7'). Default: all."),
+    )
 
-    return vars(parser.parse_args())
-
+    args = vars(parser.parse_args())
+    # Coerce to int where possible so the resolver gets a homogeneous list.
+    if args.get("reconstruction_lipids"):
+        try:
+            args["reconstruction_lipids"] = [int(v) for v in args["reconstruction_lipids"]]
+        except ValueError:
+            pass  # keep as strings; resolver handles names
+    return args
 
 # ===========================================================================
 # Data
@@ -378,71 +390,217 @@ MODEL_REGISTRY = {
     "mlp":     MLPBaseline,
 }
 
+def _resolve_lipid_filter(selected_lipids_names, lipid_indices=None, lipid_names=None):
+    """Resolve a lipid filter spec to an int array of column indices.
 
-def reconstruct(model, config, template_volume, coord_mean, coord_std, col_means, col_stds,
-                mode: str, region_bbox, threshold: float, batch_size: int) -> None:
-    """Walk the template voxel grid, batch-predict, write batch_*.pth.
-
-    Output file layout matches experiment.whole_brain_reconstruction /
-    region_reconstruction so experiment.load_whole_brain_reconstruction can
-    consume baseline batches transparently.
+    Returns None to mean "all lipids". Hard-errors on miss or ambiguity.
+    Mirrors MaldiExperiment._resolve_lipid_filter so behavior matches the
+    LGP/Manifold runs.
     """
+    if lipid_indices is None and lipid_names is None:
+        return None
+    all_names = [str(n) for n in selected_lipids_names]
+
+    if lipid_names is not None:
+        resolved = []
+        for name in lipid_names:
+            target = name.strip()
+            exact = [i for i, n in enumerate(all_names) if n == target]
+            if len(exact) == 1:
+                resolved.append(exact[0]); continue
+            if len(exact) > 1:
+                raise ValueError(f"{name!r} matches multiple lipids exactly: {exact}")
+            sub = [i for i, n in enumerate(all_names) if target.lower() in n.lower()]
+            if len(sub) == 0:
+                raise ValueError(f"No lipid matches {name!r}. First 10: {all_names[:10]}")
+            if len(sub) > 1:
+                raise ValueError(
+                    f"Ambiguous lipid name {name!r}; matches: "
+                    + ", ".join(f"[{i}]{all_names[i]}" for i in sub)
+                )
+            resolved.append(sub[0])
+        idx = np.asarray(resolved, dtype=np.int64)
+    else:
+        idx = np.asarray(lipid_indices, dtype=np.int64)
+        if idx.min() < 0 or idx.max() >= len(all_names):
+            raise ValueError(f"lipid index out of range [0, {len(all_names)})")
+
+    # Dedupe but preserve order
+    _, keep = np.unique(idx, return_index=True)
+    idx = idx[np.sort(keep)]
+
+    selected = [all_names[i] for i in idx]
+    logging.info(f"Reconstruction restricted to {len(idx)} lipid(s): {selected}")
+    return idx
+
+
+def _write_per_lipid_volumes(volume_path, predictions, indices, template_shape,
+                              all_names, col_indices, suffix=""):
+    """Write {lipid_name}_volume{suffix}.npy and its 255-normalized sibling.
+
+    predictions: (N, K) where K = len(col_indices). col_indices maps each
+    column to its global lipid index in selected_lipids_names.
+    """
+    if not isinstance(indices, np.ndarray):
+        raise TypeError(
+            f"_write_per_lipid_volumes expected indices: ndarray, "
+            f"got {type(indices).__name__}. Check argument order at call site."
+        )
+    z, y, x = indices[:, 0], indices[:, 1], indices[:, 2]
+
+    for col_pos, lipid_global_idx in enumerate(
+            tqdm(col_indices, desc="per-lipid volumes")):
+        lipid_name = all_names[int(lipid_global_idx)]
+        out_path = volume_path / f"{lipid_name}_volume{suffix}.npy"
+        out_255  = volume_path / f"{lipid_name}_volume255{suffix}.npy"
+        if out_path.exists() and out_255.exists():
+            continue
+        vol = np.full(template_shape, np.nan, dtype=np.float32)
+        vol[z, y, x] = predictions[:, col_pos]
+        np.save(out_path, vol)
+        vmin = np.nanmin(vol); vmax = np.nanmax(vol)
+        if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
+            np.save(out_255, 255.0 * (vol - vmin) / (vmax - vmin))
+        else:
+            np.save(out_255, vol)
+
+def reconstruct(model, config, template_volume, coord_mean, coord_std,
+                col_means, col_stds, mode: str, region_bbox, threshold: float,
+                batch_size: int, lipid_filter=None):
+    """One-pass reconstruction. Accumulates filtered predictions in RAM,
+    writes consolidated `predictions{tag}.npy` + per-lipid volumes.
+
+    Returns (volume_path, suffix) so the caller can render from disk.
+    """
+    all_names = [str(n) for n in config.selected_lipids_names]
+    n_lipids_total = len(all_names)
+
+    if lipid_filter is None:
+        col_indices = np.arange(n_lipids_total, dtype=np.int64)
+        filter_tag = ""
+    else:
+        col_indices = np.asarray(lipid_filter, dtype=np.int64)
+        if len(col_indices) <= 4:
+            filter_tag = "_lipids_" + "_".join(str(i) for i in col_indices)
+        else:
+            import hashlib
+            h = hashlib.sha1(col_indices.tobytes()).hexdigest()[:8]
+            filter_tag = f"_lipids_{len(col_indices)}_{h}"
+    n_lipids_out = len(col_indices)
+
+    # --- Resolve voxel set + paths ---
     if mode == "whole_brain":
         volume_path = config.exp_path / "volume"
+        suffix = ""
         volume_path.mkdir(parents=True, exist_ok=True)
-        non_zero_indices = np.argwhere(template_volume > threshold)
+        non_zero_indices = np.argwhere(template_volume > threshold).astype(np.int32)
         logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
     elif mode == "region":
         if region_bbox is None:
             raise ValueError("--reconstruct region requires --region-bbox")
         bbox_str = "_".join(str(int(b)) for b in region_bbox)
         volume_path = config.exp_path / f"volume_region_{bbox_str}"
+        suffix = f"_region_{bbox_str}"
         volume_path.mkdir(parents=True, exist_ok=True)
         zmin, zmax, ymin, ymax, xmin, xmax = (int(b) for b in region_bbox)
         sub = template_volume[zmin:zmax, ymin:ymax, xmin:xmax]
         z, y, x = np.where(sub > threshold)
         if z.shape[0] == 0:
             logging.warning(f"No voxels >{threshold} in bbox {region_bbox}. Skipping.")
-            return
-        non_zero_indices = np.stack([z + zmin, y + ymin, x + xmin], axis=1)
-        logging.info(
-            f"Region reconstruction: {non_zero_indices.shape[0]:,} voxels in bbox {region_bbox}"
-        )
+            return volume_path, suffix
+        non_zero_indices = np.stack(
+            [z + zmin, y + ymin, x + xmin], axis=1,
+        ).astype(np.int32)
+        logging.info(f"Region reconstruction: {non_zero_indices.shape[0]:,} voxels")
     else:
         raise ValueError(f"unknown reconstruct mode: {mode}")
 
-    # Voxel coords (full-res 25um) -> mm -> standardized using train stats.
+    n_voxels = non_zero_indices.shape[0]
+
+    preds_file       = volume_path / f"predictions{filter_tag}.npy"
+    indices_file     = volume_path / "predictions_indices.npy"
+    filter_meta_file = volume_path / f"predictions{filter_tag}.lipidcols.npy"
+
+    # --- Resume: same voxel set AND same filter ---
+    if preds_file.exists() and indices_file.exists():
+        saved_indices = np.load(indices_file)
+        same_voxels = (saved_indices.shape == non_zero_indices.shape and
+                       np.array_equal(saved_indices, non_zero_indices))
+        same_filter = True
+        if filter_meta_file.exists():
+            saved_cols = np.load(filter_meta_file)
+            same_filter = (saved_cols.shape == col_indices.shape and
+                           np.array_equal(saved_cols, col_indices))
+        if same_voxels and same_filter:
+            logging.info(f"Reusing cached predictions at {preds_file}")
+            all_preds = np.load(preds_file, mmap_mode="r")
+            _write_per_lipid_volumes(
+                volume_path, all_preds, non_zero_indices,
+                template_volume.shape, all_names, col_indices, suffix,
+            )
+            return volume_path, suffix
+        else:
+            logging.warning(
+                f"Cache mismatch (same_voxels={same_voxels}, "
+                f"same_filter={same_filter}); recomputing."
+            )
+
+    # --- Coords -> standardized -> dataloader ---
     non_zero_ccf = non_zero_indices.astype(np.float32) * 0.025
     non_zero_ccf = torch.tensor(non_zero_ccf, dtype=torch.float32)
     non_zero_ccf = (non_zero_ccf - coord_mean) / coord_std
 
     ccf_dataset = torch.utils.data.TensorDataset(
-        non_zero_ccf, torch.tensor(non_zero_indices, dtype=torch.float32),
+        non_zero_ccf, torch.tensor(non_zero_indices, dtype=torch.int32),
     )
-    ccf_dataloader = torch.utils.data.DataLoader(
+    ccf_loader = torch.utils.data.DataLoader(
         ccf_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
     )
 
-    for i, batch in enumerate(tqdm(ccf_dataloader, desc=f"reconstruct[{mode}]")):
-        batch_file = volume_path / f"batch_{i}.pth"
-        if batch_file.exists():
-            logging.info(f"  batch {i} already exists, skipping")
-            continue
-        coords_batch = batch[0]
-        indices_batch = batch[1]
-        pred_norm = model.predict(coords_batch)
-        pred = pred_norm * col_stds + col_means
-        pred = pred.detach().cpu().numpy()
-        if config.log_transform:
-            pred = np.exp(pred) - 1e-10
-        torch.save({
-            "coordinates": coords_batch.cpu(),
-            "indices": indices_batch.cpu(),
-            "predictions": pred,
-            # No GP posterior for baselines; downstream loaders never read it.
-        }, batch_file)
-    logging.info(f"Reconstruction batches written to {volume_path}")
+    # --- Pre-allocate (filtered width only) ---
+    pred_bytes = n_voxels * n_lipids_out * 4
+    logging.info(
+        f"Allocating {pred_bytes / 1e9:.2f} GB for predictions "
+        f"({n_voxels:,} voxels × {n_lipids_out} lipid{'s' if n_lipids_out != 1 else ''})"
+    )
+    all_preds = np.empty((n_voxels, n_lipids_out), dtype=np.float32)
 
+    # Slice de-normalization params once
+    col_means_np = col_means.cpu().numpy()[col_indices]
+    col_stds_np  = col_stds.cpu().numpy()[col_indices]
+
+    cursor = 0
+    for batch in tqdm(ccf_loader, desc=f"reconstruct[{mode}]"):
+        coords_batch = batch[0]
+        pred_norm = model.predict(coords_batch)        # (B, n_lipids_total)
+        full_preds_np = pred_norm.detach().cpu().numpy()
+
+        # Slice BEFORE de-normalization so the in-loop array stays at (B, K)
+        sliced = full_preds_np[:, col_indices]
+        sliced = sliced * col_stds_np + col_means_np
+        if config.log_transform:
+            sliced = np.exp(sliced) - 1e-10
+
+        n_b = sliced.shape[0]
+        all_preds[cursor:cursor + n_b] = sliced.astype(np.float32, copy=False)
+        cursor += n_b
+
+    # --- Save consolidated ---
+    np.save(preds_file, all_preds)
+    np.save(indices_file, non_zero_indices)
+    np.save(filter_meta_file, col_indices)
+    logging.info(
+        f"Saved predictions: {all_preds.shape} -> {preds_file}  "
+        f"(lipids: {[all_names[i] for i in col_indices]})"
+    )
+
+    # --- Per-lipid volumes ---
+    _write_per_lipid_volumes(
+        volume_path, all_preds, non_zero_indices,
+        template_volume.shape, all_names, col_indices, suffix,
+    )
+
+    return volume_path, suffix
 
 # ===========================================================================
 # Main
@@ -549,18 +707,47 @@ def main():
 
         logging.info("Per-split outputs written.")
 
+    recon_lipids = args.get("reconstruction_lipids", None)
+    lipid_filter = None
+    if recon_lipids:
+        if all(isinstance(v, int) for v in recon_lipids):
+            lipid_filter = _resolve_lipid_filter(
+                config.selected_lipids_names, lipid_indices=recon_lipids,
+            )
+        else:
+            lipid_filter = _resolve_lipid_filter(
+                config.selected_lipids_names, lipid_names=recon_lipids,
+            )
     if rec_mode == "none":
         logging.info("Skipping reconstruction (--reconstruct none).")
     else:
         template_volume=np.load(args["reference_file"])
-        reconstruct(
+        volume_path, suffix = reconstruct(
             model=model, config=config, template_volume=template_volume,
             coord_mean=coord_mean, coord_std=coord_std,
             col_means=col_means, col_stds=col_stds,
             mode=rec_mode, region_bbox=region_bbox,
             threshold=args["reconstruct_threshold"],
             batch_size=args["batch_size"],
+            lipid_filter=lipid_filter,
         )
+
+        # ---- Render per-lipid composites ----
+        try:
+            from render_lipid_volumes import render_selected_lipids
+            output_dir = config.exp_path / "renders"
+            render_selected_lipids(
+                template_volume=template_volume,
+                volume_dir=volume_path,
+                output_dir=output_dir,
+                selected_lipids_names=config.selected_lipids_names,
+                lipid_indices=(list(lipid_filter)
+                                if lipid_filter is not None else None),
+                suffix=suffix,
+            )
+            logging.info(f"Renders written to {output_dir}")
+        except Exception as e:
+            logging.error(f"Rendering failed (reconstruction still saved): {e}")
 
     logging.info("Done.")
 
