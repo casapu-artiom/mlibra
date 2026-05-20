@@ -1,4 +1,15 @@
-##!/usr/bin/env sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+DRY_RUN=${DRY_RUN:-0}
+
+run_or_echo() {
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[DRY] $*"
+    else
+        "$@"
+    fi
+}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
 if [ -f "$SCRIPT_DIR/.env" ]; then
@@ -9,7 +20,7 @@ else
     exit 1
 fi
 
-MEM=32G
+MEM=48G
 CPU=4
 GPU=0.5
 
@@ -27,11 +38,10 @@ S3_REFERENCE_FILE_BG="/s3/mlibra/mlibra-data/bg_template.npy"
 S3_ANNOTATION_FILE_BG="/s3/mlibra/mlibra-data/bg_annotations.npy"
 SRC_PATH="/myhome/mlibra"
 
-EXP_PREFIX=("DIFFICULT" "FOLD-3")
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
-    local job_name=$1 template=$2 ref=$3 annot=$4 knn=$5 nu=$6 graphbandwidth=$7 bumpscale=$8 bumpdecay=$9 prefix=$10
+    local job_name=$1 template=$2 ref=$3 annot=$4 knn=$5 nu=$6 graphbandwidth=$7 bumpscale=$8 bumpdecay=$9 prefix=${10} slice=${11}
 	shift 11
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
@@ -40,13 +50,13 @@ submit() {
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
-        -e EXP_PREFIX="$EXP_PREFIX" \
+        -e EXP_PREFIX="$prefix" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e DATA_PATH="$S3_DATA_PATH" \
         -e OUTPUT_DIR="$S3_OUTPUT_DIR" \
         -e EIGENVECTOR_DIR="$S3_EIGENVECTOR_DIR" \
         -e MALDI_FILE="$S3_MALDI_FILE" \
-        -e SLICES_DATASET_FILE="$S3_SLICES_DATASET_FILE" \
+        -e SLICES_DATASET_FILE="$slice" \
         -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
         -e TEMPLATE_NAME="$template" \
         -e REFERENCE_FILE="$ref" \
@@ -60,27 +70,42 @@ submit() {
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 
-submit "gp-exp-difficult-${EXP_SUFFIX}-exp-1"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.01 "DIFFICULT"
-submit "gp-exp-difficult-${EXP_SUFFIX}-exp-2"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.05 "DIFFICULT"
-submit "gp-exp-difficult-${EXP_SUFFIX}-exp-3"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.1 "DIFFICULT"
-submit "gp-exp-fold-3-${EXP_SUFFIX}-exp-4"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.01 "FOLD-3"
-submit "gp-exp-fold-3-${EXP_SUFFIX}-exp-5"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.05 "FOLD-3"
-submit "gp-exp-fold-3-${EXP_SUFFIX}-exp-6"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1          0.01 80 0.1 "FOLD-3"
+FOLDS=("difficult" "fold-3")           # lowercase, dashed
+GRAPH_BANDWIDTHS=(0.01 0.05 0.1)
+BUMP_SCALES=(1 80 100)
+BUMP_DECAYS=(0.01 0.05 0.1)
 
+# Fixed across the whole sweep
+TEMPLATE="reference"
+REF="$S3_REFERENCE_FILE"
+ANNOT="$S3_ANNOTATION_FILE"
+KNN="faiss"
+NU=1
 
-# submit "gp-exp-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1     
-# submit "gp-exp-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1
-# submit "gp-exp-faiss-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             1
-# submit "gp-exp-atlas-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  1
-# submit "gp-exp-faiss-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             2     
-# submit "gp-exp-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2
-# submit "gp-exp-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2
-# submit "gp-exp-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2
-# submit "gp-exp-log-faiss-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             1  --log-transform
-# submit "gp-exp-log-atlas-1-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  1  --log-transform
-# submit "gp-exp-log-faiss-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             1  --log-transform
-# submit "gp-exp-log-atlas-1-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  1  --log-transform
-# submit "gp-exp-log-faiss-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     faiss             2  --log-transform
-# submit "gp-exp-log-atlas-2-reference-${EXP_SUFFIX}"    reference   "$S3_REFERENCE_FILE"    "$S3_ANNOTATION_FILE"     anatomical_atlas  2  --log-transform
-# submit "gp-exp-log-faiss-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  faiss             2  --log-transform
-# submit "gp-exp-log-atlas-2-brainglobe-${EXP_SUFFIX}"   brainglobe  "$S3_REFERENCE_FILE_BG" "$S3_ANNOTATION_FILE_BG"  anatomical_atlas  2  --log-transform
+exp_num=1
+for fold in "${FOLDS[@]}"; do
+    # fold-3  -> FOLD-3  (used as wandb EXP_PREFIX)
+    # fold-3  -> fold_3  (used in the splits filename)
+    fold_upper=${fold^^}
+    fold_file=${fold//-/_}
+    SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
+
+    for gb in "${GRAPH_BANDWIDTHS[@]}"; do
+        for bs in "${BUMP_SCALES[@]}"; do
+            for bd in "${BUMP_DECAYS[@]}"; do
+                job_name="gp-manifold-${EXP_SUFFIX}-${exp_num}"
+
+                # Map exp_num -> config, so you can read it back from terminal/logs
+                printf "  exp %2d: fold=%-10s gb=%-5s bs=%-4s bd=%s\n" \
+                    "$exp_num" "$fold" "$gb" "$bs" "$bd"
+
+                run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" \
+                    "$KNN" "$NU" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE"
+
+                exp_num=$((exp_num + 1))
+            done
+        done
+    done
+done
+
+echo "Submitted $((exp_num - 1)) jobs."
