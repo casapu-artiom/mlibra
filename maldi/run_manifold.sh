@@ -56,4 +56,6 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --graphbandwidth-init $GRAPHBANDWIDTH \
     --knn-method $KNN_METHOD \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
+    --do-brain-reconstruction \
+    --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
     "$@"

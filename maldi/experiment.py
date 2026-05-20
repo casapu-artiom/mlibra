@@ -641,7 +641,7 @@ class MaldiExperiment:
             non_zero_indices, volume_path, template_volume.shape, suffix=suffix,
             lipid_filter=lipid_filter,
         )
-
+        self.render_reconstruction(template_volume, volume_path, lipid_filter, suffix)
 
     def region_reconstruction(self, region_bbox, threshold=5.0,
                             lipid_indices=None, lipid_names=None):
@@ -733,45 +733,67 @@ class MaldiExperiment:
         return True
 
     def _reconstruct_voxels(self, non_zero_indices, volume_path, template_shape,
-                            suffix="", write_per_latent_volumes=False, lipid_filter=None):
+                            suffix="", lipid_filter=None):
         """Core reconstruction loop. One forward pass over all voxels, then
-        write everything. Smart in three ways:
-        1. Resume: skip the GPU loop if consolidated arrays already exist
-        2. Per-latent volumes only when latent_dim is reasonable
-        3. Probe one batch to learn latent_dim before allocating
+        write everything.
+
+        Memory model: when lipid_filter is set, we only allocate / save / load
+        those columns. The forward pass still runs the full decoder (one matmul
+        per batch produces all lipids — slicing them out doesn't speed it up),
+        but everything downstream operates on the subset.
+
+        Resume: the cached predictions array is shape (N, len(filter)) when
+        filtered, (N, n_lipids) when not. The two are not interchangeable —
+        if you re-run with a different filter and the cache shape mismatches,
+        we redo the GPU loop.
         """
         n_voxels = non_zero_indices.shape[0]
-        n_lipids = len(self.config.selected_lipids_names)
+        all_names = list(self.config.selected_lipids_names)
+        n_lipids_total = len(all_names)
 
-        preds_file     = volume_path / "predictions.npy"
-        indices_file   = volume_path / "predictions_indices.npy"
-        post_mean_file = volume_path / "predictions_posterior_mean.npy"
-        post_var_file  = volume_path / "predictions_posterior_var.npy"
+        if lipid_filter is None:
+            col_indices = np.arange(n_lipids_total, dtype=np.int64)
+            filter_tag = ""
+        else:
+            col_indices = np.asarray(lipid_filter, dtype=np.int64)
+            # Build a tag so cached files for different filters don't collide
+            if len(col_indices) <= 4:
+                filter_tag = "_lipids_" + "_".join(str(i) for i in col_indices)
+            else:
+                import hashlib
+                h = hashlib.sha1(col_indices.tobytes()).hexdigest()[:8]
+                filter_tag = f"_lipids_{len(col_indices)}_{h}"
+        n_lipids_out = len(col_indices)
 
-        # --- Resume: if consolidated arrays exist, skip GPU loop ---
+        preds_file       = volume_path / f"predictions{filter_tag}.npy"
+        indices_file     = volume_path / "predictions_indices.npy"
+        filter_meta_file = volume_path / f"predictions{filter_tag}.lipidcols.npy"
+
+        # --- Resume: same voxel set AND same lipid filter ---
         if preds_file.exists() and indices_file.exists():
             saved_indices = np.load(indices_file)
-            if saved_indices.shape == non_zero_indices.shape and \
-            np.array_equal(saved_indices, non_zero_indices):
+            same_voxels = (saved_indices.shape == non_zero_indices.shape and
+                        np.array_equal(saved_indices, non_zero_indices))
+            same_filter = True
+            if filter_meta_file.exists():
+                saved_cols = np.load(filter_meta_file)
+                same_filter = (saved_cols.shape == col_indices.shape and
+                            np.array_equal(saved_cols, col_indices))
+            if same_voxels and same_filter:
                 logging.info(f"Reusing cached predictions at {preds_file}")
                 all_preds = np.load(preds_file, mmap_mode="r")
-                post_mean = np.load(post_mean_file, mmap_mode="r") if post_mean_file.exists() else None
-                post_var  = np.load(post_var_file,  mmap_mode="r") if post_var_file.exists()  else None
-
                 self._write_per_lipid_volumes(
-                    all_preds, non_zero_indices, template_shape, suffix,
-                    lipid_filter=lipid_filter,
+                    volume_path, all_preds, non_zero_indices, template_shape, suffix,
+                    col_indices=col_indices,
                 )
-                if post_mean is not None and write_per_latent_volumes:
-                    # Per-latent volumes are independent of which lipids you picked, so
-                    # they get written regardless.
-                    self._write_per_latent_volumes(all_post_mean, all_post_var,
-                                                    non_zero_indices, template_shape, suffix)
                 return
             else:
-                logging.warning("Cached indices don't match current voxel set; recomputing.")
+                logging.warning(
+                    f"Cache mismatch (same_voxels={same_voxels}, same_filter={same_filter}); "
+                    "recomputing."
+                )
 
-        # --- Diffusion setup (unchanged from existing code) ---
+        # --- Diffusion setup ---
         ddpm = unet = true_values_min = true_values_max = padding = None
         pad_len = 0
         if self.config.use_diffusion:
@@ -792,7 +814,7 @@ class MaldiExperiment:
             pad_len = target_len - n_channels
             padding = (0, pad_len)
 
-        # --- Build coord tensor + dataloader ---
+        # --- Coordinates + dataloader ---
         non_zero_ccf = torch.tensor(non_zero_indices.astype(np.float32) * 0.025,
                                     dtype=torch.float32)
         non_zero_ccf = (non_zero_ccf - self.coord_mean) / self.coord_std
@@ -803,39 +825,20 @@ class MaldiExperiment:
             ccf_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=0,
         )
 
-        # --- Probe one batch to learn shapes and whether posterior is available ---
-        self.lgp_model.eval()
-        latent_dim = None
-        has_posterior = False
-        with torch.no_grad():
-            probe_coords = non_zero_ccf[:min(8, n_voxels)].to(self.config.device)
-            _, probe_post = self.lgp_model.predict(probe_coords)
-            if probe_post is not None and hasattr(probe_post, "mean") and hasattr(probe_post, "variance"):
-                try:
-                    pm = probe_post.mean
-                    pv = probe_post.variance
-                    latent_dim = int(pm.shape[-1])
-                    # Sanity-check that variance is well-formed
-                    _ = pv.detach().cpu().numpy().reshape(-1, latent_dim)
-                    has_posterior = True
-                    logging.info(f"GP posterior available; latent_dim={latent_dim}")
-                except Exception as e:
-                    logging.warning(f"Posterior present but unusable ({e}); skipping posterior storage.")
-            else:
-                logging.info("Model has no usable GP posterior; storing predictions only.")
+        # --- Pre-allocate accumulator (filtered width only) ---
+        pred_bytes = n_voxels * n_lipids_out * 4
+        logging.info(
+            f"Allocating {pred_bytes / 1e9:.2f} GB for predictions "
+            f"({n_voxels:,} voxels × {n_lipids_out} lipid{'s' if n_lipids_out != 1 else ''})"
+        )
+        all_preds = np.empty((n_voxels, n_lipids_out), dtype=np.float32)
 
-        # --- Pre-allocate accumulators (peak RAM check) ---
-        pred_bytes = n_voxels * n_lipids * 4
-        post_bytes = (n_voxels * latent_dim * 4 * 2) if has_posterior else 0
-        logging.info(f"Allocating {(pred_bytes + post_bytes) / 1e9:.2f} GB for accumulators")
-        all_preds = np.empty((n_voxels, n_lipids), dtype=np.float32)
-        all_post_mean = np.empty((n_voxels, latent_dim), dtype=np.float32) if has_posterior else None
-        all_post_var  = np.empty((n_voxels, latent_dim), dtype=np.float32) if has_posterior else None
-
-        train_mean_np = self.train_mean.cpu().numpy()
-        train_std_np  = self.train_std.cpu().numpy()
+        # Slice de-standardization params to the requested columns
+        train_mean_np = self.train_mean.cpu().numpy()[col_indices]
+        train_std_np  = self.train_std.cpu().numpy()[col_indices]
 
         cursor = 0
+        self.lgp_model.eval()
         with torch.no_grad():
             for batch in tqdm(ccf_loader, desc="reconstructing voxels"):
                 coords = batch[0].to(self.config.device)
@@ -854,58 +857,53 @@ class MaldiExperiment:
                     if pad_len > 0:
                         ddpm_pred = ddpm_pred[:, :-pad_len]
                     ddpm_pred = ddpm_pred * (true_values_max - true_values_min) + true_values_min
-                    preds_np = (cond.detach().cpu() - ddpm_pred).numpy()
+                    full_preds_np = (cond.detach().cpu() - ddpm_pred).numpy()
                 else:
-                    preds_np = preds.detach().cpu().numpy()
-                preds_np = preds_np * train_std_np + train_mean_np
-                if self.config.log_transform:
-                    preds_np = np.exp(preds_np) - 1e-10
+                    full_preds_np = preds.detach().cpu().numpy()
 
-                n_b = preds_np.shape[0]
-                all_preds[cursor:cursor + n_b] = preds_np.astype(np.float32, copy=False)
-                if has_posterior:
-                    all_post_mean[cursor:cursor + n_b] = (
-                        gp_posterior.mean.detach().cpu().numpy()
-                    )
-                    all_post_var[cursor:cursor + n_b] = (
-                        gp_posterior.variance.detach().cpu().numpy()
-                    )
+                # Slice to the requested lipids BEFORE de-standardization (so we
+                # never materialize the full (B, 172) post-processed cube)
+                sliced = full_preds_np[:, col_indices]
+                sliced = sliced * train_std_np + train_mean_np
+                if self.config.log_transform:
+                    sliced = np.exp(sliced) - 1e-10
+
+                n_b = sliced.shape[0]
+                all_preds[cursor:cursor + n_b] = sliced.astype(np.float32, copy=False)
                 cursor += n_b
 
-        # --- Save consolidated arrays ---
+        # --- Save consolidated ---
         np.save(preds_file, all_preds)
         np.save(indices_file, non_zero_indices)
-        logging.info(f"Saved predictions: {all_preds.shape} → {preds_file}")
-        if has_posterior:
-            np.save(post_mean_file, all_post_mean)
-            np.save(post_var_file, all_post_var)
-            logging.info(f"Saved posterior mean/var: {all_post_mean.shape} → {post_mean_file}")
+        np.save(filter_meta_file, col_indices)
+        logging.info(
+            f"Saved predictions: {all_preds.shape} → {preds_file}  "
+            f"(lipids: {[all_names[i] for i in col_indices]})"
+        )
 
         # --- Per-lipid volumes ---
-        self._write_per_lipid_volumes(all_preds, non_zero_indices, template_shape, suffix)
+        self._write_per_lipid_volumes(
+            volume_path, all_preds, non_zero_indices, template_shape, suffix,
+            col_indices=col_indices,
+        )
 
-        # --- Per-latent volumes + aggregate uncertainty ---
-        if has_posterior and write_per_latent_volumes:
-            self._write_per_latent_volumes(all_post_mean, all_post_var, non_zero_indices,
-                                            template_shape, suffix)
-
-    def _write_per_lipid_volumes(self, predictions, indices, template_shape,
-                                suffix="", lipid_filter=None):
+    def _write_per_lipid_volumes(self, volume_path, predictions, indices, template_shape,
+                                suffix="", col_indices=None):
+        """predictions: (N, K) where K = len(col_indices). col_indices maps each
+        column back to its lipid index in selected_lipids_names."""
         z, y, x = indices[:, 0], indices[:, 1], indices[:, 2]
-        if lipid_filter is None:
-            lipid_iter = enumerate(self.config.selected_lipids_names)
-            total = len(self.config.selected_lipids_names)
-        else:
-            lipid_iter = ((int(i), self.config.selected_lipids_names[int(i)])
-                        for i in lipid_filter)
-            total = len(lipid_filter)
-        for li, lipid_name in tqdm(lipid_iter, total=total, desc="per-lipid volumes"):
-            out_path = self.config.exp_path / f"{lipid_name}_volume{suffix}.npy"
-            out_255  = self.config.exp_path / f"{lipid_name}_volume255{suffix}.npy"
+        if col_indices is None:
+            col_indices = np.arange(predictions.shape[1], dtype=np.int64)
+
+        for col_pos, lipid_global_idx in enumerate(tqdm(col_indices,
+                                                        desc="per-lipid volumes")):
+            lipid_name = self.config.selected_lipids_names[int(lipid_global_idx)]
+            out_path = volume_path / f"{lipid_name}_volume{suffix}.npy"
+            out_255  = volume_path / f"{lipid_name}_volume255{suffix}.npy"
             if out_path.exists() and out_255.exists():
                 continue
             vol = np.full(template_shape, np.nan, dtype=np.float32)
-            vol[z, y, x] = predictions[:, li]
+            vol[z, y, x] = predictions[:, col_pos]
             np.save(out_path, vol)
             vmin = np.nanmin(vol); vmax = np.nanmax(vol)
             if np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
@@ -913,31 +911,22 @@ class MaldiExperiment:
             else:
                 np.save(out_255, vol)
 
-    def _write_per_latent_volumes(self, post_mean, post_var, indices,
-                                template_shape, suffix=""):
-        """Write one .npy per latent dim for both mean and variance, plus a
-        single 'total variance' (sum over latents) volume — that's the
-        most useful uncertainty heatmap for visualization."""
-        z, y, x = indices[:, 0], indices[:, 1], indices[:, 2]
-        latent_dim = post_mean.shape[1]
-        for k in tqdm(range(latent_dim), desc="per-latent volumes"):
-            mean_path = self.config.exp_path / f"latent_{k:02d}_mean{suffix}.npy"
-            var_path  = self.config.exp_path / f"latent_{k:02d}_var{suffix}.npy"
-            if not mean_path.exists():
-                vol = np.full(template_shape, np.nan, dtype=np.float32)
-                vol[z, y, x] = post_mean[:, k]
-                np.save(mean_path, vol)
-            if not var_path.exists():
-                vol = np.full(template_shape, np.nan, dtype=np.float32)
-                vol[z, y, x] = post_var[:, k]
-                np.save(var_path, vol)
-        # Aggregate: total variance (sum across latents) — single uncertainty heatmap
-        agg_path = self.config.exp_path / f"posterior_total_variance{suffix}.npy"
-        if not agg_path.exists():
-            vol = np.full(template_shape, np.nan, dtype=np.float32)
-            vol[z, y, x] = post_var.sum(axis=1)
-            np.save(agg_path, vol)
-            logging.info(f"Saved total-variance map (Σ over latents): {agg_path}")
+    def render_reconstruction(self, template_volume, volume_path, lipid_filter,
+                              region_suffix: str = ""):
+        """Render per-lipid composite PNGs after reconstruction. Honors the
+        same lipid filter resolution as whole_brain_reconstruction."""
+        from render_lipid_volumes import render_selected_lipids
+        suffix = "_diffusion" if self.config.use_diffusion else region_suffix
+
+        render_selected_lipids(
+            template_volume=template_volume,
+            volume_dir=volume_path,
+            output_dir=self.config.exp_path / "renders",
+            selected_lipids_names=self.config.selected_lipids_names,
+            lipid_indices=list(lipid_filter),
+            suffix=suffix,
+            n_rotation_frames=10,
+        )
 
     def load_whole_brain_reconstruction(self, lipid):
         """Return per-lipid volume; builds on demand from consolidated array."""
