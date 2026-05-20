@@ -40,4 +40,6 @@ python $SRC_PATH/maldi/lgp_experiment.py \
     --kernel "$KERNEL" \
     --mode "$MODE" \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
+    --do-brain-reconstruction \
+    --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
     "$@"
