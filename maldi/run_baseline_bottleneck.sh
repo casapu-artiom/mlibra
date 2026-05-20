@@ -49,7 +49,8 @@ python $SRC_PATH/maldi/experiment_baselines.py \
     --xgb-n-estimators $XGB_N_ESTIMATORS \
     --xgb-max-depth $XGB_MAX_DEPTH \
     --xgb-lr $XGB_LR \
-    --reconstruct none \
+    --reconstruct whole_brain \
+    --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
     "$@"
 
 # --reconstruct whole_brain \

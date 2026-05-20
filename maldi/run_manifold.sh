@@ -6,7 +6,7 @@
 : "${BATCH_SIZE:=1000}"
 : "${N_EPOCHS:=2}"
 : "${LEARNING_RATE:=0.001}"
-: "${GRAPHBANDWIDTH:=0.01}"
+: "${GRAPHBANDWIDTH:=0.05}"
 : "${NU:=1}"
 : "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
@@ -22,7 +22,7 @@
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/difficult.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${KNN_METHOD:=anatomical_atlas}"
+: "${KNN_METHOD:=faiss}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=DIFFICULT}"
 
@@ -56,6 +56,8 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --graphbandwidth-init $GRAPHBANDWIDTH \
     --knn-method $KNN_METHOD \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
+    --do-brain-reconstruction \
+    --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
     "$@"
 
 # --do-brain-reconstruction \
