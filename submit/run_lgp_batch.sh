@@ -26,7 +26,7 @@ GPU=0.5
 
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_3"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_2"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
