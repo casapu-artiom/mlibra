@@ -58,8 +58,8 @@ submit() {
         -e SLICES_DATASET_FILE="$slices" \
         -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
         -e TEMPLATE_NAME="reference" \
-        -e REFERENCE_FILE="$REFERENCE_FILE" \
-        -e ANNOTATION_FILE="$ANNOTATION_FILE" \
+        -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
+        -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
         -e SRC_PATH="$SRC_PATH" \
         -e N_EPOCHS="$N_EPOCHS" \
         -- ./maldi/run_baseline.sh "${extra_args[@]}"
@@ -85,8 +85,8 @@ submit_bottleneck() {
         -e SLICES_DATASET_FILE="$slices" \
         -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
         -e TEMPLATE_NAME="reference" \
-        -e REFERENCE_FILE="$REFERENCE_FILE" \
-        -e ANNOTATION_FILE="$ANNOTATION_FILE" \
+        -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
+        -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
         -e SRC_PATH="$SRC_PATH" \
         -- ./maldi/run_baseline_bottleneck.sh "${extra_args[@]}"
 }
