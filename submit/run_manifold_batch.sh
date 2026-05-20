@@ -24,6 +24,7 @@ MEM=48G
 CPU=4
 GPU=0.5
 
+N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
 S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_2"
@@ -67,6 +68,7 @@ submit() {
         -e GRAPHBANDWIDTH="$graphbandwidth" \
         -e BUMP_SCALE="$bumpscale" \
         -e BUMP_DECAY="$bumpdecay" \
+        -e N_EPOCHS="$N_EPOCHS" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 

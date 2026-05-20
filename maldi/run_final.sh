@@ -2,7 +2,7 @@
 : "${NUM_INDUCING_POINTS:=500}"
 : "${LATENT_DIM:=5}"
 : "${BATCH_SIZE:=1000}"
-: "${N_EPOCHS:=20}"
+: "${N_EPOCHS:=2}"
 : "${LEARNING_RATE:=0.001}"
 : "${SEED:=416465}"
 : "${KERNEL:=matern}"

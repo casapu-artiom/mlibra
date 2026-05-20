@@ -129,7 +129,7 @@ def setup_experiment(args):
     nlist                = args.get("n_list", 1)
     num_modes            = args.get("num_modes", 200)
     bump_scale           = args.get("bump_scale", 20.0)
-    bump_decay           = args.get("bump_scale", 0.01)
+    bump_decay           = args.get("bump_decay", 0.01)
     laplacian_norm       = args.get("laplacian_norm", "symmetric")
     graphbandwidth_init  = args.get("graphbandwidth_init", 1.0)   # used for both eigensolve and kernel init
     knn_method           = args.get("knn_method", "faiss")

@@ -60,10 +60,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+import uuid
 import wandb
 
 import numpy as np
@@ -453,13 +455,21 @@ class LaplacianEigensolver:
         # if cache_dir is on one. /tmp is always a real filesystem.
         import tempfile, shutil
         with tempfile.TemporaryDirectory(prefix="eigensolver_") as tmpd:
-            tmp_npz = Path(tmpd) / npz_path.name
+            tmp_local_npz = Path(tmpd) / npz_path.name
             np.savez(
-                tmp_npz,
+                tmp_local_npz,
                 eigval=eigval.detach().cpu().numpy(),
                 eigvec=eigvec.detach().cpu().numpy(),
             )
-            shutil.copyfile(tmp_npz, npz_path)
+            # 1. Create a unique temporary path on the FUSE S3 mount
+            tmp_s3_npz = npz_path.with_name(f"{npz_path.name}.{uuid.uuid4().hex}.tmp")
+            
+            # 2. Copy the file to the unique FUSE path safely
+            shutil.copyfile(tmp_local_npz, tmp_s3_npz)
+            
+            # 3. Atomically replace the target file
+            os.replace(tmp_s3_npz, npz_path)
+            # shutil.copyfile(tmp_npz, npz_path)
 
         # JSON is a single sequential write -- no seeks, fine to write direct.
         meta = {

@@ -19,7 +19,8 @@ class RiemannMaternKernel(RiemannKernel):
         self.nu = nu
 
     def spectral_density(self):
-        return (2*self.nu / self.lengthscale.square() + self.eigval).pow(-self.nu)
+        safe_eigval = self.eigval.clamp(min=0.0)
+        return (2*self.nu / self.lengthscale.square() + safe_eigval).pow(-self.nu)
 
     def precision(self):
         return PrecisionMaternOperator(self.laplacian(), self.nu, self.lengthscale)

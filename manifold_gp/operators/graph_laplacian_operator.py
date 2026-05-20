@@ -53,7 +53,13 @@ class GraphLaplacianOperator(LinearOperator):
     @cached(name="adjacency_unnorm_mat")
     def adjacency_unnorm_mat(self: Float[LinearOperator, "N N"]) -> Float[torch.Tensor, "M"]:
         # print("adjacency_unnorm_mat")
-        return self.x.div(-4*self.graphbandwidth.square()).exp().squeeze()
+        x64 = self.x.double()
+        bw64 = self.graphbandwidth.double()
+        adj = x64.div(-4 * bw64.square()).exp()
+        # Cast back to float32 only if the downstream operators are float32;
+        # for safety, keep float64 if you have the memory.
+        return adj.to(self.x.dtype).squeeze()
+        #return self.x.div(-4*self.graphbandwidth.square()).exp().squeeze()
 
     @property
     @cached(name="degree_unnorm_mat")

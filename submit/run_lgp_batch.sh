@@ -24,6 +24,7 @@ MEM=48G
 CPU=4
 GPU=0.5
 
+N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_2"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
@@ -56,6 +57,7 @@ submit() {
         -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
         -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
         -e SRC_PATH="$SRC_PATH" \
+        -e N_EPOCHS="$N_EPOCHS" \
         -- ./maldi/run_final.sh "${extra_args[@]}"
 }
 

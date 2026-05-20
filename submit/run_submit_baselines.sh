@@ -24,6 +24,7 @@ MEM=32G
 CPU=4
 GPU=0.5
 
+N_EPOCHS=100
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
 S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_2"
@@ -60,6 +61,7 @@ submit() {
         -e REFERENCE_FILE="$REFERENCE_FILE" \
         -e ANNOTATION_FILE="$ANNOTATION_FILE" \
         -e SRC_PATH="$SRC_PATH" \
+        -e N_EPOCHS="$N_EPOCHS" \
         -- ./maldi/run_baseline.sh "${extra_args[@]}"
 }
 
