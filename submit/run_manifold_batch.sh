@@ -72,10 +72,10 @@ submit() {
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 
-FOLDS=("difficult" "fold-3")           # lowercase, dashed
-GRAPH_BANDWIDTHS=(0.01 0.05 0.1)
+FOLDS=("fold-3")           # lowercase, dashed
+GRAPH_BANDWIDTHS=(0.05 0.1)
 BUMP_SCALES=(1 80 100)
-BUMP_DECAYS=(0.01 0.05 0.1)
+BUMP_DECAYS=(0.01 0.1)
 
 # Fixed across the whole sweep
 TEMPLATE="reference"
