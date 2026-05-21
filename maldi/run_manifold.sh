@@ -8,6 +8,7 @@
 : "${LEARNING_RATE:=0.001}"
 : "${GRAPHBANDWIDTH:=0.05}"
 : "${NU:=1}"
+: "${KNN_K:=15}"
 : "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${SEED:=416465}"
@@ -55,10 +56,8 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --bump-decay $BUMP_DECAY \
     --graphbandwidth-init $GRAPHBANDWIDTH \
     --knn-method $KNN_METHOD \
+    --knn-k $KNN_K \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
     --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
     "$@"
-
-# --do-brain-reconstruction \
-# --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \

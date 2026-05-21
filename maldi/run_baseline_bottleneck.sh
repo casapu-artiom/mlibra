@@ -52,6 +52,3 @@ python $SRC_PATH/maldi/experiment_baselines.py \
     --reconstruct whole_brain \
     --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
     "$@"
-
-# --reconstruct whole_brain \
-# --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
