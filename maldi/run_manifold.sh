@@ -26,6 +26,7 @@
 : "${KNN_METHOD:=faiss}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=DIFFICULT}"
+: "${LAPLACIAN_NORM:=symmetric}"
 
 cd $SRC_PATH
 #pip install -e .
@@ -50,6 +51,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --num-inducing $NUM_INDUCING_POINTS \
     --num-modes $NUM_MODES \
     --kernel "$KERNEL" \
+    --laplacian-norm "$LAPLACIAN_NORM" \
     --mode "$MODE" \
     --nu $NU \
     --bump-scale $BUMP_SCALE \
