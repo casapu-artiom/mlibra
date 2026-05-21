@@ -26,7 +26,7 @@ GPU=0.5
 
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_2"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_4"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -58,11 +58,27 @@ submit() {
         -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
         -e SRC_PATH="$SRC_PATH" \
         -e N_EPOCHS="$N_EPOCHS" \
+        -e NUM_INDUCING_POINTS=1000 \
+        -e NUM_MODES=2000 \
         -- ./maldi/run_final.sh "${extra_args[@]}"
 }
 
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
-run_or_echo submit "gp-lgp-fold-3-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
+
+#FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8" "difficult")           # lowercase, dashed
+FOLDS=("fold-3")           # lowercase, dashed
+exp_num=1
+for fold in "${FOLDS[@]}"; do
+    # fold-3  -> FOLD-3  (used as wandb EXP_PREFIX)
+    # fold-3  -> fold_3  (used in the splits filename)
+    fold_upper=${fold^^}
+    fold_file=${fold//-/_}
+    SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
+    run_or_echo submit "gp-lgp-${EXP_SUFFIX}-${exp_num}" "${SLICES_DATASET_FILE}" "${fold_upper}"
+    exp_num=$((exp_num + 1))
+done
+
+#run_or_echo submit "gp-lgp-fold-3-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
 #run_or_echo submit "gp-lgp-fold-3-log-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3" --log-transform
 # run_or_echo submit "gp-lgp-difficult-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_DIFFICULT}" "DIFFICULT"
 # run_or_echo submit "gp-lgp-difficult-log-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_DIFFICULT}" "DIFFICULT" --log-transform

@@ -27,7 +27,7 @@ GPU=0.5
 N_EPOCHS=100
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_2"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_4"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -41,7 +41,7 @@ EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
     local job_name=$1 slices=$2 prefix=$3
-	shift 1
+	shift 3
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
@@ -67,7 +67,7 @@ submit() {
 
 submit_bottleneck() {
     local job_name=$1 slices=$2 prefix=$3
-	shift 1
+	shift 3
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
@@ -91,8 +91,20 @@ submit_bottleneck() {
         -- ./maldi/run_baseline_bottleneck.sh "${extra_args[@]}"
 }
 
-run_or_echo submit "gp-exp-fold-3-mlp-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
-run_or_echo submit_bottleneck "gp-exp-fold-3-mlp-bn-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
+#FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8" "difficult")           # lowercase, dashed
+FOLDS=("fold-3")           # lowercase, dashed
+exp_num=1
+for fold in "${FOLDS[@]}"; do
+    fold_upper=${fold^^}
+    fold_file=${fold//-/_}
+    SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
+    run_or_echo submit "gp-exp-mlp-${EXP_SUFFIX}-${exp_num}" "${SLICES_DATASET_FILE}" "${fold_upper}"
+    run_or_echo submit_bottleneck "gp-exp-bn-mlp-${EXP_SUFFIX}-${exp_num}" "${SLICES_DATASET_FILE}" "${fold_upper}"
+    exp_num=$((exp_num + 1))
+done
+
+#run_or_echo submit "gp-exp-fold-3-mlp-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
+#run_or_echo submit_bottleneck "gp-exp-fold-3-mlp-bn-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
 #run_or_echo submit "gp-exp-fold-3-mlp-log-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3" --log-transform
 #run_or_echo submit_bottleneck "gp-exp-difficult-mlp-bn-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_DIFFICULT}" "DIFFICULT"
 #run_or_echo submit_bottleneck "gp-exp-difficult-mlp-bn-log-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_DIFFICULT}" "DIFFICULT" --log-transform
