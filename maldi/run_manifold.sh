@@ -4,10 +4,10 @@
 : "${LATENT_DIM:=5}"
 : "${STRIDE:=4}"
 : "${BATCH_SIZE:=1000}"
-: "${N_EPOCHS:=2}"
+: "${N_EPOCHS:=10}"
 : "${LEARNING_RATE:=0.001}"
-: "${GRAPHBANDWIDTH:=0.05}"
-: "${NU:=1}"
+: "${GRAPHBANDWIDTH:=0.1}"
+: "${NU:=2}"
 : "${KNN_K:=15}"
 : "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
@@ -26,7 +26,8 @@
 : "${KNN_METHOD:=faiss}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=DIFFICULT}"
-: "${LAPLACIAN_NORM:=symmetric}"
+: "${LAPLACIAN_NORM:=randomwalk}"
+: "${THRESHOLD:=40}"
 
 cd $SRC_PATH
 #pip install -e .
@@ -40,6 +41,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --output-dir $OUTPUT_DIR \
     --template-name $TEMPLATE_NAME \
     --reference-file $REFERENCE_FILE \
+    --threshold $THRESHOLD \
     --annotations-file $ANNOTATION_FILE \
     --eigenvector-dir $EIGENVECTOR_DIR \
     --batch-size $BATCH_SIZE \

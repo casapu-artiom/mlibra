@@ -53,6 +53,7 @@ def parse_args():
     parser.add_argument("--kernel", type=str, default="rbf", help="Kernel type for the GP model (legacy, ignored by Riemann).")
     parser.add_argument("--log-transform", dest="log_transform", action='store_true', help="Apply log transformation to the data.")
     parser.add_argument("--nu", type=float, default=1.0, help="Smoothness parameter for the Riemann GP model.")
+    parser.add_argument("--threshold", type=int, default=5, help="Threshold for the reference")
     parser.add_argument("--n-pixels", dest="n_pixels", type=int, default=10, help="Number of pixels to consider in the experiment.")
     parser.add_argument("--learning-rate", dest="learning_rate", type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=2000, help="Batch size for training")
@@ -123,7 +124,7 @@ def setup_experiment(args):
     if config.annotations_file is not None:
         annotations_volume = np.load(config.annotations_file)
 
-    threshold            = 5
+    threshold            = args.get("threshold", 5)
     stride               = args.get("stride", 4)
     knn_k                = args.get("knn_k", 15)
     nlist                = args.get("n_list", 1)
@@ -199,6 +200,27 @@ def setup_experiment(args):
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
 
+    print("Edge value mean ", edge_value.mean())
+    print("Edge value max ", edge_value.max())
+    print("Edge value min ", edge_value.min())
+    print("Edge value median ", edge_value.median())
+    print("Edge value std ", edge_value.std())
+    edge_dist = torch.sqrt(edge_value)
+    median_dist = float(edge_dist.median())     # robust to the heavy tail
+    p90_dist    = float(torch.quantile(edge_dist, 0.9))
+    print("Edge median dist ", median_dist)
+    print("Edge 90p ", p90_dist)
+    edge_dist = torch.sqrt(edge_value)
+    for p in [95, 98, 99, 99.5, 99.9]:
+        q = float(torch.quantile(edge_dist, p / 100))
+        sq = q ** 2
+        underflow_bw = (sq / 349) ** 0.5
+        print(f"p{p}: edge_dist={q:.4g}, squared={sq:.4g}, "
+            f"float32 needs bw >= {underflow_bw:.4g}")
+
+    print(f"max edge dist: {edge_dist.max().item():.4g}")
+
+
     # 5. Eigenpairs: compute (or load from cache) before kernel construction.
     eigvec_cache_dir = eigenvector_dir / "eigvecs"
     laplacian_op = GraphLaplacianOperator(
@@ -231,6 +253,21 @@ def setup_experiment(args):
         force_recompute=bool(args.get("force_recompute_eigvecs", False)),
         device=config.device,
     )
+    print(f"eigvec shape:          {tuple(eigvec.shape)}")  # (N_nodes, num_modes)
+    print(f"eigval shape:          {tuple(eigval.shape)}")
+    print(f"NaN in eigvec:         {torch.isnan(eigvec).any().item()}")
+    print(f"NaN in eigval:         {torch.isnan(eigval).any().item()}")
+    print(f"eigval range:          [{eigval.min().item():.4g}, {eigval.max().item():.4g}]")
+    print(f"first 10 eigvals:      {eigval[:10].cpu().numpy()}")
+
+    # Orthonormality check — eigvec.T @ eigvec should be ~I for a well-conditioned eigensolve
+    inner = eigvec.T @ eigvec
+    off_diag = inner - torch.eye(inner.shape[0], device=inner.device)
+    print(f"|eigvec.T @ eigvec - I|_max (off-diag): {off_diag.abs().max().item():.4g}")
+
+    # Eigval ordering — should be non-decreasing
+    diffs = eigval[1:] - eigval[:-1]
+    print(f"min eigval gap (should be >= 0): {diffs.min().item():.4g}")
 
     # 6. Riemann Matern kernel, fully formed at construction.
     logging.info("Building Riemann Kernel (knn + edges + eigenpairs at construction)...")
