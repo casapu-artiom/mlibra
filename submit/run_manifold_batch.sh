@@ -27,7 +27,7 @@ GPU=0.5
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_5"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_6"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -42,8 +42,8 @@ SRC_PATH="/myhome/mlibra"
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
-    local job_name=$1 template=$2 ref=$3 annot=$4 knn=$5 knn_k=$6 laplacian_norm=$7 nu=$8 graphbandwidth=$9 bumpscale=${10} bumpdecay=${11} prefix=${12} slice=${13}
-	shift 13
+    local job_name=$1 template=$2 ref=$3 annot=$4 threshold=$5 knn=$6 knn_k=$7 laplacian_norm=$8 nu=$9 graphbandwidth=${10} bumpscale=${11} bumpdecay=${12} prefix=${13} slice=${14}
+	shift 14
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
@@ -73,6 +73,7 @@ submit() {
         -e N_EPOCHS="$N_EPOCHS" \
         -e NUM_INDUCING_POINTS=1000 \
         -e NUM_MODES=1300 \
+        -e THRESHOLD="$threshold" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 
@@ -81,20 +82,30 @@ submit() {
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.01 0.1)
 
+# FOLDS=("fold-3")           # lowercase, dashed
+# KNN_K=(5 15)
+# KNN_METHODS=("faiss" "anatomical_atlas")
+# LAPLACIAN_NORMS=("symmetric" "randomwalk")
+# GRAPH_BANDWIDTHS=(0.5 1.0)
+# BUMP_SCALES=(1 20 80)
+# BUMP_DECAYS=(0.1 1.0)
+
 FOLDS=("fold-3")           # lowercase, dashed
-KNN_K=(5 15)
-KNN_METHODS=("faiss" "anatomical_atlas")
-LAPLACIAN_NORMS=("symmetric" "randomwalk")
-GRAPH_BANDWIDTHS=(0.5 1.0)
-BUMP_SCALES=(1 20 80)
+KNN_K=(15 60)
+KNN_METHODS=("faiss")
+LAPLACIAN_NORMS=("randomwalk")
+GRAPH_BANDWIDTHS=(0.1)
+BUMP_SCALES=(20)
 BUMP_DECAYS=(0.1 1.0)
+# BUMP_SCALES=(1 20 80)
+# BUMP_DECAYS=(0.1 1.0)
+NU=(1, 2, 3)
+THRESHOLDS=(40, 60)
 
 # Fixed across the whole sweep
 TEMPLATE="reference"
 REF="$S3_REFERENCE_FILE"
 ANNOT="$S3_ANNOTATION_FILE"
-KNN="faiss"
-NU=1
 
 exp_num=1
 for fold in "${FOLDS[@]}"; do
@@ -110,17 +121,20 @@ for fold in "${FOLDS[@]}"; do
                 for knn_k in "${KNN_K[@]}"; do
                     for knn_method in "${KNN_METHODS[@]}"; do
                         for laplacian_norm in "${LAPLACIAN_NORMS[@]}"; do
-                            
-                            job_name="gp-manifold-${EXP_SUFFIX}-${exp_num}"
+                            for nu in ${NU[@]}; do
+                                for threshold in ${THRESHOLDS[@]}; do
+                                    job_name="gp-manifold-${EXP_SUFFIX}-${exp_num}"
 
-                            # Map exp_num -> config, so you can read it back from terminal/logs
-                            printf "  exp %2d: fold=%-10s gb=%-5s bs=%-4s bd=%s\n" \
-                                "$exp_num" "$fold" "$gb" "$bs" "$bd"
+                                    # Map exp_num -> config, so you can read it back from terminal/logs
+                                    printf "  exp %2d: fold=%-10s gb=%-5s bs=%-4s bd=%s\n" \
+                                        "$exp_num" "$fold" "$gb" "$bs" "$bd"
 
-                            run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" \
-                                "$knn_method" "$knn_k" "$laplacian_norm" "$NU" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE"
+                                    run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" "$threshold" \
+                                        "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE"
 
-                            exp_num=$((exp_num + 1))
+                                    exp_num=$((exp_num + 1))
+                                done
+                            done
                         done
                     done
                 done 
