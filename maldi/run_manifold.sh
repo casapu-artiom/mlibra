@@ -14,6 +14,7 @@
 : "${SEED:=416465}"
 : "${KERNEL:=symmetric}"
 : "${MODE:=lgp}"
+: "${NO_RSAMPLE:=false}"
 : "${TEMPLATE_NAME:=reference}"
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
@@ -32,7 +33,15 @@
 cd $SRC_PATH
 #pip install -e .
 
-EXP_NAME="$EXP_PREFIX-MANIFOLD-RSAMPLE-$LATENT_DIM-$STRIDE-$TEMPLATE_NAME-$THRESHOLD-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$KNN_K-$LAPLACIAN_NORM-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH"
+if [ "$NO_RSAMPLE" = "true" ] || [ "$NO_RSAMPLE" = "1" ]; then
+    SAMPLING_TAG="MEAN"         # Update this to whatever you want the name to be without rsample
+    SAMPLING_FLAG="--no-rsample" # The flag to pass to your python script
+else
+    SAMPLING_TAG="RSAMPLE"
+    SAMPLING_FLAG=""             # Leave empty so Python falls back to its default
+fi
+
+EXP_NAME="$EXP_PREFIX-MANIFOLD-$SAMPLING_TAG-$LATENT_DIM-$STRIDE-$TEMPLATE_NAME-$THRESHOLD-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$KNN_K-$LAPLACIAN_NORM-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH"
 
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
@@ -64,4 +73,4 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
     --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
-    "$@"
+    $SAMPLING_FLAG "$@"
