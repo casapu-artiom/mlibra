@@ -70,7 +70,7 @@ def parse_args():
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
-    parser.add_argument("--use-rsample", dest="use_rsample", action='store_false', help="Use rsample instead of mean.")
+    parser.add_argument("--no-rsample", dest="no_rsample", action='store_false', help="Use rsample instead of mean.")
     parser.add_argument("--do-brain-reconstruction", dest="do_brain_reconstruction", action='store_true', help="Perform whole brain prediction")
     parser.add_argument(
         "--reconstruction-lipids", dest="reconstruction_lipids",
@@ -295,6 +295,7 @@ def setup_experiment(args):
         manifold_kernel=manifold_kernel,
     ).to(config.device)
 
+    use_rsample = not args.get("no_rsample", False)
     lgp_model = ManifoldLGP(
         p=len(config.selected_lipids_names),
         d=config.latent_dim,
@@ -303,7 +304,7 @@ def setup_experiment(args):
         activation="silu",
         device=config.device,
         gp_model=gp_model,
-        use_rsample=args.get("use_rsample", True),
+        use_rsample=use_rsample,
     )
 
     wandb.finish()

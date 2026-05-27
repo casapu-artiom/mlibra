@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--learning-rate", dest="learning_rate", type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=2000, help="Batch size for training")
     parser.add_argument("--load-args", dest="load_args", action='store_true', help="Load arguments from a file instead of command line.")
-    parser.add_argument("--use-rsample", dest="use_rsample", action='store_false', help="Use rsample instead of mean.")
+    parser.add_argument("--no-rsample", dest="no_rsample", action='store_false', help="Use rsample instead of mean.")
     parser.add_argument("--use-diffusion", dest="use_diffusion", action='store_true', help="Use diffusion model in the experiment.")
     parser.add_argument("--do-brain-reconstruction", dest="do_brain_reconstruction", action='store_true', help="Perform whole brain prediction")
     parser.add_argument(
@@ -106,6 +106,7 @@ def setup_experiment(args):
     logging.info("GP model created successfully")
 
     logging.info("Creating LGP instance")
+    use_rsample = not args.get("no_rsample", False)
     lgp_model = LGP(
         gp_model=gp_model,
         p=len(config.selected_lipids_names),
@@ -114,7 +115,7 @@ def setup_experiment(args):
         dropout=[0.1, 0.1, 0.1],
         activation='silu',
         device=config.device,
-        use_rsample=args.get("use_rsample", True),
+        use_rsample=use_rsample,
     )
     return MaldiExperiment(config, lgp_model, coord_mean, coord_std), region_bbox
 
