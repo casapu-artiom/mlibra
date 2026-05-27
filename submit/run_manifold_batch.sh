@@ -99,7 +99,7 @@ BUMP_SCALES=(20)
 BUMP_DECAYS=(0.1 1.0)
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.1 1.0)
-NU=(1, 2, 3)
+NU=(1 2 3)
 THRESHOLDS=(40 60)
 
 # Fixed across the whole sweep

@@ -26,7 +26,7 @@ GPU=0.5
 
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_5"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_7"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -37,8 +37,8 @@ S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_availabl
 SRC_PATH="/myhome/mlibra"
 
 submit() {
-    local job_name=$1 slices=$2 prefix=$3
-	shift 3
+    local job_name=$1 slices=$2 prefix=$3 norsample=$4
+	shift 4
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
@@ -60,6 +60,7 @@ submit() {
         -e N_EPOCHS="$N_EPOCHS" \
         -e NUM_INDUCING_POINTS=1000 \
         -e NUM_MODES=2000 \
+        -e NO_RSAMPLE="$norsample" \
         -- ./maldi/run_final.sh "${extra_args[@]}"
 }
 
@@ -67,15 +68,18 @@ EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 #FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8" "difficult")           # lowercase, dashed
 FOLDS=("fold-3")           # lowercase, dashed
+NO_RSAMPLES=("false" "true")
 exp_num=1
 for fold in "${FOLDS[@]}"; do
-    # fold-3  -> FOLD-3  (used as wandb EXP_PREFIX)
-    # fold-3  -> fold_3  (used in the splits filename)
-    fold_upper=${fold^^}
-    fold_file=${fold//-/_}
-    SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
-    run_or_echo submit "gp-lgp-${EXP_SUFFIX}-${exp_num}" "${SLICES_DATASET_FILE}" "${fold_upper}"
-    exp_num=$((exp_num + 1))
+    for norsample in "${NO_RSAMPLES[@]}"; do
+        # fold-3  -> FOLD-3  (used as wandb EXP_PREFIX)
+        # fold-3  -> fold_3  (used in the splits filename)
+        fold_upper=${fold^^}
+        fold_file=${fold//-/_}
+        SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
+        run_or_echo submit "gp-lgp-${EXP_SUFFIX}-${exp_num}" "${SLICES_DATASET_FILE}" "${fold_upper}" "${norsample}"
+        exp_num=$((exp_num + 1))
+    done
 done
 
 #run_or_echo submit "gp-lgp-fold-3-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
