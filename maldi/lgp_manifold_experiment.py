@@ -200,27 +200,6 @@ def setup_experiment(args):
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
 
-    print("Edge value mean ", edge_value.mean())
-    print("Edge value max ", edge_value.max())
-    print("Edge value min ", edge_value.min())
-    print("Edge value median ", edge_value.median())
-    print("Edge value std ", edge_value.std())
-    edge_dist = torch.sqrt(edge_value)
-    median_dist = float(edge_dist.median())     # robust to the heavy tail
-    p90_dist    = float(torch.quantile(edge_dist, 0.9))
-    print("Edge median dist ", median_dist)
-    print("Edge 90p ", p90_dist)
-    edge_dist = torch.sqrt(edge_value)
-    for p in [95, 98, 99, 99.5, 99.9]:
-        q = float(torch.quantile(edge_dist, p / 100))
-        sq = q ** 2
-        underflow_bw = (sq / 349) ** 0.5
-        print(f"p{p}: edge_dist={q:.4g}, squared={sq:.4g}, "
-            f"float32 needs bw >= {underflow_bw:.4g}")
-
-    print(f"max edge dist: {edge_dist.max().item():.4g}")
-
-
     # 5. Eigenpairs: compute (or load from cache) before kernel construction.
     eigvec_cache_dir = eigenvector_dir / "eigvecs"
     laplacian_op = GraphLaplacianOperator(
