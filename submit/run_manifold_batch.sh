@@ -27,7 +27,7 @@ GPU=0.5
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_6"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_7"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -91,16 +91,16 @@ submit() {
 # BUMP_DECAYS=(0.1 1.0)
 
 FOLDS=("fold-3")           # lowercase, dashed
-KNN_K=(15 60)
-KNN_METHODS=("faiss")
+KNN_K=(120 180)
+KNN_METHODS=("anatomical_atlas" "faiss")
 LAPLACIAN_NORMS=("randomwalk")
 GRAPH_BANDWIDTHS=(0.1)
 BUMP_SCALES=(20)
-BUMP_DECAYS=(0.1 1.0)
+BUMP_DECAYS=(0.1)
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.1 1.0)
-NU=(1 2 3)
-THRESHOLDS=(40 60)
+NU=(1)
+THRESHOLDS=(5 40)
 
 # Fixed across the whole sweep
 TEMPLATE="reference"
