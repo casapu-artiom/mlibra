@@ -27,7 +27,7 @@ GPU=0.5
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_8"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_9"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -92,7 +92,7 @@ submit() {
 # BUMP_DECAYS=(0.1 1.0)
 
 FOLDS=("fold-3")           # lowercase, dashed
-KNN_K=(120 180)
+KNN_K=(15 120 180)
 MAN_KNN_METHODS=("faiss" "anatomical_atlas" "faiss_atlas_weighted")
 MAN_INFLATIONS=(10 100)   # only used when knn_method=faiss_atlas_weighted
 LAPLACIAN_NORMS=("symmetric" "randomwalk")
@@ -121,11 +121,11 @@ for fold in "${FOLDS[@]}"; do
         for bs in "${BUMP_SCALES[@]}"; do
             for bd in "${BUMP_DECAYS[@]}"; do
                 for knn_k in "${KNN_K[@]}"; do
-                    for knn_method in "${KNN_METHODS[@]}"; do
+                    for knn_method in "${MAN_KNN_METHODS[@]}"; do
                         for laplacian_norm in "${LAPLACIAN_NORMS[@]}"; do
                             for nu in ${NU[@]}; do
                                 for threshold in ${THRESHOLDS[@]}; do
-                                    if [ "$km" = "faiss_atlas_weighted" ]; then
+                                    if [ "$knn_method" = "faiss_atlas_weighted" ]; then
                                         infl_list=("${MAN_INFLATIONS[@]}")
                                     else
                                         infl_list=(1)
@@ -142,7 +142,6 @@ for fold in "${FOLDS[@]}"; do
                                             "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE"
 
                                         exp_num=$((exp_num + 1))
-
                                     done
                                 done
                             done

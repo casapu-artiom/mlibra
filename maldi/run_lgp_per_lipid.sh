@@ -45,13 +45,14 @@
 # ---- Manifold-only ----
 : "${NUM_MODES:=1300}"
 : "${STRIDE:=4}"
-: "${KNN_K:=15}"
-: "${KNN_METHOD:=anatomical_atlas}"
+: "${KNN_K:=120}"
+: "${KNN_METHOD:=faiss_atlas_weighted}"
+: "${CROSS_REGION_INFLATION:=10.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
 : "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${GRAPHBANDWIDTH:=0.1}"
-: "${THRESHOLD:=5}"
+: "${THRESHOLD:=40}"
 
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -63,9 +64,9 @@
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${TEMPLATE_NAME:=reference}"
-: "${SRC_PATH:=/home/casap/mlibra_git/maldi}"
+: "${SRC_PATH:=/home/casap/mlibra_git}"
 
-cd $SRC_PATH
+#cd $SRC_PATH
 
 # ---- one-shot launcher (called by the sweep loops too) -----------------
 run_one() {
@@ -92,6 +93,7 @@ run_one() {
     if [ "$FAMILY" = "manifold" ]; then
         manifold_args="--eigenvector-dir $EIGENVECTOR_DIR \
             --knn-method $KMETHOD_ \
+            --cross-region-inflation $CROSS_REGION_INFLATION \
             --laplacian-norm $LN_ \
             --stride $STRIDE \
             --knn-k $KNN_ \
