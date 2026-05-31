@@ -243,52 +243,32 @@ def safe_filename(name: str) -> str:
 
 
 def savez_safe(path, **arrays):
-    """``np.savez`` but works on filesystems that don't support seek()
-    on write — e.g. S3 mounts via s3fs/goofys.
-
-    The npz format is a ZIP file, and ZIP writers seek back to the
-    beginning when closing the archive (to write the central
-    directory). S3 mounts only allow sequential writes and throw
-    OSError(95) "Operation not supported" when that seek happens. The
-    workaround: write to a local temp file (which DOES support seek),
-    then copy the finished archive to the destination — a copy is
-    purely sequential and S3 accepts it.
-
-    Falls back to the plain np.savez path if writing succeeds locally
-    AND the destination is the same filesystem (no real cost there).
+    """
+    Always writes .npz to a local temporary file first, then uses a 
+    purely sequential copy to the final destination. This completely 
+    avoids the seek() errors on S3 FUSE mounts without risking broken
+    file states from failed direct write attempts.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Try a direct write first. On a normal filesystem this is the
-    # cheapest path; on S3 it raises immediately and we fall through.
-    try:
-        np.savez(str(path), **arrays)
-        return
-    except OSError as e:
-        # errno 95 = ENOTSUP / EOPNOTSUPP, the typical S3 fuse error.
-        # Also handle the generic "Operation not supported" wording
-        # other mounts produce.
-        if getattr(e, "errno", None) != 95 and "not supported" not in str(e).lower():
-            raise
-        logging.getLogger("per_lipid_gp").info(
-            f"  np.savez direct write failed on {path} (S3 mount?); "
-            f"writing via local temp file and copying."
-        )
-    # Stage to local disk, then copy. NamedTemporaryFile with delete=False
-    # so np.savez can close it cleanly; we delete after the copy.
+    
+    # Create the temp file on the local filesystem
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
         tmp_path = tmp.name
+        
     try:
+        # Write the ZIP archive locally (where seek() is fully supported)
         np.savez(tmp_path, **arrays)
+        
         # Use shutil.copyfile (not move) — move tries rename() first,
-        # which crosses-fs would fail; copyfile is always sequential.
+        # which fails across filesystems; copyfile is strictly sequential.
         shutil.copyfile(tmp_path, str(path))
     finally:
+        # Clean up the local temp file
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-
 
 def resolve_lipids(spec, lipid_names: list[str],
                    log: logging.Logger) -> list[int]:
