@@ -65,6 +65,8 @@
 : "${TEMPLATE_NAME:=reference}"
 : "${SRC_PATH:=/home/casap/mlibra_git/maldi}"
 
+cd $SRC_PATH
+
 # ---- one-shot launcher (called by the sweep loops too) -----------------
 run_one() {
     local FAMILY=$1; local NU_=$2; local LR_=$3; local EPS_=$4
@@ -115,7 +117,7 @@ run_one() {
         subset_args="$subset_args --lipids-file $LIPIDS_FILE"
     fi
 
-    python "$SRC_PATH/lgp_experiment_per_lipid.py" \
+    python "$SRC_PATH/maldi/lgp_experiment_per_lipid.py" \
         --kernel-family "$FAMILY" \
         --exp-name "$EXP_NAME" \
         --output-dir "$OUTPUT_DIR" \
