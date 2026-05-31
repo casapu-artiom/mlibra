@@ -6,9 +6,9 @@
 : "${BATCH_SIZE:=1000}"
 : "${N_EPOCHS:=10}"
 : "${LEARNING_RATE:=0.001}"
-: "${GRAPHBANDWIDTH:=1.0}"
+: "${GRAPHBANDWIDTH:=0.1}"
 : "${NU:=2}"
-: "${KNN_K:=180}"
+: "${KNN_K:=120}"
 : "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${SEED:=416465}"
@@ -24,10 +24,11 @@
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${KNN_METHOD:=anatomical_atlas}"
+: "${KNN_METHOD:=faiss_atlas_weighted}"
+: "${CROSS_REGION_INFLATION:=10.0}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=DIFFICULT-STATIC-INDP}"
-: "${LAPLACIAN_NORM:=randomwalk}"
+: "${LAPLACIAN_NORM:=symmetric}"
 : "${THRESHOLD:=40}"
 
 cd $SRC_PATH
@@ -69,6 +70,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --bump-decay $BUMP_DECAY \
     --graphbandwidth-init $GRAPHBANDWIDTH \
     --knn-method $KNN_METHOD \
+    --cross-region-inflation $CROSS_REGION_INFLATION \
     --knn-k $KNN_K \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \

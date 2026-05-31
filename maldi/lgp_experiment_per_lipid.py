@@ -459,6 +459,39 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         extra=eigvec_key_parts, device=args["device"],
     )
 
+    print(f"eigvec shape:          {tuple(eigvec.shape)}")  # (N_nodes, num_modes)
+    print(f"eigval shape:          {tuple(eigval.shape)}")
+    print(f"NaN in eigvec:         {torch.isnan(eigvec).any().item()}")
+    print(f"NaN in eigval:         {torch.isnan(eigval).any().item()}")
+    print(f"eigval range:          [{eigval.min().item():.4g}, {eigval.max().item():.4g}]")
+    print(f"first 10 eigvals:      {eigval[:10].cpu().numpy()}")
+
+    # Orthonormality check — eigvec.T @ eigvec should be ~I for a well-conditioned eigensolve
+    inner = eigvec.T @ eigvec
+    off_diag = inner - torch.eye(inner.shape[0], device=inner.device)
+    print(f"|eigvec.T @ eigvec - I|_max (off-diag): {off_diag.abs().max().item():.4g}")
+
+    # Eigval ordering — should be non-decreasing
+    diffs = eigval[1:] - eigval[:-1]
+    print(f"min eigval gap (should be >= 0): {diffs.min().item():.4g}")
+
+    with torch.no_grad():
+        # QR re-orthogonalization — cheap and fixes degenerate subspace mixing
+        # from the Lanczos solver (causes |U^T U - I| errors up to ~0.8)
+        Q, R = torch.linalg.qr(eigvec)   # Q is (N, num_modes), orthonormal cols
+        # Restore sign convention: ensure R diagonal is positive (unique QR)
+        signs = R.diagonal().sign()
+        signs[signs == 0] = 1.0
+        eigvec = Q * signs.unsqueeze(0)
+        
+        # Re-sort by eigenvalue (QR may mix columns within degenerate subspaces)
+        sort_idx = eigval.argsort()
+        eigval = eigval[sort_idx]
+        eigvec = eigvec[:, sort_idx]
+
+    inner = eigvec.T @ eigvec
+    print(f"|U^T U - I| after QR: {(inner - torch.eye(inner.shape[0], device=inner.device)).abs().max():.4g}")
+
     # Kernel
     manifold_kernel = RiemannMaternKernel(
         nu=args["nu"], knn=knn, edge_index=edge_index, edge_value=edge_value,
@@ -557,7 +590,19 @@ def train_lipid_batch(
     )
 
     bs = min(int(args["batch_size"]), n_train)
-    n_iters = int(args["epochs"]) * max(1, (n_train + bs - 1) // bs)
+    iters_per_epoch = max(1, (n_train + bs - 1) // bs)
+    n_iters = int(args["epochs"]) * iters_per_epoch
+
+    # Log frequency for cluster runs — write a line every ~5% of training
+    # so cluster job logs show progress even when the tqdm bar is hidden.
+    log_every = max(1, n_iters // 20)
+
+    log.info(
+        f"  [{pbar_desc}] starting fit: "
+        f"n_train={n_train:,} bs={bs} epochs={args['epochs']} "
+        f"iters_per_epoch={iters_per_epoch} total_iters={n_iters} "
+        f"n_tasks={n_tasks}; logging every {log_every} iters."
+    )
 
     pbar = tqdm(range(n_iters), desc=pbar_desc, leave=False,
                 dynamic_ncols=True)
@@ -574,6 +619,10 @@ def train_lipid_batch(
     # variance of <5e-5 — far below numerical precision for typical
     # mini-batch residuals, where (y-z)² / exp(-10) overflows fast.
     log_var_n_min, log_var_n_max = -8.0, 4.0
+
+    fit_t0 = time.time()
+    epoch_t0 = fit_t0
+    current_epoch = 0
     with gpytorch.settings.cholesky_jitter(1e-3, 1e-4):
         for it in pbar:
             idx = torch.randperm(n_train, generator=g)[:bs].to(device)
@@ -709,6 +758,40 @@ def train_lipid_batch(
 
             last_recon = float(recon.detach().item())
             last_kl = float(kl.detach().item())
+
+            # ---- periodic log line (cluster-friendly) -----------------
+            # Visible even when tqdm output is suppressed (non-tty, log
+            # capture, runai, etc). Includes recon / KL / log_var_n
+            # range / elapsed / ETA so a cluster job log gives a
+            # full picture.
+            if it % log_every == 0 or it == n_iters - 1:
+                elapsed = time.time() - fit_t0
+                done = it + 1
+                rate = done / max(elapsed, 1e-9)
+                eta = (n_iters - done) / max(rate, 1e-9)
+                lvn_min = float(log_var_n.min().item())
+                lvn_max = float(log_var_n.max().item())
+                log.info(
+                    f"  [{pbar_desc}] it {done:>6d}/{n_iters} "
+                    f"({100 * done / n_iters:5.1f}%) "
+                    f"recon={last_recon:.4g} kl={last_kl:.4g} "
+                    f"lvn=[{lvn_min:+.2f},{lvn_max:+.2f}] "
+                    f"{rate:.1f} it/s  elapsed={elapsed:.0f}s "
+                    f"eta={eta:.0f}s"
+                )
+
+            # ---- epoch boundary log ----------------------------------
+            new_epoch = (it + 1) // iters_per_epoch
+            if new_epoch > current_epoch and new_epoch <= int(args["epochs"]):
+                epoch_elapsed = time.time() - epoch_t0
+                log.info(
+                    f"  [{pbar_desc}] === epoch {new_epoch}/{args['epochs']} "
+                    f"done in {epoch_elapsed:.1f}s "
+                    f"(recon={last_recon:.4g}, kl={last_kl:.4g}) ==="
+                )
+                current_epoch = new_epoch
+                epoch_t0 = time.time()
+
             if (it % max(1, n_iters // 30)) == 0:
                 pbar.set_postfix(
                     recon=f"{last_recon:.3g}",
@@ -718,6 +801,12 @@ def train_lipid_batch(
                 )
     pbar.set_postfix(recon=f"{last_recon:.3g}", kl=f"{last_kl:.3g}")
     pbar.close()
+    fit_elapsed = time.time() - fit_t0
+    log.info(
+        f"  [{pbar_desc}] FIT DONE: final recon={last_recon:.4g} "
+        f"kl={last_kl:.4g} in {fit_elapsed:.1f}s "
+        f"({n_iters / max(fit_elapsed, 1e-9):.1f} it/s avg)"
+    )
 
     model.eval()
     return model, log_var_n.detach()
@@ -771,9 +860,19 @@ def predict_batched(model, log_var_n, x: torch.Tensor, n_tasks: int,
 # Main pipeline
 # =============================================================================
 def main():
+    # Cluster-friendly logging: line-buffered stdout (so log lines
+    # appear in real time, not at process exit) + explicit stream
+    # to stdout (so it's interleaved with the rest of the job's
+    # output rather than appearing on stderr).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+        force=True,
     )
     log = logging.getLogger("per_lipid_gp")
     args = parse_args()

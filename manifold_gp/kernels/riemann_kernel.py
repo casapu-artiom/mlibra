@@ -228,36 +228,89 @@ class RiemannKernel(gpytorch.kernels.Kernel):
  
     def features(self, x: Tensor) -> Tensor:
         laplacian_ = self.laplacian()
-        if torch.equal(x, self.knn.x):
-            spectral_density = self.spectral_density()
-            spectral_density /= spectral_density.sum()
-            return (spectral_density * self.eigvec.shape[0]).sqrt() * self.eigvec
- 
-        edge_value, edge_index = self.knn.search(x, self.nearest_neighbors)
-        x_within_support = edge_value[:, 0].sqrt() < self.bump_scale * self.graphbandwidth.squeeze()
+
+        # Check if x is a *subset* of knn.x by nearest-neighbor lookup,
+        # not torch.equal (which requires identical tensors).
+        # For graph nodes: nearest neighbor distance should be exactly 0.
+        edge_value_nn, edge_index_nn = self.knn.search(x, 1)
+        is_on_graph = (edge_value_nn[:, 0] < 1e-8)   # dist² < 1e-8 → on the graph
+
+        spectral_density = self.spectral_density()
+        spectral_density = (spectral_density / spectral_density.sum().clamp(min=1e-12))
+        scale = (spectral_density * self.eigvec.shape[0]).sqrt()  # (num_modes,)
+
         features = torch.zeros(x.shape[0], self.num_modes, device=x.device)
- 
-        if x_within_support.sum() != 0:
-            spectral_density = self.spectral_density().div(
-                (1 - self.graphbandwidth.square() * self.eigval).square()
-            )
-            spectral_density /= spectral_density.sum()
-            spectral_density *= self.knn.x.shape[0]
- 
-            features[x_within_support] = (
-                spectral_density.sqrt()
-                * laplacian_.out_of_sample(
-                    self.eigvec, edge_value[x_within_support],
-                    edge_index[x_within_support],
+
+        # ---- In-sample rows: look up exact eigenvector by node index ----
+        if is_on_graph.any():
+            node_idx = edge_index_nn[is_on_graph, 0]   # which graph node
+            features[is_on_graph] = scale * self.eigvec[node_idx]
+
+        # ---- Out-of-sample rows: Nyström extension ----
+        oos = ~is_on_graph
+        if oos.any():
+            x_oos = x[oos]
+            ev, ei = edge_value_nn[oos], edge_index_nn[oos]
+            # Full k-NN for Nyström (not just k=1)
+            ev_k, ei_k = self.knn.search(x_oos, self.nearest_neighbors)
+            within = ev_k[:, 0].sqrt() < self.bump_scale * self.graphbandwidth.squeeze()
+            if within.any():
+                # Use original spectral density formula for OOS
+                sd_oos = self.spectral_density().div(
+                    (1 - self.graphbandwidth.square() * self.eigval).square().clamp(min=1e-6)
                 )
-                * bump_function(
-                    edge_value[x_within_support, 0].sqrt(),
-                    self.bump_scale * self.graphbandwidth.squeeze(),
-                    self.bump_decay,
-                ).unsqueeze(-1)
-            )
- 
+                sd_oos = (sd_oos / sd_oos.sum().clamp(min=1e-12)) * self.eigvec.shape[0]
+                scale_oos = sd_oos.sqrt()
+                oos_idx = oos.nonzero(as_tuple=True)[0]
+                within_global = oos_idx[within]
+                features[within_global] = (
+                    scale_oos
+                    * laplacian_.out_of_sample(
+                        self.eigvec,
+                        ev_k[within],
+                        ei_k[within],
+                    )
+                    * bump_function(
+                        ev_k[within, 0].sqrt(),
+                        self.bump_scale * self.graphbandwidth.squeeze(),
+                        self.bump_decay,
+                    ).unsqueeze(-1)
+                )
+
         return features
+
+
+    # def features(self, x: Tensor) -> Tensor:
+    #     laplacian_ = self.laplacian()
+    #     if torch.equal(x, self.knn.x):
+    #         spectral_density = self.spectral_density()
+    #         spectral_density /= spectral_density.sum()
+    #         return (spectral_density * self.eigvec.shape[0]).sqrt() * self.eigvec
+ 
+    #     edge_value, edge_index = self.knn.search(x, self.nearest_neighbors)
+    #     x_within_support = edge_value[:, 0].sqrt() < self.bump_scale * self.graphbandwidth.squeeze()
+    #     features = torch.zeros(x.shape[0], self.num_modes, device=x.device)
+ 
+    #     if x_within_support.sum() != 0:
+    #         denom = (1 - self.graphbandwidth.square() * self.eigval).square().clamp(min=1e-6)
+    #         spectral_density = self.spectral_density() / denom
+    #         spectral_density /= spectral_density.sum()
+    #         spectral_density *= self.knn.x.shape[0]
+ 
+    #         features[x_within_support] = (
+    #             spectral_density.sqrt()
+    #             * laplacian_.out_of_sample(
+    #                 self.eigvec, edge_value[x_within_support],
+    #                 edge_index[x_within_support],
+    #             )
+    #             * bump_function(
+    #                 edge_value[x_within_support, 0].sqrt(),
+    #                 self.bump_scale * self.graphbandwidth.squeeze(),
+    #                 self.bump_decay,
+    #             ).unsqueeze(-1)
+    #         )
+ 
+    #     return features
  
     def raw_eigenvectors(self, x: Tensor) -> Tensor:
         """Pure eigenvectors evaluated at x, without spectral density scaling.

@@ -20,6 +20,9 @@ from manifold_gp.utils.compute_eigenvectors import (
     LaplacianEigensolver, make_key as make_eig_key,
 )
 from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as make_graph_key
+from manifold_gp.utils.anatomical_knn import (
+    labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
+)
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from l3di.lgp_manifold import LatentRiemannGP, ManifoldLGP
 
@@ -60,7 +63,19 @@ def parse_args():
     parser.add_argument("--load-args", dest="load_args", action='store_true', help="Load arguments from a file instead of command line.")
     parser.add_argument("--use-diffusion", dest="use_diffusion", action='store_true', help="Use diffusion model in the experiment.")
     parser.add_argument("--knn-method", dest="knn_method", type=str, default="faiss",
-                        choices=["faiss", "anatomical_atlas"])
+                        choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted"],
+                        help=("'faiss': Euclidean kNN, no anatomical prior. "
+                              "'anatomical_atlas': edges restricted to same atlas region + "
+                              "voxel-adjacent cross-region links (strong but can produce "
+                              "disconnected components → NaN). "
+                              "'faiss_atlas_weighted': use the faiss kNN graph but INFLATE "
+                              "squared distances on edges that cross atlas regions by "
+                              "--cross-region-inflation. Soft prior — graph stays connected."))
+    parser.add_argument("--cross-region-inflation", dest="cross_region_inflation", type=float,
+                        default=10.0,
+                        help=("For --knn-method=faiss_atlas_weighted only. "
+                              "Multiplier applied to squared distance on cross-region edges. "
+                              "Default 10 = mild prior; 100 = strong prior."))
     parser.add_argument("--laplacian-norm", dest="laplacian_norm", type=str, default="symmetric",
                         choices=["symmetric", "randomwalk"])
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
@@ -165,6 +180,10 @@ def setup_experiment(args):
     if knn_method == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
         graph_key_parts["conn"] = 3
+    elif knn_method == "faiss_atlas_weighted":
+        # The base graph is pure faiss — reuse that cache. Atlas weighting is
+        # applied after loading, so we encode it in the eigenvector key only.
+        pass
 
     graph_key = make_graph_key(graph_key_parts)
     logging.info(f"Graph cache key: {graph_key}")
@@ -197,8 +216,62 @@ def setup_experiment(args):
             force_recompute=bool(args.get("force_recompute_graph", False)),
             device=config.device,
         )
+    elif knn_method == "faiss_atlas_weighted":
+        # ---- 1. Get (or load) the base faiss graph ------------------
+        # Cache key uses "faiss" so it's shared with vanilla faiss runs
+        # of the same k / stride / threshold.
+        base_key_parts = dict(graph_key_parts)
+        base_key_parts["method"] = "faiss"
+        base_key = make_graph_key(base_key_parts)
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=base_key,
+            method="faiss",
+            coords=reference_nodes,
+            k=knn_k,
+            nlist=nlist,
+            extra=base_key_parts,
+            force_recompute=bool(args.get("force_recompute_graph", False)),
+            device=config.device,
+        )
+        # ---- 2. Map nodes to atlas regions --------------------------
+        if sub_atlas is None:
+            raise ValueError(
+                "--knn-method=faiss_atlas_weighted requires --annotations-file; "
+                "got none."
+            )
+        node_labels = labels_for_nodes_from_sub_atlas(
+            sub_volume, sub_atlas, threshold,
+        )
+        if node_labels.shape[0] != knn.x.shape[0]:
+            raise RuntimeError(
+                f"Mismatch between labelled voxels ({node_labels.shape[0]}) "
+                f"and graph nodes ({knn.x.shape[0]}). Check that atlas and "
+                f"reference template were cropped/strided identically."
+            )
+        # ---- 3. Inflate cross-region edges --------------------------
+        inflation = float(args.get("cross_region_inflation", 10.0))
+        edge_index, edge_value, _info = inflate_cross_region_edges(
+            edge_index, edge_value, node_labels,
+            inflation=inflation, treat_zero_as_cross=True,
+        )
+        # ---- 4. Re-key so the eigvec cache doesn't collide with
+        #         vanilla faiss runs (same topology, different weights).
+        graph_key_parts["weighting"] = f"atlas_x{inflation:g}"
+        graph_key = make_graph_key(graph_key_parts)
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
+
+    # Snap the inducing points to the nearest graph nodes.
+    with torch.no_grad():
+        ind_gpu = inducing_points.to(config.device)
+        _, nn_idx = knn.search(ind_gpu, 1)          # (M, 1) — nearest graph node
+        nn_idx = nn_idx.squeeze(1).cpu()            # (M,)
+        nn_idx_unique = torch.unique(nn_idx)
+        inducing_points = knn.x[nn_idx_unique].cpu()
+        config.num_inducing = inducing_points.shape[0]
+    logging.info(
+        f"Inducing points snapped to graph nodes: {config.num_inducing} unique"
+    )
 
     # 5. Eigenpairs: compute (or load from cache) before kernel construction.
     eigvec_cache_dir = eigenvector_dir / "eigvecs"
@@ -247,6 +320,23 @@ def setup_experiment(args):
     # Eigval ordering — should be non-decreasing
     diffs = eigval[1:] - eigval[:-1]
     print(f"min eigval gap (should be >= 0): {diffs.min().item():.4g}")
+
+    with torch.no_grad():
+        # QR re-orthogonalization — cheap and fixes degenerate subspace mixing
+        # from the Lanczos solver (causes |U^T U - I| errors up to ~0.8)
+        Q, R = torch.linalg.qr(eigvec)   # Q is (N, num_modes), orthonormal cols
+        # Restore sign convention: ensure R diagonal is positive (unique QR)
+        signs = R.diagonal().sign()
+        signs[signs == 0] = 1.0
+        eigvec = Q * signs.unsqueeze(0)
+        
+        # Re-sort by eigenvalue (QR may mix columns within degenerate subspaces)
+        sort_idx = eigval.argsort()
+        eigval = eigval[sort_idx]
+        eigvec = eigvec[:, sort_idx]
+
+    inner = eigvec.T @ eigvec
+    print(f"|U^T U - I| after QR: {(inner - torch.eye(inner.shape[0], device=inner.device)).abs().max():.4g}")
 
     # 6. Riemann Matern kernel, fully formed at construction.
     logging.info("Building Riemann Kernel (knn + edges + eigenpairs at construction)...")
