@@ -1,0 +1,987 @@
+#!/usr/bin/env python
+"""Per-lipid GP training pipeline.
+
+Trains one independent GP per lipid for either the Euclidean Matern kernel
+or the Riemann Manifold kernel. Reuses:
+
+  - ``IndependentMultitaskGPModel``  (from l3di.lgp)            for Euclidean
+  - ``LatentRiemannGP``              (from l3di.lgp_manifold)   for Manifold
+  - All MaLDI / atlas / graph / inducing-point machinery from
+    ``lgp_experiment.py`` and ``lgp_manifold_experiment.py``.
+
+Why "per lipid" if we already have ``IndependentMultitaskGPModel`` with
+``num_tasks``?  Because a single (num_tasks=173, num_inducing=500) variational
+distribution is 173 × 500² floats = ~170M parameters in the Cholesky factor
+alone, plus the matching kernel hyperparameter and inducing-point batches
+— it OOMs on most GPUs and is wasteful.  We instead loop in batches of
+``--lipid-batch-size`` lipids (default 10), reusing the exact same class
+with ``num_tasks=batch_size``. Each batch gets its own optimiser and its
+own variational fit, so lipids in different batches are fully independent
+and we get the same statistical model as 173 separate fits.
+
+Output layout (under ``<output_dir>/<exp_name>/``)::
+
+    config.json                # snapshot of every CLI flag
+    metrics.csv                # one row per lipid (test RMSE, R², etc.)
+    lipid_names.json           # int idx -> name mapping
+    graph_meta.npz             # voxel indices / atlas shape for the brain
+    predictions/<lipid_slug>/
+        test_coords_mm.npy     # (N_test, 3)   physical mm coordinates
+        test_pred_z.npy        # (N_test,)     z-scored mean
+        test_pred_raw.npy      # (N_test,)     raw (de-standardised) mean
+        test_std_z.npy         # (N_test,)     posterior stdev
+        test_true_z.npy        # (N_test,)     ground truth
+        graph_pred_z.npy       # (N_nodes,)    whole-brain reconstruction
+        graph_pred_raw.npy     # (N_nodes,)
+        graph_std_z.npy        # (N_nodes,)
+    checkpoints/batch_<bb>.pt  # one file per lipid batch (state_dict + meta)
+
+The on-disk layout is what ``visualize_lipid_gp.py`` (the slim viewer) reads.
+No model checkpoints need to be reloaded for visualisation — predictions
+are precomputed.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import gpytorch
+from tqdm import tqdm
+
+# Re-use the EXISTING project pieces — no copy-paste.
+from config import MaldiConfig
+from l3di.lgp import IndependentMultitaskGPModel
+from l3di.lgp_manifold import LatentRiemannGP
+from utils import (
+    get_inducing_points,
+    get_bbox_inducing_points,
+    apply_region_to_config,
+    crop_or_stride_volume,
+    reference_ccf_from_subvolume,
+)
+
+# Manifold kernel + graph stack. Imports kept identical to
+# ``lgp_manifold_experiment.py`` for compatibility.
+from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
+from manifold_gp.utils.compute_eigenvectors import (
+    LaplacianEigensolver, make_key as make_eig_key,
+)
+from manifold_gp.utils.nearest_neighbors import (
+    KnnGraphCache, make_key as make_graph_key,
+)
+from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
+
+
+# =============================================================================
+# CLI parsing — strict superset of lgp_*_experiment.py flags
+# =============================================================================
+def parse_args() -> dict:
+    p = argparse.ArgumentParser(
+        description=(
+            "Train one independent GP per lipid (Euclidean or Manifold), "
+            "batched in groups of --lipid-batch-size lipids to control "
+            "GPU memory. Outputs per-lipid prediction arrays ready for "
+            "off-line analysis or for the slim napari viewer."
+        ),
+    )
+
+    # ---- which kernel ----
+    p.add_argument("--kernel-family", choices=["euclidean", "manifold"],
+                   required=True,
+                   help="'euclidean' → IndependentMultitaskGPModel "
+                        "(reuse from l3di.lgp), 'manifold' → "
+                        "LatentRiemannGP (reuse from l3di.lgp_manifold).")
+
+    # ---- everything common to both experiment scripts ----
+    p.add_argument("--exp-name", required=True,
+                   help="Sub-directory under --output-dir for this run.")
+    p.add_argument("--output-dir", required=True,
+                   help="Top-level results directory.")
+    p.add_argument("--dataset-path", required=True)
+    p.add_argument("--maldi-file", required=True)
+    p.add_argument("--available-lipids-file", required=True)
+    p.add_argument("--slices-dataset-file", required=True)
+    p.add_argument("--template-name", required=True)
+    p.add_argument("--reference-file", required=True)
+    p.add_argument("--annotations-file", default=None)
+    p.add_argument("--mode", default="per_lipid",
+                   help="Passed to MaldiConfig for compatibility.")
+
+    p.add_argument("--num-inducing", type=int, default=500,
+                   help="Inducing points per GP (per lipid). "
+                        "For the Euclidean kernel these are learned; "
+                        "for the manifold kernel they are anchored.")
+    p.add_argument("--lipid-batch-size", type=int, default=10,
+                   help="Number of lipids to fit simultaneously (= "
+                        "num_tasks of the multitask GP). Increase this "
+                        "to amortise per-step overhead; decrease if you "
+                        "OOM. With 173 lipids and default 10, the run "
+                        "does 18 batches.")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--epochs", type=int, default=20,
+                   help="Adam epochs per lipid-batch fit.")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--log-transform", action="store_true")
+    p.add_argument("--nu", type=float, default=2.0)
+    p.add_argument("--n-pixels", type=int, default=10)
+    p.add_argument("--learning-rate", type=float, default=0.005)
+    p.add_argument("--batch-size", type=int, default=4096,
+                   help="Mini-batch size for variational SGD over MaLDI "
+                        "points.")
+
+    # ---- Euclidean-only knob ----
+    p.add_argument("--kernel", default="matern",
+                   choices=["rbf", "matern", "symmetric"],
+                   help="Sub-type for IndependentMultitaskGPModel.")
+
+    # ---- Manifold-only knobs (ignored when --kernel-family=euclidean) ----
+    p.add_argument("--eigenvector-dir", default=None,
+                   help="Required when --kernel-family=manifold.")
+    p.add_argument("--knn-method", default="faiss",
+                   choices=["faiss", "anatomical_atlas"])
+    p.add_argument("--laplacian-norm", default="randomwalk",
+                   choices=["symmetric", "randomwalk"])
+    p.add_argument("--stride", type=int, default=4)
+    p.add_argument("--knn-k", type=int, default=15)
+    p.add_argument("--n-list", type=int, default=1)
+    p.add_argument("--graphbandwidth-init", type=float, default=0.1)
+    p.add_argument("--bump-scale", type=float, default=20.0)
+    p.add_argument("--bump-decay", type=float, default=0.01)
+    p.add_argument("--num-modes", type=int, default=1300)
+    p.add_argument("--threshold", type=int, default=5)
+
+    # ---- lipid restriction / debugging ----
+    p.add_argument("--lipids", nargs="+", default=None,
+                   help="Restrict to a subset of lipids (names or "
+                        "indices). Default: all of them. NOTE: lipid "
+                        "names with spaces won't survive shell word-"
+                        "splitting; use --lipids-file for those.")
+    p.add_argument("--lipids-file", default=None,
+                   help="Path to a text file with one lipid name (or "
+                        "integer index) per line. Lines beginning with "
+                        "'#' and blank lines are ignored. This is the "
+                        "right way to pass lipid names that contain "
+                        "spaces (e.g. 'PC 35:1 PE 38:1'). Combined "
+                        "with --lipids if both given.")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Cap on number of lipids processed (applied "
+                        "after --lipids/--lipids-file filtering).")
+    p.add_argument("--nan-action", choices=["raise", "skip"], default="raise",
+                   help=("What to do when the training loss becomes "
+                         "NaN. 'raise' (default) early-stops with a "
+                         "detailed diagnostic — best for debugging. "
+                         "'skip' drops the bad batch and continues "
+                         "training; useful when only occasional "
+                         "batches go bad (e.g. an unlucky mini-batch "
+                         "lands on a degenerate region of the kernel)."))
+    p.add_argument("--region-bbox", type=int, nargs=6, default=None,
+                   metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"))
+
+    # ---- compatibility scarecrows: accepted but unused ----
+    # The l3di MaldiConfig may demand these. We provide harmless defaults
+    # so that the same shell wrapper can drive both this script and the
+    # existing experiment scripts.
+    p.add_argument("--latent-dim", type=int, default=1,
+                   help="Not used in per-lipid mode (kept for "
+                        "MaldiConfig compatibility).")
+    p.add_argument("--no-rsample", action="store_false")
+    p.add_argument("--use-diffusion", action="store_true")
+    p.add_argument("--do-brain-reconstruction", action="store_true",
+                   default=True,
+                   help="In per-lipid mode this is always on — the "
+                        "whole-brain prediction is what the viewer needs.")
+
+    return vars(p.parse_args())
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def safe_filename(name: str) -> str:
+    """Turn an arbitrary lipid name into a filesystem-safe slug.
+    'PA 36:1 PA 38:4' → 'PA_36-1_PA_38-4'
+    """
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.replace(":", "-"))
+    return s.strip("_")
+
+
+def resolve_lipids(spec, lipid_names: list[str],
+                   log: logging.Logger) -> list[int]:
+    """Convert --lipids tokens (names OR integer indices) → list of ints."""
+    if spec is None:
+        return list(range(len(lipid_names)))
+    out = []
+    for tok in spec:
+        # Try integer first
+        try:
+            i = int(tok)
+            if 0 <= i < len(lipid_names):
+                out.append(i)
+                continue
+        except ValueError:
+            pass
+        if tok in lipid_names:
+            out.append(lipid_names.index(tok))
+        else:
+            log.warning(f"Lipid spec '{tok}' not found; skipped.")
+    # de-dup, preserve order
+    seen = set()
+    return [i for i in out if not (i in seen or seen.add(i))]
+
+
+def load_maldi_columns(maldi_file, filter_expr, lipid_indices,
+                       lipid_names_all, coord_cols=("xccf", "yccf", "zccf")):
+    """Read coords + a SUBSET of lipid columns from the parquet.
+
+    Only loads the lipid columns we care about — much cheaper than
+    reading all 173 every time. ``lipid_indices`` indexes into
+    ``lipid_names_all``.
+    """
+    df_coords = pd.read_parquet(
+        maldi_file, columns=list(coord_cols), filters=filter_expr,
+    )
+    cols = [lipid_names_all[i] for i in lipid_indices]
+    df_lip = pd.read_parquet(
+        maldi_file, columns=cols, filters=filter_expr,
+    )
+    coords = torch.from_numpy(df_coords.values.astype(np.float32))
+    values = torch.from_numpy(df_lip.values.astype(np.float32))
+    return coords, values
+
+
+# =============================================================================
+# Manifold-only setup (kernel + graph) — extracted unchanged from
+# lgp_manifold_experiment.setup_experiment(), minus the LGP / decoder bits.
+# =============================================================================
+def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
+    """Build the RiemannMaternKernel exactly as ``lgp_manifold_experiment``
+    does. Returns the kernel ready to plug into LatentRiemannGP.
+    """
+    region_bbox = args.get("region_bbox")
+    template_volume = np.load(args["reference_file"])
+    annotations_volume = (np.load(args["annotations_file"])
+                          if args.get("annotations_file") else None)
+
+    sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
+        template_volume, annotations_volume,
+        args["stride"], region_bbox,
+    )
+    reference_ccf = reference_ccf_from_subvolume(
+        sub_volume, voxel_offset, voxel_scale_mm, args["threshold"],
+    )
+    reference_nodes = torch.tensor(reference_ccf, dtype=torch.float32)
+    reference_nodes = (reference_nodes - coord_mean) / coord_std
+    reference_nodes = reference_nodes.to(args["device"]).contiguous()
+
+    eig_dir = Path(args["eigenvector_dir"])
+    eig_dir.mkdir(parents=True, exist_ok=True)
+    graph_cache_dir = eig_dir / "knn"
+    eigvec_cache_dir = eig_dir / "eigvecs"
+
+    graphs = KnnGraphCache(cache_dir=graph_cache_dir, verbose=True)
+    graph_key_parts = {
+        "template": args["template_name"],
+        "stride": args["stride"] if region_bbox is None else 1,
+        "thresh": args["threshold"],
+        "method": args["knn_method"],
+        "k": args["knn_k"],
+        "nlist": args["n_list"],
+        "bbox": tuple(region_bbox) if region_bbox is not None else None,
+    }
+    if args["knn_method"] == "anatomical_atlas":
+        graph_key_parts["atlas"] = "annotation_coarse_d4"
+        graph_key_parts["conn"] = 3
+    graph_key = make_graph_key(graph_key_parts)
+
+    # Build / load KNN graph
+    if args["knn_method"] == "faiss":
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=graph_key, method="faiss",
+            coords=reference_nodes,
+            k=args["knn_k"], nlist=args["n_list"],
+            extra=graph_key_parts, device=args["device"],
+        )
+    else:
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=graph_key, method="anatomical_atlas",
+            volume=sub_volume, threshold=args["threshold"],
+            atlas_volume=sub_atlas, connectivity=3,
+            coords=reference_nodes,
+            k=args["knn_k"], nlist=args["n_list"],
+            extra=graph_key_parts, device=args["device"],
+        )
+
+    # Eigenpairs
+    laplacian_op = GraphLaplacianOperator(
+        edge_value, edge_index, knn.x.shape[0],
+        torch.tensor(args["graphbandwidth_init"], device=args["device"]),
+        args["laplacian_norm"],
+    )
+    eigvec_key_parts = {
+        "graph": graph_key,
+        "norm": args["laplacian_norm"],
+        "bw": args["graphbandwidth_init"],
+        "modes": args["num_modes"],
+    }
+    eigvec_key = make_eig_key(eigvec_key_parts)
+    ncv_min = max(1500, 3 * args["num_modes"] + 20)
+    solver = LaplacianEigensolver(
+        num_modes=args["num_modes"], backend="cupy",
+        tol=1e-4, ncv_min=ncv_min, verbose=True,
+    )
+    eigval, eigvec = solver.compute_or_load(
+        laplacian_op, cache_dir=eigvec_cache_dir, key=eigvec_key,
+        graphbandwidth=args["graphbandwidth_init"],
+        laplacian_normalization=args["laplacian_norm"],
+        extra=eigvec_key_parts, device=args["device"],
+    )
+
+    # Kernel
+    manifold_kernel = RiemannMaternKernel(
+        nu=args["nu"], knn=knn, edge_index=edge_index, edge_value=edge_value,
+        eigval=eigval, eigvec=eigvec,
+        nearest_neighbors=args["knn_k"], num_modes=args["num_modes"],
+        bump_scale=args["bump_scale"], bump_decay=args["bump_decay"],
+        laplacian_normalization=args["laplacian_norm"],
+        graphbandwidth_init=args["graphbandwidth_init"],
+    ).to(args["device"])
+    manifold_kernel.eval()
+
+    return {
+        "kernel": manifold_kernel,
+        "reference_nodes": reference_nodes,
+        "sub_volume": sub_volume,
+        "voxel_offset": voxel_offset,
+        "voxel_scale_mm": voxel_scale_mm,
+        "template_shape": template_volume.shape,
+    }
+
+
+# =============================================================================
+# Per-lipid-batch trainer (the actual GP fit)
+# =============================================================================
+def train_lipid_batch(
+    *,
+    coords_train: torch.Tensor,   # (N, 3) on device, already z-scored
+    y_train: torch.Tensor,        # (N, B)   B = lipid batch size
+    inducing_points: torch.Tensor,
+    args: dict,
+    manifold_kernel=None,         # if None → Euclidean path
+    device: str,
+    log: logging.Logger,
+    pbar_desc: str,
+):
+    """Build one multitask model with num_tasks=B, run variational SGD,
+    return the trained model + per-task log-variance.
+
+    Loss formulation mirrors ``LGP.loss_function`` / ``ManifoldLGP.loss_function``
+    in the existing l3di code base — NOT the canonical
+    ``gpytorch.mlls.VariationalELBO``. Two things differ:
+
+      1. The GP latent is rsampled (reparameterised) during training,
+         then the per-task log-variance ``log_var_n`` defines the data
+         NLL directly:
+             recon = 0.5 * sum_n ( (y - z)² / exp(log_var_n) + log_var_n )
+         where z = q(f|x).rsample() and log_var_n is a learnable
+         (n_tasks,) vector. This matches LGP/ManifoldLGP's existing
+         likelihood model exactly — same dynamics, same hyperparameter
+         meaning, same MC variance.
+      2. The KL is computed via
+         ``model.variational_strategy.kl_divergence().sum()``
+         (summed over tasks), as in LGP. No likelihood object is
+         constructed because the noise lives in ``log_var_n``, not in
+         a ``GaussianLikelihood``.
+
+    Why match the LGP loss precisely (rather than use VariationalELBO)?
+    Two reasons. (a) The existing scripts' calibration of learning_rate,
+    epochs, batch_size, cholesky_jitter is tuned to *this* loss, not the
+    closed-form Gaussian ELBO. (b) Consistency: a per-lipid hyperparameter
+    sweep should compare against the SAME inference procedure the LGP
+    framework uses, so any difference in test metrics reflects the
+    kernel, not the loss.
+    """
+    n_tasks = y_train.shape[1]
+    n_train = y_train.shape[0]
+
+    if manifold_kernel is None:
+        # Euclidean — same as run_final.sh's setup.
+        voxel_size = 0.025
+        # Equivalent to lgp_experiment.minimal_length_scale
+        minimal_length_scale = args["n_pixels"] * voxel_size / 3.0
+        model = IndependentMultitaskGPModel(
+            inducing_points=inducing_points,
+            num_tasks=n_tasks,
+            kernel_type=args["kernel"],
+            nu=args["nu"],
+            minimal_length_scale=minimal_length_scale,
+            input_dim=3,
+        ).to(device)
+    else:
+        model = LatentRiemannGP(
+            inducing_points=inducing_points,
+            num_tasks=n_tasks,
+            manifold_kernel=manifold_kernel,
+        ).to(device)
+
+    # Per-task learnable log-variance — exactly LGP.log_var_n with p = n_tasks.
+    # Initialised to zero (variance = 1) to match LGP's nn.Parameter(torch.zeros(p)).
+    log_var_n = torch.nn.Parameter(torch.zeros(n_tasks, device=device))
+
+    model.train()
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + [log_var_n],
+        lr=args["learning_rate"], weight_decay=1e-3,
+    )
+
+    bs = min(int(args["batch_size"]), n_train)
+    n_iters = int(args["epochs"]) * max(1, (n_train + bs - 1) // bs)
+
+    pbar = tqdm(range(n_iters), desc=pbar_desc, leave=False,
+                dynamic_ncols=True)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(args["seed"]))
+    last_recon = float("nan")
+    last_kl = float("nan")
+    # Optional config knobs (read once outside the loop for speed):
+    # nan_action: "raise" (default — early stop with diagnostic),
+    #             "skip"  (zero grads, don't step, continue training)
+    nan_action = args.get("nan_action", "raise")
+    # Clamp log_var_n to a sane range. The natural scale for z-scored
+    # outputs is variance ~1 (so log_var_n ~0). Values <-10 mean noise
+    # variance of <5e-5 — far below numerical precision for typical
+    # mini-batch residuals, where (y-z)² / exp(-10) overflows fast.
+    log_var_n_min, log_var_n_max = -8.0, 4.0
+    with gpytorch.settings.cholesky_jitter(1e-3, 1e-4):
+        for it in pbar:
+            idx = torch.randperm(n_train, generator=g)[:bs].to(device)
+            x_b, y_b = coords_train[idx], y_train[idx]
+            optimizer.zero_grad()
+            gp_posterior = model(x_b)
+
+            # rsample shape: for IndependentMultitaskVariationalStrategy
+            # the posterior is a MultitaskMultivariateNormal of shape
+            # (batch=bs, n_tasks). rsample() therefore returns (bs, n_tasks).
+            z = gp_posterior.rsample()  # reparameterised — gradients flow
+
+            # ---- recon = LGP.nll_loss(y_b, z, log_var_n) ----
+            # 0.5 * sum_n,t ( (y - z)² / exp(log_var_n[t]) + log_var_n[t] )
+            recon = 0.5 * torch.sum(
+                (y_b - z).pow(2) / torch.exp(log_var_n).unsqueeze(0)
+                + log_var_n.unsqueeze(0)
+            )
+
+            # ---- KL from the variational strategy ----
+            kl = model.variational_strategy.kl_divergence().sum()
+
+            # ELBO upweighting: the recon was summed over a mini-batch of
+            # bs points, but the KL is exact (total over all data). To
+            # keep the gradient unbiased w.r.t. the full-data ELBO, we
+            # rescale either the KL down by bs/n_train or scale recon up
+            # by n_train/bs. The LGP scripts use the latter implicitly
+            # by accumulating recon across all batches in an epoch and
+            # adding the KL once per batch — we just inline the
+            # equivalent: minimize (n_train/bs) * recon + kl.
+            loss = (n_train / bs) * recon + kl
+
+            # ---- NaN handling: attribute the failure precisely ----
+            if not torch.isfinite(loss):
+                # Decompose to figure out WHICH piece is bad.
+                z_nan = int(torch.isnan(z).sum().item())
+                z_inf = int(torch.isinf(z).sum().item())
+                y_nan = int(torch.isnan(y_b).sum().item())
+                lvn = log_var_n.detach()
+                resid = (y_b - z).pow(2)
+                resid_max = (
+                    float(resid[torch.isfinite(resid)].max().item())
+                    if torch.isfinite(resid).any() else float("inf")
+                )
+                lvn_min = float(lvn.min().item())
+                lvn_max = float(lvn.max().item())
+                exp_min = float(torch.exp(lvn).min().item())
+                # Identify the culprit category
+                culprits = []
+                if z_nan or z_inf:
+                    culprits.append(
+                        f"posterior sample z has {z_nan} NaN + "
+                        f"{z_inf} Inf — Cholesky of the variational "
+                        f"covariance likely failed (kernel ill-conditioned)"
+                    )
+                if y_nan:
+                    culprits.append(
+                        f"input y had {y_nan} NaN — check parquet for "
+                        f"missing values in selected lipid columns"
+                    )
+                if lvn_min < log_var_n_min:
+                    culprits.append(
+                        f"log_var_n drifted to {lvn_min:.2f} "
+                        f"(exp = {exp_min:.2e}); noise term exploding"
+                    )
+                # Check kernel parameters for NaN too
+                bad_params = []
+                for name, p in model.named_parameters():
+                    if not torch.isfinite(p).all():
+                        bad_params.append(name)
+                if bad_params:
+                    culprits.append(
+                        f"model parameter(s) became non-finite: "
+                        f"{bad_params[:5]}"
+                        + ("..." if len(bad_params) > 5 else "")
+                    )
+                if not culprits:
+                    culprits.append(
+                        f"no obvious cause — recon={recon.item():.3g}, "
+                        f"kl={kl.item():.3g}, max residual²={resid_max:.3g}"
+                    )
+
+                msg = (
+                    f"Training loss became {loss.item()} at iter {it}/"
+                    f"{n_iters}.\n"
+                    f"  recon = {recon.item()}, kl = {kl.item():.3g}\n"
+                    f"  log_var_n: min={lvn_min:.2f}, max={lvn_max:.2f}\n"
+                    f"  max (y-z)² before /exp(log_var) = {resid_max:.3g}\n"
+                    f"Likely cause(s):\n"
+                )
+                for c in culprits:
+                    msg += f"  • {c}\n"
+
+                if nan_action == "raise":
+                    pbar.close()
+                    raise RuntimeError(
+                        msg
+                        + "Try: (a) lower --learning-rate (you have "
+                        + f"{args['learning_rate']}); (b) larger "
+                        + "cholesky_jitter; (c) smaller --bump-scale or "
+                        + "different --knn-method; (d) rerun with "
+                        + "nan_action='skip' to skip bad batches and "
+                        + "keep training."
+                    )
+                # nan_action == "skip": don't step on this batch
+                log.warning(f"[it {it}] {msg.splitlines()[0]} — skipping batch")
+                optimizer.zero_grad()
+                continue
+
+            loss.backward()
+            # ---- guard the optimizer step itself ----
+            # AdamW can move parameters to NaN if any gradient is NaN
+            # while loss looked finite (rare but happens with numerical
+            # boundaries). Skip the step if any grad is bad.
+            grad_bad = False
+            for p in list(model.parameters()) + [log_var_n]:
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grad_bad = True
+                    break
+            if grad_bad:
+                log.warning(
+                    f"[it {it}] non-finite gradient — skipping step "
+                    f"(loss was {loss.item():.3g})"
+                )
+                optimizer.zero_grad()
+                continue
+            optimizer.step()
+            # Clamp log_var_n back into a sane range so the noise term
+            # can't explode/underflow. Done after the step so AdamW's
+            # update can move freely, then we project.
+            with torch.no_grad():
+                log_var_n.clamp_(log_var_n_min, log_var_n_max)
+
+            last_recon = float(recon.detach().item())
+            last_kl = float(kl.detach().item())
+            if (it % max(1, n_iters // 30)) == 0:
+                pbar.set_postfix(
+                    recon=f"{last_recon:.3g}",
+                    kl=f"{last_kl:.3g}",
+                    lvn=f"[{log_var_n.min().item():.2f},"
+                        f"{log_var_n.max().item():.2f}]",
+                )
+    pbar.set_postfix(recon=f"{last_recon:.3g}", kl=f"{last_kl:.3g}")
+    pbar.close()
+
+    model.eval()
+    return model, log_var_n.detach()
+
+
+def predict_batched(model, log_var_n, x: torch.Tensor, n_tasks: int,
+                    chunk: int = 20_000):
+    """Forward in chunks. Returns (mean, var) of the **posterior over
+    the latent f**, NOT the predictive over y. We then add the per-task
+    observation noise back in at the end.
+
+    Why split f vs y? Because the LGP / ManifoldLGP framework doesn't
+    use a likelihood object — the observation noise lives in
+    ``log_var_n``. To get a predictive variance that's directly
+    comparable to held-out y values, we add ``exp(log_var_n)`` to the
+    latent variance (i.e., predictive variance = q(f|x).variance +
+    obs_noise).
+    """
+    means, vars_f = [], []
+    n = x.shape[0]
+    obs_var = torch.exp(log_var_n).to(x.device)  # (n_tasks,)
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            post = model(x[s:e])
+            # MultitaskMVN: .mean is (batch, n_tasks), .variance same shape
+            means.append(post.mean.detach().cpu())
+            vars_f.append(post.variance.clamp(min=0).detach().cpu())
+    mean = torch.cat(means).numpy()                       # (N, n_tasks)
+    var_f = torch.cat(vars_f).numpy()
+    var_y = var_f + obs_var.cpu().numpy()[None, :]        # broadcast (1, n_tasks)
+
+    # NaN audit at predict time. The training loop bails on non-finite
+    # loss, but the variational mean / variance can still be NaN at
+    # query points outside the model's support (e.g. ill-conditioned
+    # Cholesky of the inducing covariance). Log a one-line summary
+    # rather than silently writing NaN-laden .npy files.
+    n_nan_mean = int(np.isnan(mean).sum())
+    n_nan_var = int(np.isnan(var_y).sum())
+    if n_nan_mean or n_nan_var:
+        logging.getLogger("per_lipid_gp").warning(
+            f"  predict produced NaN: mean {n_nan_mean}/{mean.size} "
+            f"({100*n_nan_mean/mean.size:.2f}%), var "
+            f"{n_nan_var}/{var_y.size} ({100*n_nan_var/var_y.size:.2f}%). "
+            f"The predictions for this batch will contain NaN."
+        )
+    return mean, var_y
+
+
+# =============================================================================
+# Main pipeline
+# =============================================================================
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    log = logging.getLogger("per_lipid_gp")
+    args = parse_args()
+
+    torch.manual_seed(args["seed"])
+    np.random.seed(args["seed"])
+
+    # ---- output directory ----
+    out_root = Path(args["output_dir"]) / args["exp_name"]
+    out_root.mkdir(parents=True, exist_ok=True)
+    (out_root / "predictions").mkdir(exist_ok=True)
+    (out_root / "checkpoints").mkdir(exist_ok=True)
+    with open(out_root / "config.json", "w") as f:
+        json.dump(args, f, indent=2, default=str)
+    log.info("=" * 72)
+    log.info(f"Per-lipid GP experiment — {args['exp_name']}")
+    log.info(f"  kernel family : {args['kernel_family']}")
+    log.info(f"  output_dir    : {out_root}")
+    log.info("=" * 72)
+
+    # ---- config / inducing points (same as lgp_*_experiment.py) ----
+    config = MaldiConfig.from_args(args)
+    region_bbox = args.get("region_bbox")
+    apply_region_to_config(config, region_bbox)
+
+    log.info("Computing inducing points + coord normalization …")
+    if region_bbox is not None:
+        inducing_points, coord_mean, coord_std = get_bbox_inducing_points(
+            config.exp_path, config.dataset_path,
+            config.num_inducing, region_bbox,
+        )
+        config.num_inducing = inducing_points.shape[0]
+    else:
+        inducing_points, coord_mean, coord_std = get_inducing_points(
+            config.exp_path, config.dataset_path, config.num_inducing,
+        )
+    log.info(f"  got {inducing_points.shape[0]} inducing points")
+    inducing_points = inducing_points.to(args["device"])
+
+    # ---- manifold setup (only if needed) ----
+    manifold_ctx = None
+    if args["kernel_family"] == "manifold":
+        if args.get("eigenvector_dir") is None:
+            log.error("--eigenvector-dir is required for --kernel-family=manifold")
+            sys.exit(2)
+        log.info("Building manifold kernel (graph + eigenvectors) …")
+        manifold_ctx = setup_manifold_kernel(
+            args, config, coord_mean, coord_std, log,
+        )
+
+    # ---- load lipid names + section filters ----
+    lipid_names_all = list(config.selected_lipids_names)
+    log.info(f"Available lipids: {len(lipid_names_all)}")
+    with open(out_root / "lipid_names.json", "w") as f:
+        json.dump(lipid_names_all, f, indent=2)
+
+    # Merge --lipids and --lipids-file into one spec list. Both are
+    # optional; if both are given they're concatenated. resolve_lipids()
+    # then deduplicates while preserving order.
+    lipid_spec = list(args.get("lipids") or [])
+    if args.get("lipids_file"):
+        with open(args["lipids_file"]) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lipid_spec.append(line)
+        log.info(f"Loaded {len(lipid_spec)} lipid spec(s) from file "
+                 f"(after merging with --lipids).")
+    if not lipid_spec:
+        lipid_spec = None  # explicit "all lipids"
+
+    lipid_idx_to_fit = resolve_lipids(lipid_spec, lipid_names_all, log)
+    if args["limit"]:
+        lipid_idx_to_fit = lipid_idx_to_fit[:int(args["limit"])]
+    log.info(f"Will fit {len(lipid_idx_to_fit)} lipids: "
+             f"{[lipid_names_all[i] for i in lipid_idx_to_fit[:5]]}"
+             + ("..." if len(lipid_idx_to_fit) > 5 else ""))
+
+    # ---- load FULL coords + ALL needed lipid columns once ----
+    # (read each parquet file once, not 173 times)
+    # NOTE: MaldiConfig calls the TRAIN-side filter `section_filter`
+    # (the test-side is `test_filter`). MaldiExperiment.__init__ renames
+    # the train one to `self.train_filter`, but we're not going through
+    # the Experiment wrapper here — read the config attribute directly.
+    log.info("Loading MaLDI train + test data (subset of columns) …")
+    coords_tr_mm, y_tr_raw = load_maldi_columns(
+        args["maldi_file"], config.section_filter,
+        lipid_idx_to_fit, lipid_names_all,
+    )
+    log.info(f"  train: {coords_tr_mm.shape[0]:,} pts × "
+             f"{y_tr_raw.shape[1]} lipids")
+    coords_te_mm, y_te_raw = load_maldi_columns(
+        args["maldi_file"], config.test_filter,
+        lipid_idx_to_fit, lipid_names_all,
+    )
+    log.info(f"  test : {coords_te_mm.shape[0]:,} pts × "
+             f"{y_te_raw.shape[1]} lipids")
+
+    # Pre-processing identical to MaldiExperiment.load_train_data()
+    y_tr_raw = y_tr_raw.clamp(min=0)
+    y_te_raw = y_te_raw.clamp(min=0)
+    if args["log_transform"]:
+        y_tr_raw = torch.log(y_tr_raw + 1e-10)
+        y_te_raw = torch.log(y_te_raw + 1e-10)
+    col_means = y_tr_raw.mean(dim=0)
+    col_stds = y_tr_raw.std(dim=0).clamp(min=1e-6)
+    y_tr_z = (y_tr_raw - col_means) / col_stds
+    y_te_z = (y_te_raw - col_means) / col_stds
+    torch.save(col_means, out_root / "col_means.pt")
+    torch.save(col_stds, out_root / "col_stds.pt")
+
+    # Z-score coords using the global (whole-brain) statistics
+    coords_tr_z = ((coords_tr_mm - coord_mean) / coord_std).to(args["device"])
+    coords_te_z = ((coords_te_mm - coord_mean) / coord_std).to(args["device"])
+
+    # ---- graph_meta for off-line reconstruction ----
+    if manifold_ctx is not None:
+        np.savez(
+            out_root / "graph_meta.npz",
+            reference_nodes_z=manifold_ctx["reference_nodes"].cpu().numpy(),
+            template_shape=np.array(manifold_ctx["template_shape"]),
+            voxel_offset=manifold_ctx["voxel_offset"],
+            voxel_scale_mm=manifold_ctx["voxel_scale_mm"],
+            coord_mean=coord_mean.cpu().numpy(),
+            coord_std=coord_std.cpu().numpy(),
+        )
+
+    # For the EUCLIDEAN case we still want a whole-brain reconstruction.
+    # Reuse the same node set if we have it, else build voxel coords on
+    # the fly from the template's non-zero voxels.
+    if manifold_ctx is None:
+        log.info("Building whole-brain voxel grid for reconstruction …")
+        template_volume = np.load(args["reference_file"])
+        # Same threshold logic as whole_brain_reconstruction()
+        nz = np.argwhere(template_volume > args.get("threshold", 5)).astype(np.int32)
+        # Convert voxel idx → mm. The Allen CCF template has shape
+        # (AP, DV, LR), and the parquet's xccf/yccf/zccf are in the SAME
+        # order — i.e. xccf is axis 0, yccf is axis 1, zccf is axis 2.
+        # So no permutation is needed: voxel (i, j, k) maps directly to
+        # mm (i*scale, j*scale, k*scale) and that aligns with the
+        # parquet's (xccf, yccf, zccf) columns used for coord_mean.
+        # (Earlier versions of this file applied an erroneous [2,1,0]
+        # reorder; if you have old Euclidean graph_pred_z.npy files
+        # they're plotted at wrong voxel positions and need re-running.)
+        voxel_scale = 0.025
+        coords_brain_mm = torch.from_numpy(nz.astype(np.float32) * voxel_scale)
+        node_voxel_idx = nz
+        np.savez(
+            out_root / "graph_meta.npz",
+            node_voxel_idx=node_voxel_idx,
+            template_shape=np.array(template_volume.shape),
+            coord_mean=coord_mean.cpu().numpy(),
+            coord_std=coord_std.cpu().numpy(),
+        )
+        brain_nodes_z = ((coords_brain_mm - coord_mean) / coord_std).to(args["device"])
+        log.info(f"  brain grid: {brain_nodes_z.shape[0]:,} voxels")
+    else:
+        brain_nodes_z = manifold_ctx["reference_nodes"]
+
+    # ---- batched training loop ----
+    metrics_rows = []
+    B = int(args["lipid_batch_size"])
+    n_lipids = len(lipid_idx_to_fit)
+    n_batches = (n_lipids + B - 1) // B
+    log.info("=" * 72)
+    log.info(f"Training {n_lipids} lipids in {n_batches} batches of {B} "
+             f"(or fewer for the tail).")
+    log.info("=" * 72)
+
+    grand_t0 = time.time()
+    for batch_i in range(n_batches):
+        s = batch_i * B
+        e = min(s + B, n_lipids)
+        batch_lipid_global = lipid_idx_to_fit[s:e]
+        batch_lipid_local = list(range(s, e))     # indices into y_tr_z columns
+        batch_size_actual = len(batch_lipid_local)
+        batch_names = [lipid_names_all[i] for i in batch_lipid_global]
+        log.info(f"[batch {batch_i+1}/{n_batches}] lipids "
+                 f"{batch_lipid_global[0]}..{batch_lipid_global[-1]} "
+                 f"({batch_size_actual} tasks)")
+        log.info(f"  → {', '.join(batch_names[:3])}"
+                 + (", ..." if batch_size_actual > 3 else ""))
+
+        y_tr_z_batch = y_tr_z[:, batch_lipid_local].to(args["device"]).contiguous()
+        y_te_z_batch_np = y_te_z[:, batch_lipid_local].numpy()
+
+        t0 = time.time()
+        model, log_var_n = train_lipid_batch(
+            coords_train=coords_tr_z,
+            y_train=y_tr_z_batch,
+            inducing_points=inducing_points,
+            args=args,
+            manifold_kernel=(manifold_ctx["kernel"]
+                             if manifold_ctx is not None else None),
+            device=args["device"],
+            log=log,
+            pbar_desc=f"batch {batch_i+1}/{n_batches}",
+        )
+        fit_sec = time.time() - t0
+
+        # Predict on test set + brain. predict_batched returns y-space
+        # variance (latent f variance + obs noise from log_var_n), so the
+        # std arrays we save are comparable to held-out y values.
+        t0 = time.time()
+        test_mean_z, test_var_z = predict_batched(
+            model, log_var_n, coords_te_z, n_tasks=batch_size_actual,
+        )
+        brain_mean_z, brain_var_z = predict_batched(
+            model, log_var_n, brain_nodes_z, n_tasks=batch_size_actual,
+        )
+        pred_sec = time.time() - t0
+        log.info(f"  fit={fit_sec:.1f}s pred={pred_sec:.1f}s")
+
+        # Save state_dict + log_var_n (one file per batch).
+        # log_var_n IS the noise model — analogous to a GaussianLikelihood's
+        # noise parameter but per-task and outside the gpytorch object.
+        torch.save({
+            "model_state": model.state_dict(),
+            "log_var_n": log_var_n.cpu(),  # (n_tasks,)
+            "lipid_global_idx": batch_lipid_global,
+            "lipid_names": batch_names,
+            "n_tasks": batch_size_actual,
+            "kernel_family": args["kernel_family"],
+            "args": args,
+        }, out_root / "checkpoints" / f"batch_{batch_i:03d}.pt")
+
+        # Per-lipid splits + metrics
+        for k, (g_idx, name) in enumerate(zip(batch_lipid_global, batch_names)):
+            slug = safe_filename(name)
+            lip_dir = out_root / "predictions" / slug
+            lip_dir.mkdir(exist_ok=True)
+
+            mean_t = test_mean_z[:, k].astype(np.float32)
+            std_t = np.sqrt(test_var_z[:, k]).astype(np.float32)
+            true_t = y_te_z_batch_np[:, k].astype(np.float32)
+
+            mean_b = brain_mean_z[:, k].astype(np.float32)
+            std_b = np.sqrt(brain_var_z[:, k]).astype(np.float32)
+
+            # Save z + raw (de-standardize using the per-lipid mean/std)
+            cm = float(col_means[k + s].item())
+            cs = float(col_stds[k + s].item())
+            np.save(lip_dir / "test_coords_mm.npy",
+                    coords_te_mm.numpy().astype(np.float32))
+            np.save(lip_dir / "test_pred_z.npy", mean_t)
+            np.save(lip_dir / "test_pred_raw.npy", mean_t * cs + cm)
+            np.save(lip_dir / "test_std_z.npy", std_t)
+            np.save(lip_dir / "test_true_z.npy", true_t)
+            np.save(lip_dir / "graph_pred_z.npy", mean_b)
+            np.save(lip_dir / "graph_pred_raw.npy", mean_b * cs + cm)
+            np.save(lip_dir / "graph_std_z.npy", std_b)
+
+            # Per-lipid metrics on z-scored test predictions
+            err = true_t - mean_t
+            rmse = float(np.sqrt(np.mean(err ** 2)))
+            if np.std(mean_t) < 1e-10 or np.std(true_t) < 1e-10:
+                corr = float("nan")
+            else:
+                corr = float(np.corrcoef(true_t, mean_t)[0, 1])
+            ss_res = float(np.sum(err ** 2))
+            ss_tot = float(np.sum((true_t - true_t.mean()) ** 2)) or 1.0
+            r2 = 1.0 - ss_res / ss_tot
+
+            metrics_rows.append({
+                "lipid_global_idx": int(g_idx),
+                "lipid_name": name,
+                "slug": slug,
+                "batch": int(batch_i),
+                "test_rmse_z": rmse,
+                "test_corr": corr,
+                "test_r2": r2,
+                "mean_pred_std_z": float(std_t.mean()),
+                "fit_sec": fit_sec / batch_size_actual,  # amortised
+            })
+
+        # Flush after each batch (a long run can be inspected partway through)
+        pd.DataFrame(metrics_rows).to_csv(
+            out_root / "metrics.csv", index=False,
+        )
+
+        # Free memory before the next batch
+        del model, log_var_n, test_mean_z, test_var_z
+        del brain_mean_z, brain_var_z, y_tr_z_batch
+        torch.cuda.empty_cache() if args["device"].startswith("cuda") else None
+
+    grand_t = time.time() - grand_t0
+    log.info("=" * 72)
+    log.info(f"All {n_lipids} lipids trained in {grand_t:.1f}s "
+             f"({grand_t / max(n_lipids, 1):.1f}s/lipid avg)")
+    log.info("=" * 72)
+
+    # ---- summary ----
+    df = pd.DataFrame(metrics_rows)
+    summary = {
+        "n_lipids": int(len(df)),
+        "n_batches": int(n_batches),
+        "lipid_batch_size": int(B),
+        "kernel_family": args["kernel_family"],
+        "wall_time_sec": float(grand_t),
+        "test_rmse_z": {
+            "mean": float(df["test_rmse_z"].mean()),
+            "median": float(df["test_rmse_z"].median()),
+        },
+        "test_corr": {
+            "mean": float(df["test_corr"].mean(skipna=True)),
+            "median": float(df["test_corr"].median(skipna=True)),
+        },
+        "test_r2": {
+            "mean": float(df["test_r2"].mean()),
+            "median": float(df["test_r2"].median()),
+        },
+        "hypers": {k: args[k] for k in
+                   ("nu", "num_inducing", "learning_rate", "epochs",
+                    "batch_size", "lipid_batch_size") if k in args},
+    }
+    with open(out_root / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    log.info(f"Summary: test corr mean={summary['test_corr']['mean']:+.4f} "
+             f"median={summary['test_corr']['median']:+.4f}")
+    log.info(f"         test RMSE(z) mean={summary['test_rmse_z']['mean']:.4f}")
+    log.info(f"Outputs in: {out_root}")
+
+
+if __name__ == "__main__":
+    main()

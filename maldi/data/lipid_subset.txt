@@ -1,0 +1,14 @@
+# Per-lipid GP smoke-test subset.
+# Sorted by some difficulty score (easy → hard).
+# Lines beginning with '#' and blank lines are ignored.
+ 
+PC 35:1 PE 38:1
+#PC 37:5 PE 38:2 PE 40:5
+PA 36:1
+#PG 36:0
+#PG 39:4
+LPC 22:6
+#PC 32:0
+PE O-36:0 PE O-38:3
+#HexCer 42:1;O2
+Hex2Cer 40:1;O2

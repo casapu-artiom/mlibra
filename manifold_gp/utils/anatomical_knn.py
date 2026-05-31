@@ -2,17 +2,27 @@
 Anatomy-aware KNN graph construction.
 
 Standard FAISS KNN connects voxels by Euclidean distance only, which produces
-shortcut edges across sulcal gaps and ventricles. This module builds a graph
-where:
+shortcut edges across sulcal gaps and ventricles. This module provides two
+construction strategies for a soft-to-hard anatomical prior:
 
-  1. Each voxel has KNN edges only to other voxels in the same anatomical
-     region (label).
-  2. Cross-region edges are added ONLY between voxels that are physically
-     adjacent in the voxel grid AND both lie in real tissue.
+  1. ``build_anatomical_knn`` (HARD prior):
+       - Each voxel has KNN edges only to other voxels in the same anatomical
+         region (label).
+       - Cross-region edges are added ONLY between voxels that are physically
+         adjacent in the voxel grid AND both lie in real tissue.
 
-Output is `(edge_index, edge_value)` in the same shape your RiemannKernel
-expects from its FAISS-based knn.graph(K) call, so it can be plugged in
-directly.
+  2. ``inflate_cross_region_edges`` (SOFT prior):
+       - Take an existing graph (e.g. from FAISS) and INFLATE the edge values
+         on any edge that connects two different atlas regions, by a
+         user-chosen factor. Topology unchanged — graph stays connected,
+         which avoids the disconnected-component failure mode of the hard
+         prior. The Gaussian edge weight w=exp(-d²/2σ²) collapses
+         super-exponentially with inflated d², so cross-region smoothness
+         becomes very expensive but not impossible.
+
+Both functions return ``(edge_index, edge_value)`` in the same shape your
+RiemannKernel expects from its FAISS-based knn.graph(K) call, so they can
+be plugged in directly.
 """
 from __future__ import annotations
 
@@ -258,3 +268,131 @@ def build_anatomical_knn(
     if return_labels:
         out = out + (node_labels,)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Soft anatomical prior: inflate cross-region edges of an existing graph
+# ---------------------------------------------------------------------------
+def inflate_cross_region_edges(
+    edge_index: torch.Tensor,
+    edge_value: torch.Tensor,
+    node_labels: np.ndarray,
+    inflation: float = 10.0,
+    treat_zero_as_cross: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """Reweight an existing kNN graph using atlas labels — a SOFT
+    anatomical prior.
+
+    Takes any pre-built graph (typically from FAISS or another kNN
+    construction) and multiplies the edge value (squared distance) by
+    ``inflation`` on any edge whose two endpoints lie in different
+    atlas regions. Topology is unchanged: the graph stays connected
+    (assuming the input was), so the graph Laplacian has exactly one
+    zero eigenvalue and the resulting spectral kernel is well-conditioned.
+
+    The interaction with the Gaussian edge weight ``w_ij = exp(-d²_ij /
+    (2 σ²))`` is the point of this transformation: inflating ``d²`` by
+    a factor F shrinks ``w_ij`` from ``exp(-d²/(2σ²))`` to
+    ``exp(-F·d²/(2σ²))``. For typical within-region edges where
+    ``d²/(2σ²) ≈ 0.5`` (median), inflation=10 reduces cross-region
+    weights from ≈ 0.6 to ≈ 0.007 — about 100× weaker, but non-zero.
+    So information still flows across boundaries; just slowly.
+
+    This is a drop-in soft alternative to ``build_anatomical_knn``:
+    keep the FAISS topology (always connected → no NaN training
+    failures from disconnected components) but use the atlas to
+    discourage cross-region smoothness in the prior.
+
+    Args:
+      edge_index:   (2, E) long tensor of edge endpoints, as returned
+                    by a faiss or knn graph builder.
+      edge_value:   (E,) float tensor of squared distances (same
+                    convention as ``build_anatomical_knn``).
+      node_labels:  (N,) int array of atlas labels (0 = background,
+                    >0 = region). MUST have length == number of nodes
+                    in the graph (i.e. max(edge_index) < len(node_labels)).
+      inflation:    multiplier on squared distance for cross-region
+                    edges. 1.0 = no change. 10.0 = mild soft prior.
+                    100.0 = strong soft prior. Effectively unbounded —
+                    very large values approach the hard-prior limit
+                    but still keep the graph connected.
+      treat_zero_as_cross: if True (default), edges that touch an
+                    atlas background voxel (label 0) are also inflated.
+                    Background voxels are usually empty space adjacent
+                    to the tissue and shouldn't carry "free" smoothness.
+
+    Returns:
+      new_edge_index: (2, E) — same as input, returned as a convenience
+                       for chaining.
+      new_edge_value: (E,)   — cloned, with cross-region entries multiplied.
+      info:           dict with diagnostics ('n_cross', 'n_total',
+                       'frac_cross', 'inflation') for logging.
+    """
+    if edge_index.numel() == 0:
+        return edge_index, edge_value, {
+            "n_cross": 0, "n_total": 0, "frac_cross": 0.0,
+            "inflation": float(inflation),
+        }
+
+    n_nodes = int(edge_index.max().item()) + 1
+    if node_labels.shape[0] < n_nodes:
+        raise ValueError(
+            f"node_labels has {node_labels.shape[0]} entries but graph "
+            f"references node indices up to {n_nodes - 1}. Did you pass "
+            f"labels for the right node set?"
+        )
+
+    labels_t = torch.as_tensor(node_labels, dtype=torch.long,
+                               device=edge_index.device)
+    src_labels = labels_t[edge_index[0]]
+    tgt_labels = labels_t[edge_index[1]]
+    cross_region = (src_labels != tgt_labels)
+    if treat_zero_as_cross:
+        cross_region = cross_region | (src_labels == 0) | (tgt_labels == 0)
+
+    n_cross = int(cross_region.sum().item())
+    n_total = int(cross_region.numel())
+
+    new_edge_value = edge_value.clone()
+    if inflation != 1.0 and n_cross > 0:
+        new_edge_value[cross_region] = (
+            new_edge_value[cross_region] * float(inflation)
+        )
+
+    info = {
+        "n_cross": n_cross,
+        "n_total": n_total,
+        "frac_cross": n_cross / max(n_total, 1),
+        "inflation": float(inflation),
+    }
+    logging.info(
+        f"  inflate_cross_region_edges: {n_cross:,} / {n_total:,} "
+        f"({100 * info['frac_cross']:.1f}%) cross-region edges, "
+        f"inflated ×{inflation:g}"
+    )
+    return edge_index, new_edge_value, info
+
+
+def labels_for_nodes_from_sub_atlas(
+    sub_volume: np.ndarray,
+    sub_atlas: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Helper: given a sub-volume + matching sub-atlas (as produced by
+    your ``crop_or_stride_volume`` utility) plus the tissue threshold
+    used to build the node set, return the (N,) array of atlas labels
+    in the same order as the graph's nodes.
+
+    Assumes the graph was built from voxels where ``sub_volume >
+    threshold``, in numpy's default C-order (which matches
+    ``np.argwhere`` and ``np.where``). This is how
+    ``build_anatomical_knn`` and the standard faiss path both order
+    their nodes.
+    """
+    if sub_atlas is None:
+        raise ValueError(
+            "sub_atlas is None — pass an annotations volume so cross-"
+            "region detection has labels to work with."
+        )
+    mask = sub_volume > threshold
+    return sub_atlas[mask].astype(np.int64)
