@@ -80,6 +80,9 @@ from manifold_gp.utils.compute_eigenvectors import (
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
 )
+from manifold_gp.utils.anatomical_knn import (
+    labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
+)
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 
 
@@ -417,9 +420,6 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         # Use the helper in anatomical_knn so other models can do the
         # same conversion (sub_volume + sub_atlas + threshold → labels
         # in node order).
-        from anatomical_knn import (
-            labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
-        )
         if sub_atlas is None:
             raise ValueError(
                 "--knn-method=faiss_atlas_weighted requires "
