@@ -45,8 +45,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -146,7 +149,30 @@ def parse_args() -> dict:
     p.add_argument("--eigenvector-dir", default=None,
                    help="Required when --kernel-family=manifold.")
     p.add_argument("--knn-method", default="faiss",
-                   choices=["faiss", "anatomical_atlas"])
+                   choices=["faiss", "anatomical_atlas",
+                            "faiss_atlas_weighted"],
+                   help=("'faiss': Euclidean kNN, no anatomical prior. "
+                         "'anatomical_atlas': edges restricted to same "
+                         "atlas region + voxel-adjacent cross-region "
+                         "links (strong but can produce disconnected "
+                         "components → NaN). "
+                         "'faiss_atlas_weighted': use the faiss kNN "
+                         "graph as-is but INFLATE squared distances "
+                         "on edges that cross atlas regions, by a "
+                         "factor of --cross-region-inflation. Soft "
+                         "anatomical prior — graph stays connected "
+                         "(no NaN) and the spectral kernel still "
+                         "prefers within-region smoothness because "
+                         "the Gaussian edge weight w=exp(-d²/2σ²) "
+                         "collapses for inflated d²."))
+    p.add_argument("--cross-region-inflation", type=float, default=10.0,
+                   help=("For --knn-method=faiss_atlas_weighted only. "
+                         "Multiplier applied to squared Euclidean "
+                         "distance on edges that connect two atlas "
+                         "regions. Default 10 = mild prior; try 100 "
+                         "for a strong prior, 1 for none. The "
+                         "underlying graph topology is identical to "
+                         "pure faiss; only the edge weights change."))
     p.add_argument("--laplacian-norm", default="randomwalk",
                    choices=["symmetric", "randomwalk"])
     p.add_argument("--stride", type=int, default=4)
@@ -211,6 +237,54 @@ def safe_filename(name: str) -> str:
     """
     s = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.replace(":", "-"))
     return s.strip("_")
+
+
+def savez_safe(path, **arrays):
+    """``np.savez`` but works on filesystems that don't support seek()
+    on write — e.g. S3 mounts via s3fs/goofys.
+
+    The npz format is a ZIP file, and ZIP writers seek back to the
+    beginning when closing the archive (to write the central
+    directory). S3 mounts only allow sequential writes and throw
+    OSError(95) "Operation not supported" when that seek happens. The
+    workaround: write to a local temp file (which DOES support seek),
+    then copy the finished archive to the destination — a copy is
+    purely sequential and S3 accepts it.
+
+    Falls back to the plain np.savez path if writing succeeds locally
+    AND the destination is the same filesystem (no real cost there).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Try a direct write first. On a normal filesystem this is the
+    # cheapest path; on S3 it raises immediately and we fall through.
+    try:
+        np.savez(str(path), **arrays)
+        return
+    except OSError as e:
+        # errno 95 = ENOTSUP / EOPNOTSUPP, the typical S3 fuse error.
+        # Also handle the generic "Operation not supported" wording
+        # other mounts produce.
+        if getattr(e, "errno", None) != 95 and "not supported" not in str(e).lower():
+            raise
+        logging.getLogger("per_lipid_gp").info(
+            f"  np.savez direct write failed on {path} (S3 mount?); "
+            f"writing via local temp file and copying."
+        )
+    # Stage to local disk, then copy. NamedTemporaryFile with delete=False
+    # so np.savez can close it cleanly; we delete after the copy.
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        np.savez(tmp_path, **arrays)
+        # Use shutil.copyfile (not move) — move tries rename() first,
+        # which crosses-fs would fail; copyfile is always sequential.
+        shutil.copyfile(tmp_path, str(path))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def resolve_lipids(spec, lipid_names: list[str],
@@ -299,6 +373,13 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     if args["knn_method"] == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
         graph_key_parts["conn"] = 3
+    elif args["knn_method"] == "faiss_atlas_weighted":
+        # The base graph is pure faiss — we reuse that cache. The atlas
+        # weighting is applied AFTER loading, so we only need to encode
+        # the inflation factor in the eigenvector key (the kNN graph
+        # cache key uses "faiss" so it's shareable with vanilla faiss
+        # runs of the same k / stride / threshold).
+        pass
     graph_key = make_graph_key(graph_key_parts)
 
     # Build / load KNN graph
@@ -309,7 +390,7 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
             k=args["knn_k"], nlist=args["n_list"],
             extra=graph_key_parts, device=args["device"],
         )
-    else:
+    elif args["knn_method"] == "anatomical_atlas":
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key, method="anatomical_atlas",
             volume=sub_volume, threshold=args["threshold"],
@@ -318,6 +399,60 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
             k=args["knn_k"], nlist=args["n_list"],
             extra=graph_key_parts, device=args["device"],
         )
+    elif args["knn_method"] == "faiss_atlas_weighted":
+        # ---- 1. Get the base faiss graph ---------------------------
+        # Build (or load from cache) the *exact same* faiss kNN graph
+        # that --knn-method=faiss would produce, so caches are shared
+        # across the two methods.
+        base_key_parts = dict(graph_key_parts)
+        base_key_parts["method"] = "faiss"  # cache under the faiss key
+        base_key = make_graph_key(base_key_parts)
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=base_key, method="faiss",
+            coords=reference_nodes,
+            k=args["knn_k"], nlist=args["n_list"],
+            extra=base_key_parts, device=args["device"],
+        )
+        # ---- 2. Look up each node's atlas region -------------------
+        # Use the helper in anatomical_knn so other models can do the
+        # same conversion (sub_volume + sub_atlas + threshold → labels
+        # in node order).
+        from anatomical_knn import (
+            labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
+        )
+        if sub_atlas is None:
+            raise ValueError(
+                "--knn-method=faiss_atlas_weighted requires "
+                "--annotations-file; got none."
+            )
+        node_labels = labels_for_nodes_from_sub_atlas(
+            sub_volume, sub_atlas, args["threshold"],
+        )
+        if node_labels.shape[0] != knn.x.shape[0]:
+            raise RuntimeError(
+                f"Mismatch between labelled voxels ({node_labels.shape[0]}) "
+                f"and graph nodes ({knn.x.shape[0]}). The atlas and "
+                f"reference template were probably cropped/strided "
+                f"differently — check that they have the same shape."
+            )
+
+        # ---- 3. Inflate cross-region edges via library function -----
+        # Topology is unchanged; only edge_value gets reweighted.
+        inflation = float(args.get("cross_region_inflation", 10.0))
+        edge_index, edge_value, _info = inflate_cross_region_edges(
+            edge_index, edge_value, node_labels,
+            inflation=inflation, treat_zero_as_cross=True,
+        )
+
+        # ---- 4. Re-key the eigenvector cache -----------------------
+        # Same graph topology but different edge weights → different
+        # Laplacian → different eigenmodes. Encode the inflation in
+        # graph_key so the eigvec cache doesn't collide with vanilla
+        # faiss runs.
+        graph_key_parts["weighting"] = f"atlas_x{inflation:g}"
+        graph_key = make_graph_key(graph_key_parts)
+    else:
+        raise ValueError(f"unknown knn_method: {args['knn_method']}")
 
     # Eigenpairs
     laplacian_op = GraphLaplacianOperator(
@@ -777,7 +912,7 @@ def main():
 
     # ---- graph_meta for off-line reconstruction ----
     if manifold_ctx is not None:
-        np.savez(
+        savez_safe(
             out_root / "graph_meta.npz",
             reference_nodes_z=manifold_ctx["reference_nodes"].cpu().numpy(),
             template_shape=np.array(manifold_ctx["template_shape"]),
@@ -807,7 +942,7 @@ def main():
         voxel_scale = 0.025
         coords_brain_mm = torch.from_numpy(nz.astype(np.float32) * voxel_scale)
         node_voxel_idx = nz
-        np.savez(
+        savez_safe(
             out_root / "graph_meta.npz",
             node_voxel_idx=node_voxel_idx,
             template_shape=np.array(template_volume.shape),
