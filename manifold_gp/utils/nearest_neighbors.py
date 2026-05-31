@@ -333,7 +333,16 @@ class KnnGraphCache:
             print(f"[knn_graph] trained in {time.time() - t0:.1f}s "
                   f"(N={knn.x.shape[0]:,}  E={ei.shape[-1]:,})")
  
-        # 3. Save
+        valid_mask = (ei[0] >= 0) & (ei[1] >= 0)
+        if not valid_mask.all():
+            logging.warning(
+                f"[KnnGraphCache] Detected {(~valid_mask).sum().item()} null neighbor padding entries (-1). "
+                f"Purging them cleanly from the graph topology mapping."
+            )
+            ei = ei[:, valid_mask]
+            ev = ev[valid_mask]
+ 
+         # 3. Save
         self.save(key, knn, ei, ev, method=method, nlist=nlist, extra=extra)
         return knn, ei, ev
  
