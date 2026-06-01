@@ -69,6 +69,7 @@ import torch
 import matplotlib.cm as cm
 
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
+from manifold_gp.utils.anatomical_knn import inflate_cross_region_edges, labels_for_nodes_from_sub_atlas
 from manifold_gp.utils.compute_eigenvectors import (
     LaplacianEigensolver, make_key as make_eig_key,
 )
@@ -129,8 +130,16 @@ def parse_args() -> dict:
     p.add_argument("--region-bbox", type=int, nargs=6, default=None,
                    metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"))
 
-    p.add_argument("--knn-method", choices=["faiss", "anatomical_atlas"],
+    p.add_argument("--knn-method", choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted"],
                    default="anatomical_atlas")
+    p.add_argument("--cross-region-inflation", type=float, default=10.0,
+                   help=("For --knn-method=faiss_atlas_weighted only. "
+                         "Multiplier applied to squared Euclidean "
+                         "distance on edges that connect two atlas "
+                         "regions. Default 10 = mild prior; try 100 "
+                         "for a strong prior, 1 for none. The "
+                         "underlying graph topology is identical to "
+                         "pure faiss; only the edge weights change."))
     p.add_argument("--knn-k", type=int, default=15)
     p.add_argument("--n-list", type=int, default=1)
     p.add_argument("--laplacian-norm", choices=["symmetric", "randomwalk"],
@@ -247,18 +256,82 @@ def setup(args: dict, log: logging.Logger):
     if args["knn_method"] == "faiss":
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key, method="faiss",
-            coords=reference_nodes, k=args["knn_k"], nlist=args["n_list"],
-            extra=graph_key_parts,
-            force_recompute=args["force_recompute_graph"], device=device,
+            coords=reference_nodes,
+            k=args["knn_k"], nlist=args["n_list"],
+            extra=graph_key_parts, device=args["device"],
+            force_recompute=args["force_recompute_graph"],
         )
-    else:
+    elif args["knn_method"] == "anatomical_atlas":
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key, method="anatomical_atlas",
             volume=sub_volume, threshold=args["threshold"],
             atlas_volume=sub_atlas, connectivity=3,
-            coords=reference_nodes, k=args["knn_k"], nlist=args["n_list"],
-            extra=graph_key_parts,
-            force_recompute=args["force_recompute_graph"], device=device,
+            coords=reference_nodes,
+            k=args["knn_k"], nlist=args["n_list"],
+            extra=graph_key_parts, device=args["device"],
+            force_recompute=args["force_recompute_graph"],
+        )
+    elif args["knn_method"] == "faiss_atlas_weighted":
+        # ---- 1. Get the base faiss graph ---------------------------
+        # Build (or load from cache) the *exact same* faiss kNN graph
+        # that --knn-method=faiss would produce, so caches are shared
+        # across the two methods.
+        base_key_parts = dict(graph_key_parts)
+        base_key_parts["method"] = "faiss"  # cache under the faiss key
+        base_key = make_graph_key(base_key_parts)
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=base_key, method="faiss",
+            coords=reference_nodes,
+            k=args["knn_k"], nlist=args["n_list"],
+            extra=base_key_parts, device=args["device"],
+            force_recompute=args["force_recompute_graph"],
+        )
+        # ---- 2. Look up each node's atlas region -------------------
+        # Use the helper in anatomical_knn so other models can do the
+        # same conversion (sub_volume + sub_atlas + threshold → labels
+        # in node order).
+        if sub_atlas is None:
+            raise ValueError(
+                "--knn-method=faiss_atlas_weighted requires "
+                "--annotations-file; got none."
+            )
+        node_labels = labels_for_nodes_from_sub_atlas(
+            sub_volume, sub_atlas, args["threshold"],
+        )
+        if node_labels.shape[0] != knn.x.shape[0]:
+            raise RuntimeError(
+                f"Mismatch between labelled voxels ({node_labels.shape[0]}) "
+                f"and graph nodes ({knn.x.shape[0]}). The atlas and "
+                f"reference template were probably cropped/strided "
+                f"differently — check that they have the same shape."
+            )
+
+        # ---- 3. Inflate cross-region edges via library function -----
+        # Topology is unchanged; only edge_value gets reweighted.
+        inflation = float(args.get("cross_region_inflation", 10.0))
+        edge_index, edge_value, _info = inflate_cross_region_edges(
+            edge_index, edge_value, node_labels,
+            inflation=inflation, treat_zero_as_cross=True,
+        )
+
+        # ---- 4. Re-key the eigenvector cache -----------------------
+        # Same graph topology but different edge weights → different
+        # Laplacian → different eigenmodes. Encode the inflation in
+        # graph_key so the eigvec cache doesn't collide with vanilla
+        # faiss runs.
+        graph_key_parts["weighting"] = f"atlas_x{inflation:g}"
+        graph_key = make_graph_key(graph_key_parts)
+    else:
+        raise ValueError(f"unknown knn_method: {args['knn_method']}")
+
+    print(f"[DEBUG] operator_dimension (knn.x.shape[0]): {knn.x.shape[0]}")
+    print(f"[DEBUG] edge_index min: {edge_index.min().item()}, max: {edge_index.max().item()}")
+
+    if edge_index.max().item() >= knn.x.shape[0] or edge_index.min().item() < 0:
+        raise ValueError(
+            f"CRITICAL: edge_index contains out-of-bounds indices! "
+            f"Valid range is [0, {knn.x.shape[0] - 1}], but edge_index ranges "
+            f"from {edge_index.min().item()} to {edge_index.max().item()}."
         )
 
     bw = float(args["graphbandwidth"])
@@ -287,6 +360,22 @@ def setup(args: dict, log: logging.Logger):
         force_recompute=args["force_recompute_eigvecs"], device=device,
     )
     log.info(f"Loaded {eigvec.shape[1]} eigenmodes")
+
+    print(f"eigvec shape:          {tuple(eigvec.shape)}")  # (N_nodes, num_modes)
+    print(f"eigval shape:          {tuple(eigval.shape)}")
+    print(f"NaN in eigvec:         {torch.isnan(eigvec).any().item()}")
+    print(f"NaN in eigval:         {torch.isnan(eigval).any().item()}")
+    print(f"eigval range:          [{eigval.min().item():.4g}, {eigval.max().item():.4g}]")
+    print(f"first 10 eigvals:      {eigval[:10].cpu().numpy()}")
+
+    # Orthonormality check — eigvec.T @ eigvec should be ~I for a well-conditioned eigensolve
+    inner = eigvec.T @ eigvec
+    off_diag = inner - torch.eye(inner.shape[0], device=inner.device)
+    print(f"|eigvec.T @ eigvec - I|_max (off-diag): {off_diag.abs().max().item():.4g}")
+
+    # Eigval ordering — should be non-decreasing
+    diffs = eigval[1:] - eigval[:-1]
+    print(f"min eigval gap (should be >= 0): {diffs.min().item():.4g}")
 
     return dict(
         device=device,

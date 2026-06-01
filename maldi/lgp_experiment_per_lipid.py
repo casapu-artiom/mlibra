@@ -475,23 +475,6 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     diffs = eigval[1:] - eigval[:-1]
     print(f"min eigval gap (should be >= 0): {diffs.min().item():.4g}")
 
-    with torch.no_grad():
-        # QR re-orthogonalization — cheap and fixes degenerate subspace mixing
-        # from the Lanczos solver (causes |U^T U - I| errors up to ~0.8)
-        Q, R = torch.linalg.qr(eigvec)   # Q is (N, num_modes), orthonormal cols
-        # Restore sign convention: ensure R diagonal is positive (unique QR)
-        signs = R.diagonal().sign()
-        signs[signs == 0] = 1.0
-        eigvec = Q * signs.unsqueeze(0)
-        
-        # Re-sort by eigenvalue (QR may mix columns within degenerate subspaces)
-        sort_idx = eigval.argsort()
-        eigval = eigval[sort_idx]
-        eigvec = eigvec[:, sort_idx]
-
-    inner = eigvec.T @ eigvec
-    print(f"|U^T U - I| after QR: {(inner - torch.eye(inner.shape[0], device=inner.device)).abs().max():.4g}")
-
     # Kernel
     manifold_kernel = RiemannMaternKernel(
         nu=args["nu"], knn=knn, edge_index=edge_index, edge_value=edge_value,

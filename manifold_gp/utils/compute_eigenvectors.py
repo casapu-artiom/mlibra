@@ -405,14 +405,23 @@ class LaplacianEigensolver:
         evecs = torch.from_numpy(evecs_np).float().to(device)
         return evals, evecs
 
-    def _postprocess(self, evals, evecs, op
-                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _postprocess(self, evals, evecs, op) -> Tuple[torch.Tensor, torch.Tensor]:
         evals = evals[: self.num_modes]
         evecs = evecs[:, : self.num_modes]
         evals[0] = 0.0
-        degree_safe = torch.clamp(op.degree_mat, min=1e-8)
-        evecs = evecs * degree_safe.pow(-0.5).view(-1, 1)
-        evecs = l2_normalize(evecs, p=2, dim=0)
+
+        # Both branches start from φ_sym (symmetric Laplacian eigvecs).
+        # QR re-orthogonalizes Lanczos drift before any further transform.
+        Q, R = torch.linalg.qr(evecs)
+        signs = R.diagonal().sign()
+        signs[signs == 0] = 1.0
+        evecs = Q * signs.unsqueeze(0)   # φ_sym, now properly L2-orthonormal
+
+        if op.normalization == "randomwalk":
+            # φ_rw = D^(-1/2) φ_sym  →  D-orthonormal (φ^T D φ = I)
+            degree_safe = torch.clamp(op.degree_mat, min=1e-8)
+            evecs = evecs * degree_safe.pow(-0.5).view(-1, 1)
+
         return evals, evecs
 
     # ---------------------------------------------------------- fingerprint
