@@ -239,6 +239,30 @@ def parse_args() -> dict:
                          "a good default; >4 hits diminishing returns "
                          "and uses more RAM since each worker keeps a "
                          "copy of the dataset tensors."))
+    p.add_argument("--grad-clip", type=float, default=10.0,
+                   help=("Gradient L2-norm clip. The analytic ELBO can "
+                         "produce very large gradients at initialization "
+                         "(the posterior variance term is huge under "
+                         "the GP prior, before training contracts it), "
+                         "and the manifold kernel's K_uu Cholesky can "
+                         "be ill-conditioned. Clipping the gradient "
+                         "norm to this value keeps the first few "
+                         "epochs numerically stable. Default 10.0 = "
+                         "permissive (rarely binds late in training); "
+                         "try 1.0 if you still see non-finite gradient "
+                         "warnings."))
+    p.add_argument("--bad-grad-skip-frac", type=float, default=0.01,
+                   help=("Fraction of gradient entries that must be "
+                         "NaN/Inf before skipping the whole step. Below "
+                         "this threshold we zero the bad entries and "
+                         "step normally (well-defined directions still "
+                         "informative). At or above the threshold, the "
+                         "step is skipped entirely — too much zeroing "
+                         "means moving in an essentially random "
+                         "direction. Default 0.01 (1% of params). Set "
+                         "higher (e.g. 0.1) to tolerate more zeroing; "
+                         "set lower (e.g. 0.001) to skip more "
+                         "aggressively."))
     p.add_argument("--region-bbox", type=int, nargs=6, default=None,
                    metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"))
 
@@ -690,6 +714,11 @@ def train_lipid_batch(
     fit_t0 = time.time()
     epoch_t0 = fit_t0
     current_epoch = iter_start // iters_per_epoch
+    # Counter for consecutive non-finite gradients. Resets on every
+    # successful step. We use it to throttle the warning log (otherwise
+    # one bad iter fills 100+ lines) and to bail out after sustained
+    # divergence rather than spinning forever.
+    bad_grad_count = 0
     # CUDA generator for fast on-device random index sampling. Using
     # torch.randperm(n_train) on CPU every iter wastes 50-100ms per
     # step on a 5M-point training set (allocates an int64 tensor of
@@ -889,25 +918,120 @@ def train_lipid_batch(
                     # nan_action == "skip": don't step on this batch
                     log.warning(f"[it {it}] {msg.splitlines()[0]} — skipping batch")
                     optimizer.zero_grad()
+                    # Advance `it` so we don't get stuck on the same
+                    # minibatch counter forever (the DataLoader keeps
+                    # serving fresh minibatches regardless).
+                    it += 1
+                    pbar.update(1)
+                    if it >= n_iters:
+                        break
                     continue
 
                 loss.backward()
-                # ---- guard the optimizer step itself ----
-                # AdamW can move parameters to NaN if any gradient is NaN
-                # while loss looked finite (rare but happens with numerical
-                # boundaries). Skip the step if any grad is bad.
-                grad_bad = False
+
+                # ---- NaN-to-zero gradient sanitization with skip safety -
+                # Backward through the manifold kernel's Cholesky can
+                # produce NaN/Inf in a SUBSET of parameter gradients —
+                # typically variational covariance entries near a
+                # singular eigenmode of K_uu. We have two modes:
+                #
+                #   (a) Small fraction bad (<bad_grad_skip_frac): zero
+                #       the offending entries and step normally. The
+                #       remaining finite gradient direction is still
+                #       informative, just missing a few components.
+                #
+                #   (b) Large fraction bad (>=bad_grad_skip_frac): skip
+                #       the step entirely. Stepping with mostly-zeroed
+                #       gradients means moving in an essentially random
+                #       direction, which can push the model further into
+                #       the singular regime.
+                #
+                # Default threshold 1% — small enough that occasional
+                # numerical hiccups don't block training, big enough
+                # that a genuinely diverged step gets caught.
+                n_bad_grad = 0
+                n_total_grad = 0
                 for p in list(model.parameters()) + [log_var_n]:
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        grad_bad = True
-                        break
-                if grad_bad:
-                    log.warning(
-                        f"[it {it}] non-finite gradient — skipping step "
-                        f"(loss was {loss.item():.3g})"
-                    )
+                    if p.grad is None:
+                        continue
+                    n_total_grad += p.grad.numel()
+                    bad = ~torch.isfinite(p.grad)
+                    if bad.any():
+                        n_bad_grad += int(bad.sum().item())
+
+                bad_frac = n_bad_grad / max(n_total_grad, 1)
+                skip_frac = float(args.get("bad_grad_skip_frac", 0.01))
+
+                if n_bad_grad > 0 and bad_frac >= skip_frac:
+                    # Too much of the gradient is bad — skip the step
+                    # rather than stepping with mostly-zeroed grads.
+                    bad_grad_count += 1
+                    if bad_grad_count <= 3 or bad_grad_count % 100 == 0:
+                        log.warning(
+                            f"[it {it}] {n_bad_grad}/{n_total_grad} "
+                            f"({100*bad_frac:.1f}%) gradient entries "
+                            f"are NaN/Inf — SKIPPING step "
+                            f"(loss={loss.item():.3g}, "
+                            f"consecutive_skips={bad_grad_count})"
+                        )
                     optimizer.zero_grad()
+                    # Advance `it` so we don't spin forever; the
+                    # DataLoader keeps serving fresh minibatches.
+                    it += 1
+                    pbar.update(1)
+                    if bad_grad_count >= 200:
+                        pbar.close()
+                        raise RuntimeError(
+                            f"200+ consecutive steps with "
+                            f">={100*skip_frac:.1f}% bad gradients at "
+                            f"iter {it}. The model has diverged. "
+                            f"Common fixes:\n"
+                            f"  • smaller --learning-rate (currently "
+                            f"{args['learning_rate']})\n"
+                            f"  • smaller --grad-clip (currently "
+                            f"{args.get('grad_clip', 10.0)}; try 1.0)\n"
+                            f"  • smaller --bump-scale on the manifold "
+                            f"kernel\n"
+                            f"  • larger gpytorch cholesky_jitter\n"
+                            f"  • larger --bad-grad-skip-frac if you "
+                            f"want to tolerate more zeroing (currently "
+                            f"{skip_frac})"
+                        )
+                    if it >= n_iters:
+                        break
                     continue
+
+                if n_bad_grad > 0:
+                    # Small fraction bad — zero the bad entries and
+                    # proceed. The well-defined gradient directions
+                    # still update normally.
+                    for p in list(model.parameters()) + [log_var_n]:
+                        if p.grad is None:
+                            continue
+                        bad = ~torch.isfinite(p.grad)
+                        if bad.any():
+                            p.grad.masked_fill_(bad, 0.0)
+                    bad_grad_count += 1
+                    if bad_grad_count <= 3 or bad_grad_count % 100 == 0:
+                        log.warning(
+                            f"[it {it}] {n_bad_grad}/{n_total_grad} "
+                            f"({100*bad_frac:.2f}%) gradient entries "
+                            f"zeroed (loss={loss.item():.3g}, "
+                            f"consecutive_with_nan={bad_grad_count})"
+                        )
+                else:
+                    bad_grad_count = 0
+
+                # ---- gradient clipping ---------------------------------
+                # After NaN sanitization, gradients are finite — clipping
+                # caps any remaining large-but-finite values. Helps with
+                # the analytic ELBO's large gradients at init.
+                grad_clip = float(args.get("grad_clip", 10.0))
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.parameters()) + [log_var_n],
+                    max_norm=grad_clip,
+                )
+
                 optimizer.step()
                 # Clamp log_var_n back into a sane range so the noise term
                 # can't explode/underflow. Done after the step so AdamW's
@@ -1061,6 +1185,26 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / "predictions").mkdir(exist_ok=True)
     (out_root / "checkpoints").mkdir(exist_ok=True)
+
+    # ---- refuse to proceed on a previously-failed dir ----
+    # A run that terminally diverged writes FAILED.txt; on the next
+    # invocation (e.g. cluster auto-restart) we refuse to re-run
+    # automatically. The operator must investigate and explicitly
+    # remove FAILED.txt to retry. This is intentional — auto-retrying
+    # a divergent config wastes cluster time and produces nothing.
+    failure_marker = out_root / "FAILED.txt"
+    if failure_marker.exists():
+        log.error("=" * 72)
+        log.error(f"Output dir contains FAILED.txt — refusing to run.")
+        log.error(f"  Path: {failure_marker}")
+        log.error(f"  Contents:\n{failure_marker.read_text()}")
+        log.error(
+            "Remove FAILED.txt and re-run if you want to retry, OR "
+            "change --exp-name to start fresh in a different directory."
+        )
+        log.error("=" * 72)
+        sys.exit(2)  # distinct exit code: 2 = previously-failed-refusal
+
     with open(out_root / "config.json", "w") as f:
         json.dump(args, f, indent=2, default=str)
     log.info("=" * 72)
@@ -1327,17 +1471,64 @@ def main():
         args_for_batch = dict(args, checkpoint_path=ckpt_path)
 
         t0 = time.time()
-        model, log_var_n = train_lipid_batch(
-            coords_train=coords_tr_z,
-            y_train=y_tr_z_batch,
-            inducing_points=inducing_points,
-            args=args_for_batch,
-            manifold_kernel=(manifold_ctx["kernel"]
-                             if manifold_ctx is not None else None),
-            device=args["device"],
-            log=log,
-            pbar_desc=f"batch {batch_i+1}/{n_batches}",
-        )
+        try:
+            model, log_var_n = train_lipid_batch(
+                coords_train=coords_tr_z,
+                y_train=y_tr_z_batch,
+                inducing_points=inducing_points,
+                args=args_for_batch,
+                manifold_kernel=(manifold_ctx["kernel"]
+                                 if manifold_ctx is not None else None),
+                device=args["device"],
+                log=log,
+                pbar_desc=f"batch {batch_i+1}/{n_batches}",
+            )
+        except RuntimeError as ex:
+            # Sustained divergence (>=200 consecutive bad-grad skips, or
+            # an explicit NaN-loss bail-out in nan_action='raise' mode).
+            # We treat this as a TERMINAL failure for the whole pipeline:
+            # any further batches would likely diverge the same way, the
+            # operator needs to investigate and pick new hyperparameters.
+            #
+            # Write a sticky FAILED.txt marker so:
+            #   (1) the cluster job manager sees a non-zero exit code
+            #       (RuntimeError will propagate after this block)
+            #   (2) an auto-restarter that re-runs the same exp_name
+            #       can detect prior failure via FAILED.txt presence
+            #       (resume logic at startup refuses to proceed).
+            #   (3) a human inspecting the output dir gets a clear
+            #       record of what went wrong, when, and at which batch.
+            #
+            # The operator removes FAILED.txt manually after fixing the
+            # config — this is intentional, not auto-cleared.
+            failure_marker = out_root / "FAILED.txt"
+            try:
+                failure_marker.write_text(
+                    f"Run failed at batch {batch_i+1}/{n_batches}\n"
+                    f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Lipids in failing batch: {batch_names}\n"
+                    f"Lipid global indices: {batch_lipid_global}\n"
+                    f"\n"
+                    f"Error:\n{ex}\n"
+                    f"\n"
+                    f"To retry: remove this file (FAILED.txt) and "
+                    f"re-run with the same --exp-name (or change "
+                    f"hyperparameters). The failing batch will be "
+                    f"re-attempted from scratch; previously-completed "
+                    f"batches will be skipped via the resume logic.\n"
+                )
+                log.error(
+                    f"[batch {batch_i+1}/{n_batches}] TRAINING FAILED. "
+                    f"Wrote {failure_marker}. Aborting pipeline."
+                )
+            except OSError as write_err:
+                # Best-effort — if even the marker write fails, log it
+                # but still re-raise the original training error.
+                log.error(
+                    f"[batch {batch_i+1}/{n_batches}] TRAINING FAILED "
+                    f"AND could not write {failure_marker}: {write_err}"
+                )
+            raise  # propagate the original RuntimeError unchanged
         fit_sec = time.time() - t0
 
         # Predict on test set + brain. predict_batched returns y-space
