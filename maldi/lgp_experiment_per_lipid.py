@@ -211,6 +211,22 @@ def parse_args() -> dict:
                          "training; useful when only occasional "
                          "batches go bad (e.g. an unlucky mini-batch "
                          "lands on a degenerate region of the kernel)."))
+    p.add_argument("--resume", choices=["auto", "force"], default="auto",
+                   help=("Checkpoint behaviour. 'auto' (default): if the "
+                         "output dir already has complete .npy "
+                         "predictions for any lipid in a batch, skip "
+                         "that entire batch and continue with the next. "
+                         "Restores metrics.csv too. Designed for cloud "
+                         "jobs that crash + auto-restart with the same "
+                         "--exp-name. 'force': re-run every batch from "
+                         "scratch (overwrites existing predictions)."))
+    p.add_argument("--checkpoint-every-epochs", type=int, default=5,
+                   help=("Save the in-progress per-batch model state "
+                         "every N training epochs, overwriting the "
+                         "previous in-progress checkpoint. On resume "
+                         "(after a crash), training continues from this "
+                         "checkpoint rather than starting the batch "
+                         "over from scratch. 0 = disable."))
     p.add_argument("--region-bbox", type=int, nargs=6, default=None,
                    metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"))
 
@@ -240,6 +256,29 @@ def safe_filename(name: str) -> str:
     """
     s = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.replace(":", "-"))
     return s.strip("_")
+
+
+# Files we expect every COMPLETED lipid prediction dir to contain.
+# Used by the --resume auto path: if all these exist, the lipid is done.
+# (test_*_raw.npy and graph_*_raw.npy are derivable from _z + col_means/std,
+# so we don't require them — but training will produce them.)
+_LIPID_REQUIRED_FILES = (
+    "test_coords_mm.npy",
+    "test_pred_z.npy",
+    "test_true_z.npy",
+    "test_std_z.npy",
+    "graph_pred_z.npy",
+    "graph_std_z.npy",
+)
+
+
+def lipid_is_complete(predictions_root: Path, slug: str) -> bool:
+    """True iff predictions/<slug>/ exists and contains all the
+    essential .npy files for a finished lipid."""
+    d = predictions_root / slug
+    if not d.is_dir():
+        return False
+    return all((d / f).is_file() for f in _LIPID_REQUIRED_FILES)
 
 
 def savez_safe(path, **arrays):
@@ -459,22 +498,6 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         extra=eigvec_key_parts, device=args["device"],
     )
 
-    print(f"eigvec shape:          {tuple(eigvec.shape)}")  # (N_nodes, num_modes)
-    print(f"eigval shape:          {tuple(eigval.shape)}")
-    print(f"NaN in eigvec:         {torch.isnan(eigvec).any().item()}")
-    print(f"NaN in eigval:         {torch.isnan(eigval).any().item()}")
-    print(f"eigval range:          [{eigval.min().item():.4g}, {eigval.max().item():.4g}]")
-    print(f"first 10 eigvals:      {eigval[:10].cpu().numpy()}")
-
-    # Orthonormality check — eigvec.T @ eigvec should be ~I for a well-conditioned eigensolve
-    inner = eigvec.T @ eigvec
-    off_diag = inner - torch.eye(inner.shape[0], device=inner.device)
-    print(f"|eigvec.T @ eigvec - I|_max (off-diag): {off_diag.abs().max().item():.4g}")
-
-    # Eigval ordering — should be non-decreasing
-    diffs = eigval[1:] - eigval[:-1]
-    print(f"min eigval gap (should be >= 0): {diffs.min().item():.4g}")
-
     # Kernel
     manifold_kernel = RiemannMaternKernel(
         nu=args["nu"], knn=knn, edge_index=edge_index, edge_value=edge_value,
@@ -580,14 +603,46 @@ def train_lipid_batch(
     # so cluster job logs show progress even when the tqdm bar is hidden.
     log_every = max(1, n_iters // 20)
 
+    # ---- Resume from in-progress checkpoint if one exists ---------------
+    # ckpt_path is set by the caller (per-batch). If a previous crash
+    # left a checkpoint file, restore model + log_var_n + iter counter
+    # so training picks up where it left off rather than restarting
+    # from scratch.
+    ckpt_path = args.get("checkpoint_path", None)
+    iter_start = 0
+    if ckpt_path is not None and Path(ckpt_path).exists():
+        try:
+            ckpt = torch.load(ckpt_path, map_location=device)
+            if ckpt.get("n_tasks") == n_tasks:
+                model.load_state_dict(ckpt["model_state"])
+                with torch.no_grad():
+                    log_var_n.copy_(ckpt["log_var_n"].to(device))
+                iter_start = int(ckpt.get("iter", 0))
+                log.info(
+                    f"  [{pbar_desc}] resumed from "
+                    f"{Path(ckpt_path).name} @ iter {iter_start}/"
+                    f"{n_iters} (epoch {ckpt.get('epoch', 0)})"
+                )
+            else:
+                log.warning(
+                    f"  [{pbar_desc}] checkpoint n_tasks mismatch "
+                    f"({ckpt.get('n_tasks')} vs {n_tasks}); ignoring"
+                )
+        except Exception as ex:
+            log.warning(
+                f"  [{pbar_desc}] could not load checkpoint "
+                f"{ckpt_path}: {ex}; starting from scratch"
+            )
+
     log.info(
         f"  [{pbar_desc}] starting fit: "
         f"n_train={n_train:,} bs={bs} epochs={args['epochs']} "
         f"iters_per_epoch={iters_per_epoch} total_iters={n_iters} "
-        f"n_tasks={n_tasks}; logging every {log_every} iters."
+        f"n_tasks={n_tasks}; logging every {log_every} iters; "
+        f"iter_start={iter_start}."
     )
 
-    pbar = tqdm(range(n_iters), desc=pbar_desc, leave=False,
+    pbar = tqdm(range(iter_start, n_iters), desc=pbar_desc, leave=False,
                 dynamic_ncols=True)
     g = torch.Generator(device="cpu")
     g.manual_seed(int(args["seed"]))
@@ -605,7 +660,43 @@ def train_lipid_batch(
 
     fit_t0 = time.time()
     epoch_t0 = fit_t0
-    current_epoch = 0
+    current_epoch = iter_start // iters_per_epoch
+    # ---- Periodic checkpointing ----------------------------------------
+    # Cloud jobs that auto-restart on OOM lose all in-progress training
+    # if we only save at end-of-batch. Save the model state every
+    # ``checkpoint_every_epochs`` epochs, overwriting a single file per
+    # batch so we never bloat the S3 output dir.
+    ckpt_every = int(args.get("checkpoint_every_epochs", 5))
+    ckpt_path = args.get("checkpoint_path", None)  # caller passes per-batch path
+
+    def _save_ckpt(iter_idx):
+        """Save the latest in-progress model state to ckpt_path. The
+        whole save is a torch.save of a dict including model state,
+        log_var_n, current iter, epoch, and last losses. Atomic via
+        write-to-temp-then-rename so a SIGKILL mid-save doesn't leave
+        a corrupt checkpoint."""
+        if ckpt_path is None:
+            return
+        try:
+            tmp = Path(str(ckpt_path) + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model_state": model.state_dict(),
+                "log_var_n": log_var_n.detach().cpu(),
+                "iter": iter_idx,
+                "epoch": current_epoch,
+                "recon": last_recon,
+                "kl": last_kl,
+                "n_tasks": n_tasks,
+            }, tmp)
+            os.replace(tmp, ckpt_path)  # atomic
+            log.info(
+                f"  [{pbar_desc}] ckpt @ epoch {current_epoch} "
+                f"(it {iter_idx}) → {Path(ckpt_path).name}"
+            )
+        except Exception as ex:
+            # Checkpoint failures shouldn't kill training. Log and continue.
+            log.warning(f"  [{pbar_desc}] ckpt save failed: {ex}")
     with gpytorch.settings.cholesky_jitter(1e-3, 1e-4):
         for it in pbar:
             idx = torch.randperm(n_train, generator=g)[:bs].to(device)
@@ -763,7 +854,7 @@ def train_lipid_batch(
                     f"eta={eta:.0f}s"
                 )
 
-            # ---- epoch boundary log ----------------------------------
+            # ---- epoch boundary log + checkpoint ---------------------
             new_epoch = (it + 1) // iters_per_epoch
             if new_epoch > current_epoch and new_epoch <= int(args["epochs"]):
                 epoch_elapsed = time.time() - epoch_t0
@@ -774,6 +865,10 @@ def train_lipid_batch(
                 )
                 current_epoch = new_epoch
                 epoch_t0 = time.time()
+                # Periodic checkpoint — every N epochs (configurable).
+                # Saves the SAME path each time so disk usage is bounded.
+                if ckpt_every > 0 and current_epoch % ckpt_every == 0:
+                    _save_ckpt(it + 1)
 
             if (it % max(1, n_iters // 30)) == 0:
                 pbar.set_postfix(
@@ -1021,6 +1116,74 @@ def main():
     B = int(args["lipid_batch_size"])
     n_lipids = len(lipid_idx_to_fit)
     n_batches = (n_lipids + B - 1) // B
+
+    # ---- Resume support -------------------------------------------------
+    # On a clean run, both lists below are empty. On a resumed run, we
+    # restore prior metrics rows AND identify which batches have already
+    # produced all of their lipids' .npy predictions on disk; those
+    # batches will be skipped to save GPU time. The skip granularity is
+    # per-batch because a batch is one joint GP fit — half-finished
+    # batches need a re-fit, not a partial salvage.
+    resume_mode = args.get("resume", "auto")
+    predictions_root = out_root / "predictions"
+    resumed_metrics_csv = out_root / "metrics.csv"
+    completed_batches = set()  # indices (into `range(n_batches)`)
+    if resume_mode == "auto":
+        if resumed_metrics_csv.exists():
+            try:
+                prev_df = pd.read_csv(resumed_metrics_csv)
+                # Defensive: older runs may have written metrics.csv
+                # without a 'slug' column. Derive it from lipid_name if
+                # missing so backward compat with prior runs holds.
+                if "slug" not in prev_df.columns:
+                    if "lipid_name" in prev_df.columns:
+                        prev_df["slug"] = prev_df["lipid_name"].apply(
+                            safe_filename)
+                    else:
+                        raise ValueError(
+                            "metrics.csv has neither 'slug' nor "
+                            "'lipid_name' columns; cannot resume."
+                        )
+                # Drop any rows for lipids that aren't fully on disk —
+                # those are stale entries from a crashed batch and will
+                # be re-written when the batch retrains.
+                completed_slugs = {
+                    safe_filename(n) for n in lipid_names_all
+                    if lipid_is_complete(predictions_root, safe_filename(n))
+                }
+                before = len(prev_df)
+                prev_df = prev_df[prev_df["slug"].isin(completed_slugs)]
+                # Keep only the latest row per slug (in case of duplicates
+                # from previous crashed-then-restarted runs).
+                prev_df = prev_df.drop_duplicates(
+                    subset=["slug"], keep="last")
+                metrics_rows = prev_df.to_dict("records")
+                log.info(
+                    f"  resume: restored {len(metrics_rows)}/{before} "
+                    f"valid metric rows from {resumed_metrics_csv.name}"
+                )
+            except Exception as ex:
+                log.warning(
+                    f"  resume: couldn't read existing metrics.csv "
+                    f"({ex}); starting metrics fresh"
+                )
+        for batch_i in range(n_batches):
+            s = batch_i * B
+            e = min(s + B, n_lipids)
+            batch_global_ids = lipid_idx_to_fit[s:e]
+            batch_names = [lipid_names_all[i] for i in batch_global_ids]
+            if all(
+                lipid_is_complete(predictions_root, safe_filename(name))
+                for name in batch_names
+            ):
+                completed_batches.add(batch_i)
+    if completed_batches:
+        log.info(
+            f"  resume: {len(completed_batches)}/{n_batches} batch(es) "
+            f"already complete on disk and will be SKIPPED: "
+            f"{sorted(completed_batches)}"
+        )
+
     log.info("=" * 72)
     log.info(f"Training {n_lipids} lipids in {n_batches} batches of {B} "
              f"(or fewer for the tail).")
@@ -1034,6 +1197,15 @@ def main():
         batch_lipid_local = list(range(s, e))     # indices into y_tr_z columns
         batch_size_actual = len(batch_lipid_local)
         batch_names = [lipid_names_all[i] for i in batch_lipid_global]
+
+        if batch_i in completed_batches:
+            log.info(
+                f"[batch {batch_i+1}/{n_batches}] SKIPPED — already "
+                f"complete on disk ({batch_size_actual} lipids, "
+                f"resume=auto)."
+            )
+            continue
+
         log.info(f"[batch {batch_i+1}/{n_batches}] lipids "
                  f"{batch_lipid_global[0]}..{batch_lipid_global[-1]} "
                  f"({batch_size_actual} tasks)")
@@ -1043,12 +1215,19 @@ def main():
         y_tr_z_batch = y_tr_z[:, batch_lipid_local].to(args["device"]).contiguous()
         y_te_z_batch_np = y_te_z[:, batch_lipid_local].numpy()
 
+        # Per-batch checkpoint path. Single file, overwritten as
+        # training progresses (see _save_ckpt in train_lipid_batch).
+        # Stored under "checkpoints/" so it's separate from final
+        # per-lipid predictions.
+        ckpt_path = out_root / "checkpoints" / f"batch_{batch_i:03d}_inprogress.pt"
+        args_for_batch = dict(args, checkpoint_path=ckpt_path)
+
         t0 = time.time()
         model, log_var_n = train_lipid_batch(
             coords_train=coords_tr_z,
             y_train=y_tr_z_batch,
             inducing_points=inducing_points,
-            args=args,
+            args=args_for_batch,
             manifold_kernel=(manifold_ctx["kernel"]
                              if manifold_ctx is not None else None),
             device=args["device"],
@@ -1136,6 +1315,15 @@ def main():
         pd.DataFrame(metrics_rows).to_csv(
             out_root / "metrics.csv", index=False,
         )
+
+        # The batch is fully complete (.npy files written, metrics
+        # flushed). The in-progress checkpoint is no longer needed —
+        # remove it so we don't accumulate stale checkpoints on S3.
+        try:
+            if ckpt_path.exists():
+                ckpt_path.unlink()
+        except OSError as ex:
+            log.warning(f"  cleanup of {ckpt_path.name} failed: {ex}")
 
         # Free memory before the next batch
         del model, log_var_n, test_mean_z, test_var_z
