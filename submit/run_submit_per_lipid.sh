@@ -43,11 +43,11 @@ GPU=0.5
 # Per-lipid run knobs. EPOCHS=20 is the published default; drop to 5 for
 # quick smoke-tests in the early-sweep phase. LIPID_BATCH_SIZE=10 fits
 # our 10-lipid subset in a single GP fit.
-EPOCHS=20
+EPOCHS=10
 LIPID_BATCH_SIZE=10
 NUM_INDUCING=1000
 LEARNING_RATE=0.005
-BATCH_SIZE=1000
+BATCH_SIZE=2048
 NUM_MODES=1300
 STRIDE=4
 STRIDE_BUMP=20.0   # bump_scale — fixed for this sweep

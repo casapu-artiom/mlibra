@@ -22,11 +22,11 @@
 
 # ---- GP hyperparameters ----
 : "${NU:=2}"
-: "${NUM_INDUCING:=500}"
+: "${NUM_INDUCING:=1000}"
 : "${LIPID_BATCH_SIZE:=10}"
-: "${EPOCHS:=3}"
+: "${EPOCHS:=10}"
 : "${LEARNING_RATE:=0.005}"
-: "${BATCH_SIZE:=4096}"
+: "${BATCH_SIZE:=2048}"
 : "${SEED:=42}"
 
 # ---- subset for fast iteration / debugging -------------------------------
