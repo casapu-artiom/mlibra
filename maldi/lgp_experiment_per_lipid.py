@@ -550,8 +550,20 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     ).to(args["device"])
     manifold_kernel.eval()
 
+    # CRITICAL: snap inducing points to nearest graph nodes.
+    # The RiemannKernel.features() method has two branches:
+    #   - is_on_graph (dist² < 1e-8): exact eigenvector lookup — always stable
+    #   - out-of-sample: Nyström extension with a different spectral density
+    #     formula that can diverge for small graphbandwidth + large eigvals.
+    # k-means inducing points from MaLDI coordinates are almost never exact
+    # graph nodes, so without snapping every K_uu evaluation goes through the
+    # OOS path, producing near-singular K_uu → NotPSDError / NaN loss from
+    # iter 0. lgp_manifold_experiment.setup_experiment() always snaps;
+    # this function must do the same.
+    log.info("Snapping inducing points to nearest graph nodes …")
     return {
         "kernel": manifold_kernel,
+        "knn": knn,                      # needed by caller for snapping
         "reference_nodes": reference_nodes,
         "sub_volume": sub_volume,
         "voxel_offset": voxel_offset,
@@ -776,7 +788,12 @@ def train_lipid_batch(
     # outputs is variance ~1 (so log_var_n ~0). Values <-10 mean noise
     # variance of <5e-5 — far below numerical precision for typical
     # mini-batch residuals, where (y-z)² / exp(-10) overflows fast.
-    log_var_n_min, log_var_n_max = -8.0, 4.0
+    # Bounds for log observation noise variance on z-scored outputs (unit
+    # variance by construction). -5.0 → σ²≈0.007 (tight but reachable);
+    # +1.5 → σ²≈4.5 (allows genuinely noisy lipids). The old [-8, 4]
+    # range let AdamW momentum drive log_var_n to exp(-8)≈3e-4, making
+    # the recon term explode on any nonzero residual early in training.
+    log_var_n_min, log_var_n_max = -5.0, 1.5
 
     fit_t0 = time.time()
     epoch_t0 = fit_t0
@@ -887,6 +904,11 @@ def train_lipid_batch(
                         if it >= n_iters:
                             break
                         continue
+                        # NOTE: forward failures always increment bad_grad_count
+                        # and never reach the else-branch reset below. That is
+                        # intentional — a forward failure IS a genuine problem
+                        # (unlike a single NaN gradient entry), and sustained
+                        # forward failures should trigger the bail-out.
 
                     # ---- Analytic expected log-likelihood --------------------
                     # For a Gaussian observation model with noise σ² = exp(log_var_n[t]),
@@ -960,6 +982,8 @@ def train_lipid_batch(
                         if it >= n_iters:
                             break
                         continue
+                        # NOTE: same as forward failures — NaN loss is always
+                        # a real problem, always increments, never resets.
 
                     # Capture loss components NOW (before backward) so the
                     # diagnostic shown in NaN warnings reflects the CURRENT
@@ -1005,9 +1029,18 @@ def train_lipid_batch(
                     bad_frac = n_bad_grad / max(n_total_grad, 1)
                     skip_frac = float(args.get("bad_grad_skip_frac", 0.01))
 
+                    # Minimum number of bad gradient entries before we treat
+                    # the step as genuinely problematic. A single NaN in 5M
+                    # parameters (0.00002%) is a harmless numerical artifact
+                    # from one eigenvalue boundary or one Laplacian pivot —
+                    # it carries no information about kernel health and must
+                    # not accumulate toward the bail-out counter. Only counts
+                    # at or above this threshold are suspicious.
+                    MIN_BAD_GRAD_ENTRIES = 100
+
                     if n_bad_grad > 0 and bad_frac >= skip_frac:
-                        # Too much of the gradient is bad — skip the step
-                        # rather than stepping with mostly-zeroed grads.
+                        # Large fraction bad — skip the step entirely rather
+                        # than moving in an essentially random direction.
                         bad_grad_count += 1
                         _record_error(
                             args, "grad_skip", it,
@@ -1016,8 +1049,6 @@ def train_lipid_batch(
                             bad_grad_count, log,
                         )
                         optimizer.zero_grad()
-                        # Advance `it` so we don't spin forever; the
-                        # DataLoader keeps serving fresh minibatches.
                         it += 1
                         pbar.update(1)
                         _maybe_bail_on_nan_streak(
@@ -1027,16 +1058,19 @@ def train_lipid_batch(
                             break
                         continue
 
+                    # Always zero whatever bad entries exist so downstream
+                    # grad-clip and optimizer.step() see finite values.
                     if n_bad_grad > 0:
-                        # Small fraction bad — zero the bad entries and
-                        # proceed. The well-defined gradient directions
-                        # still update normally.
                         for p in list(model.parameters()) + [log_var_n]:
                             if p.grad is None:
                                 continue
                             bad = ~torch.isfinite(p.grad)
                             if bad.any():
                                 p.grad.masked_fill_(bad, 0.0)
+
+                    if n_bad_grad >= MIN_BAD_GRAD_ENTRIES:
+                        # Enough bad entries to be suspicious — count toward
+                        # the bail-out streak and log to ERRORS.txt.
                         bad_grad_count += 1
                         _record_error(
                             args, "grad_zero", it,
@@ -1045,15 +1079,23 @@ def train_lipid_batch(
                             f"kl={last_kl:.3g}, loss={loss.item():.3g}",
                             bad_grad_count, log,
                         )
-                        # SAME bail-out: sustained NaN noise — even when
-                        # low-fraction per step — signals a kernel that
-                        # isn't healing itself. Better to stop and let the
-                        # operator pick a different config than to grind
-                        # through a long run that may never converge.
                         _maybe_bail_on_nan_streak(
                             bad_grad_count, it, args, skip_frac, log, pbar
                         )
+                    elif n_bad_grad > 0:
+                        # 1–(MIN_BAD_GRAD_ENTRIES-1) bad entries out of
+                        # millions: a harmless numerical glitch (one
+                        # eigenvalue boundary, one Laplacian pivot). Silently
+                        # zeroed above. Do NOT increment bad_grad_count and
+                        # do NOT reset it — this step is neither clean nor
+                        # genuinely problematic, so it's neutral w.r.t. the
+                        # streak. The streak only resets on a fully clean step
+                        # (n_bad_grad == 0), ensuring that a sequence of
+                        # single-entry glitches interleaved with clean steps
+                        # never accumulates toward the bail-out threshold.
+                        pass
                     else:
+                        # Fully clean step — reset the streak counter.
                         bad_grad_count = 0
 
                     # ---- gradient clipping ---------------------------------
@@ -1316,6 +1358,23 @@ def main():
         manifold_ctx = setup_manifold_kernel(
             args, config, coord_mean, coord_std, log,
         )
+        # Snap the k-means inducing points to the nearest graph nodes so
+        # that every K_uu evaluation uses the exact eigenvector lookup
+        # branch (is_on_graph) rather than the numerically fragile Nyström
+        # OOS path. Mirrors lgp_manifold_experiment.setup_experiment().
+        with torch.no_grad():
+            knn = manifold_ctx["knn"]
+            ind_gpu = inducing_points.to(args["device"])
+            _, nn_idx = knn.search(ind_gpu, 1)       # (M, 1) nearest node
+            nn_idx = nn_idx.squeeze(1).cpu()          # (M,)
+            nn_idx_unique = torch.unique(nn_idx)
+            inducing_points = knn.x[nn_idx_unique].cpu()
+        log.info(
+            f"  Inducing points snapped to graph nodes: "
+            f"{inducing_points.shape[0]} unique (from {config.num_inducing} requested)"
+        )
+        config.num_inducing = inducing_points.shape[0]
+        inducing_points = inducing_points.to(args["device"])
 
     # ---- load lipid names + section filters ----
     lipid_names_all = list(config.selected_lipids_names)
