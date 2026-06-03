@@ -575,7 +575,7 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
 # =============================================================================
 # Per-lipid-batch trainer (the actual GP fit)
 # =============================================================================
-def _record_error(args, kind, it, detail, streak, log):
+def _record_error(config, kind, it, detail, streak, log):
     """Append an error event to ERRORS.txt and throttle console output.
 
     Per-iter logging would flood the cluster log when failures happen
@@ -596,7 +596,7 @@ def _record_error(args, kind, it, detail, streak, log):
         f"{time.strftime('%Y-%m-%d %H:%M:%S')}  it={it:>6d}  "
         f"kind={kind:<10s}  streak={streak:>4d}  {detail}\n"
     )
-    out_root = Path(args["output_dir"]) / args["exp_name"]
+    out_root = config.exp_path
     errors_path = out_root / "ERRORS.txt"
     try:
         with open(errors_path, "a") as f:
@@ -646,6 +646,7 @@ def train_lipid_batch(
     coords_train: torch.Tensor,   # (N, 3) on device, already z-scored
     y_train: torch.Tensor,        # (N, B)   B = lipid batch size
     inducing_points: torch.Tensor,
+    config: MaldiConfig,
     args: dict,
     manifold_kernel=None,         # if None → Euclidean path
     device: str,
@@ -690,12 +691,12 @@ def train_lipid_batch(
         # Euclidean — same as run_final.sh's setup.
         voxel_size = 0.025
         # Equivalent to lgp_experiment.minimal_length_scale
-        minimal_length_scale = args["n_pixels"] * voxel_size / 3.0
+        minimal_length_scale = config.n_pixels * voxel_size / 3.0
         model = IndependentMultitaskGPModel(
             inducing_points=inducing_points,
             num_tasks=n_tasks,
-            kernel_type=args["kernel"],
-            nu=args["nu"],
+            kernel_type=config.kernel,
+            nu=config.nu,
             minimal_length_scale=minimal_length_scale,
             input_dim=3,
         ).to(device)
@@ -713,14 +714,14 @@ def train_lipid_batch(
     model.train()
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + [log_var_n],
-        lr=args["learning_rate"], weight_decay=1e-3,
+        lr=config.learning_rate, weight_decay=1e-3,
     )
 
-    bs = min(int(args["batch_size"]), n_train)
+    bs = min(int(config.batch_size), n_train)
     # iters_per_epoch matches DataLoader(drop_last=True) — partial final
     # minibatch is skipped so each epoch has a stable iter count.
     iters_per_epoch = max(1, n_train // bs)
-    n_iters = int(args["epochs"]) * iters_per_epoch
+    n_iters = int(config.epochs) * iters_per_epoch
 
     # Log frequency for cluster runs — write a line every ~5% of training
     # so cluster job logs show progress even when the tqdm bar is hidden.
@@ -1292,12 +1293,13 @@ def main():
     )
     log = logging.getLogger("per_lipid_gp")
     args = parse_args()
+    config = MaldiConfig.from_args(args)
 
     torch.manual_seed(args["seed"])
     np.random.seed(args["seed"])
 
     # ---- output directory ----
-    out_root = Path(args["output_dir"]) / args["exp_name"]
+    out_root = config.exp_path
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / "predictions").mkdir(exist_ok=True)
     (out_root / "checkpoints").mkdir(exist_ok=True)
@@ -1324,13 +1326,12 @@ def main():
     with open(out_root / "config.json", "w") as f:
         json.dump(args, f, indent=2, default=str)
     log.info("=" * 72)
-    log.info(f"Per-lipid GP experiment — {args['exp_name']}")
+    log.info(f"Per-lipid GP experiment — {config.exp_name}")
     log.info(f"  kernel family : {args['kernel_family']}")
     log.info(f"  output_dir    : {out_root}")
     log.info("=" * 72)
 
     # ---- config / inducing points (same as lgp_*_experiment.py) ----
-    config = MaldiConfig.from_args(args)
     region_bbox = args.get("region_bbox")
     apply_region_to_config(config, region_bbox)
 
@@ -1613,6 +1614,7 @@ def main():
                 coords_train=coords_tr_z,
                 y_train=y_tr_z_batch,
                 inducing_points=inducing_points,
+                config=config,
                 args=args_for_batch,
                 manifold_kernel=(manifold_ctx["kernel"]
                                  if manifold_ctx is not None else None),
