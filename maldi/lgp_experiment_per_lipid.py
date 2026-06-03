@@ -203,14 +203,6 @@ def parse_args() -> dict:
     p.add_argument("--limit", type=int, default=None,
                    help="Cap on number of lipids processed (applied "
                         "after --lipids/--lipids-file filtering).")
-    p.add_argument("--nan-action", choices=["raise", "skip"], default="raise",
-                   help=("What to do when the training loss becomes "
-                         "NaN. 'raise' (default) early-stops with a "
-                         "detailed diagnostic — best for debugging. "
-                         "'skip' drops the bad batch and continues "
-                         "training; useful when only occasional "
-                         "batches go bad (e.g. an unlucky mini-batch "
-                         "lands on a degenerate region of the kernel)."))
     p.add_argument("--resume", choices=["auto", "force"], default="auto",
                    help=("Checkpoint behaviour. 'auto' (default): if the "
                          "output dir already has complete .npy "
@@ -263,6 +255,19 @@ def parse_args() -> dict:
                          "higher (e.g. 0.1) to tolerate more zeroing; "
                          "set lower (e.g. 0.001) to skip more "
                          "aggressively."))
+    p.add_argument("--max-consecutive-bad-grads", type=int, default=1000,
+                   help=("Bail-out threshold: if this many consecutive "
+                         "training steps had ANY NaN/Inf gradient "
+                         "entries (regardless of whether we zeroed or "
+                         "skipped), raise RuntimeError and abort the "
+                         "whole pipeline. Sustained NaN noise — even "
+                         "at low per-step fractions — signals a kernel "
+                         "configuration that isn't healing itself; "
+                         "better to stop and let the operator pick a "
+                         "different config than to grind through a "
+                         "long run that may never converge. The "
+                         "counter resets on the first fully-clean "
+                         "step, so a single recovery clears it."))
     p.add_argument("--region-bbox", type=int, nargs=6, default=None,
                    metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"))
 
@@ -558,6 +563,72 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
 # =============================================================================
 # Per-lipid-batch trainer (the actual GP fit)
 # =============================================================================
+def _record_error(args, kind, it, detail, streak, log):
+    """Append an error event to ERRORS.txt and throttle console output.
+
+    Per-iter logging would flood the cluster log when failures happen
+    in bursts (e.g. a thousand "grad_zero" warnings in a row). We
+    instead:
+      - ALWAYS append every event to ``ERRORS.txt`` (one line per event,
+        with timestamp + iter + streak + detail). The file is the
+        complete record for forensic analysis after the run.
+      - ECHO to console only periodically: the first 3 of any streak,
+        then one per 100. Enough to see "something is going wrong" in
+        real-time without obscuring the actual training progress.
+
+    The ERRORS.txt path is derived from args["output_dir"]/exp_name —
+    the same out_root used for everything else. Failures during the
+    append (e.g. S3 hiccup) are non-fatal; we silently keep training.
+    """
+    line = (
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')}  it={it:>6d}  "
+        f"kind={kind:<10s}  streak={streak:>4d}  {detail}\n"
+    )
+    out_root = Path(args["output_dir"]) / args["exp_name"]
+    errors_path = out_root / "ERRORS.txt"
+    try:
+        with open(errors_path, "a") as f:
+            f.write(line)
+    except OSError:
+        pass  # don't kill training over a log-write failure
+    if streak <= 3 or streak % 100 == 0:
+        log.warning(f"[it {it}] {kind} streak={streak}: {detail}")
+
+
+def _maybe_bail_on_nan_streak(streak, it, args, skip_frac, log, pbar):
+    """Raise RuntimeError if NaN gradients have persisted too long.
+
+    Called from both branches of the NaN handler (skip-step and
+    zero-and-step) so a sustained streak triggers a bail-out regardless
+    of which branch is firing. The threshold is the same in both cases
+    because the underlying signal — "kernel keeps producing NaN
+    gradients" — is the same; whether we skip or zero only affects per-
+    step recovery, not whether we should keep trying long-term.
+
+    The streak is reset to 0 on the first clean step (no NaN at all),
+    so a single recovery clears the alarm.
+    """
+    cap = int(args.get("max_consecutive_bad_grads", 1000))
+    if streak < cap:
+        return
+    pbar.close()
+    raise RuntimeError(
+        f"{streak} consecutive steps with NaN/Inf gradients at "
+        f"iter {it}. The model has diverged or is stuck in a "
+        f"numerically singular region. Common fixes:\n"
+        f"  • smaller --learning-rate (currently "
+        f"{args['learning_rate']})\n"
+        f"  • smaller --grad-clip (currently "
+        f"{args.get('grad_clip', 10.0)}; try 1.0)\n"
+        f"  • smaller --bump-scale on the manifold kernel\n"
+        f"  • larger gpytorch cholesky_jitter\n"
+        f"  • change --knn-method (try faiss_atlas_weighted with "
+        f"smaller --cross-region-inflation)\n"
+        f"  • raise --max-consecutive-bad-grads if you want the "
+        f"alarm later (currently {cap})"
+    )
+
+
 def train_lipid_batch(
     *,
     coords_train: torch.Tensor,   # (N, 3) on device, already z-scored
@@ -701,10 +772,6 @@ def train_lipid_batch(
                 desc=pbar_desc, leave=False, dynamic_ncols=True)
     last_recon = float("nan")
     last_kl = float("nan")
-    # Optional config knobs (read once outside the loop for speed):
-    # nan_action: "raise" (default — early stop with diagnostic),
-    #             "skip"  (zero grads, don't step, continue training)
-    nan_action = args.get("nan_action", "raise")
     # Clamp log_var_n to a sane range. The natural scale for z-scored
     # outputs is variance ~1 (so log_var_n ~0). Values <-10 mean noise
     # variance of <5e-5 — far below numerical precision for typical
@@ -775,330 +842,337 @@ def train_lipid_batch(
         # from its first minibatch — that's a minor inaccuracy vs the
         # exact crash point, but acceptable for a 5-epoch save cadence.
         start_epoch = iter_start // iters_per_epoch
-        for epoch_idx in range(start_epoch, int(args["epochs"])):
-            for x_b_cpu, y_b_cpu in train_loader:
-                if it >= n_iters:
-                    break
-                # Async H→D copy (works because the loader pinned the
-                # tensors). The GPU op queue serialises this against the
-                # subsequent model(x_b) so we don't need explicit sync.
-                x_b = x_b_cpu.to(device, non_blocking=True)
-                y_b = y_b_cpu.to(device, non_blocking=True)
-                optimizer.zero_grad()
-                gp_posterior = model(x_b)
-
-                # ---- Analytic expected log-likelihood --------------------
-                # For a Gaussian observation model with noise σ² = exp(log_var_n[t]),
-                # the expected log-lik under q(f|x) has a closed form that
-                # does NOT need samples:
-                #
-                #   E_q[(y - f)²]      = (y - E_q[f])² + Var_q[f]
-                #                      = (y - mean)²  + variance
-                #
-                #   E_q[-log p(y|f)]   = 0.5 * [ ((y-mean)² + variance) / σ²
-                #                                 + log(2π σ²) ]
-                #
-                # Dropping the y-independent 0.5 * log(2π) (constant, no
-                # gradient) leaves us with the LGP-style nll_loss but
-                # with `var` taking the place of the MC noise from a
-                # single rsample. This is *exact* for the expectation,
-                # not an estimator — gradients have zero MC variance.
-                # The LGP framework can't use this because its MLP
-                # decoder breaks the closed form; we can because we go
-                # straight from GP to Gaussian loss.
-                #
-                # gp_posterior is MultitaskMVN with shape (bs, n_tasks).
-                # .mean and .variance are both (bs, n_tasks). .variance
-                # extracts ONLY the diagonal of the posterior covariance,
-                # which avoids the full Cholesky that rsample requires
-                # — that's where the per-iter speedup comes from.
-                mean_f = gp_posterior.mean
-                var_f = gp_posterior.variance.clamp(min=0)
-                inv_sigma2 = torch.exp(-log_var_n).unsqueeze(0)  # (1, n_tasks)
-                recon = 0.5 * torch.sum(
-                    ((y_b - mean_f).pow(2) + var_f) * inv_sigma2
-                    + log_var_n.unsqueeze(0)
-                )
-
-                # ---- KL from the variational strategy ----
-                kl = model.variational_strategy.kl_divergence().sum()
-
-                # ELBO upweighting: the recon was summed over a mini-batch of
-                # bs points, but the KL is exact (total over all data). To
-                # keep the gradient unbiased w.r.t. the full-data ELBO, we
-                # rescale either the KL down by bs/n_train or scale recon up
-                # by n_train/bs. The LGP scripts use the latter implicitly
-                # by accumulating recon across all batches in an epoch and
-                # adding the KL once per batch — we just inline the
-                # equivalent: minimize (n_train/bs) * recon + kl.
-                loss = (n_train / bs) * recon + kl
-
-                # ---- NaN handling: attribute the failure precisely ----
-                if not torch.isfinite(loss):
-                    # Decompose to figure out WHICH piece is bad. With the
-                    # analytic loss we now check mean/var directly instead
-                    # of sample z (which no longer exists).
-                    m_nan = int(torch.isnan(mean_f).sum().item())
-                    m_inf = int(torch.isinf(mean_f).sum().item())
-                    v_nan = int(torch.isnan(var_f).sum().item())
-                    v_inf = int(torch.isinf(var_f).sum().item())
-                    y_nan = int(torch.isnan(y_b).sum().item())
-                    lvn = log_var_n.detach()
-                    resid = (y_b - mean_f).pow(2)
-                    resid_max = (
-                        float(resid[torch.isfinite(resid)].max().item())
-                        if torch.isfinite(resid).any() else float("inf")
-                    )
-                    lvn_min = float(lvn.min().item())
-                    lvn_max = float(lvn.max().item())
-                    exp_min = float(torch.exp(lvn).min().item())
-                    # Identify the culprit category
-                    culprits = []
-                    if m_nan or m_inf:
-                        culprits.append(
-                            f"posterior mean has {m_nan} NaN + "
-                            f"{m_inf} Inf — variational mean blew up "
-                            f"(likely kernel ill-conditioned)"
-                        )
-                    if v_nan or v_inf:
-                        culprits.append(
-                            f"posterior variance has {v_nan} NaN + "
-                            f"{v_inf} Inf — Cholesky of K_uu failed "
-                            f"(kernel ill-conditioned)"
-                        )
-                    if y_nan:
-                        culprits.append(
-                            f"input y had {y_nan} NaN — check parquet for "
-                            f"missing values in selected lipid columns"
-                        )
-                    if lvn_min < log_var_n_min:
-                        culprits.append(
-                            f"log_var_n drifted to {lvn_min:.2f} "
-                            f"(exp = {exp_min:.2e}); noise term exploding"
-                        )
-                    # Check kernel parameters for NaN too
-                    bad_params = []
-                    for name, p in model.named_parameters():
-                        if not torch.isfinite(p).all():
-                            bad_params.append(name)
-                    if bad_params:
-                        culprits.append(
-                            f"model parameter(s) became non-finite: "
-                            f"{bad_params[:5]}"
-                            + ("..." if len(bad_params) > 5 else "")
-                        )
-                    if not culprits:
-                        culprits.append(
-                            f"no obvious cause — recon={recon.item():.3g}, "
-                            f"kl={kl.item():.3g}, max residual²={resid_max:.3g}"
-                        )
-
-                    msg = (
-                        f"Training loss became {loss.item()} at iter {it}/"
-                        f"{n_iters}.\n"
-                        f"  recon = {recon.item()}, kl = {kl.item():.3g}\n"
-                        f"  log_var_n: min={lvn_min:.2f}, max={lvn_max:.2f}\n"
-                        f"  max (y-z)² before /exp(log_var) = {resid_max:.3g}\n"
-                        f"Likely cause(s):\n"
-                    )
-                    for c in culprits:
-                        msg += f"  • {c}\n"
-
-                    if nan_action == "raise":
-                        pbar.close()
-                        raise RuntimeError(
-                            msg
-                            + "Try: (a) lower --learning-rate (you have "
-                            + f"{args['learning_rate']}); (b) larger "
-                            + "cholesky_jitter; (c) smaller --bump-scale or "
-                            + "different --knn-method; (d) rerun with "
-                            + "nan_action='skip' to skip bad batches and "
-                            + "keep training."
-                        )
-                    # nan_action == "skip": don't step on this batch
-                    log.warning(f"[it {it}] {msg.splitlines()[0]} — skipping batch")
-                    optimizer.zero_grad()
-                    # Advance `it` so we don't get stuck on the same
-                    # minibatch counter forever (the DataLoader keeps
-                    # serving fresh minibatches regardless).
-                    it += 1
-                    pbar.update(1)
+        try:
+            for epoch_idx in range(start_epoch, int(args["epochs"])):
+                for x_b_cpu, y_b_cpu in train_loader:
                     if it >= n_iters:
                         break
-                    continue
+                    # Async H→D copy (works because the loader pinned the
+                    # tensors). The GPU op queue serialises this against the
+                    # subsequent model(x_b) so we don't need explicit sync.
+                    x_b = x_b_cpu.to(device, non_blocking=True)
+                    y_b = y_b_cpu.to(device, non_blocking=True)
+                    optimizer.zero_grad()
 
-                loss.backward()
+                    # ---- forward + post-hoc NaN check -------------------------
+                    # Two failure modes during the GP forward:
+                    #   (a) gpytorch raises NotPSDError when K_uu Cholesky
+                    #       gives up after the jitter ladder is exhausted.
+                    #   (b) Cholesky numerically "succeeds" but produces NaN
+                    #       in the output because the matrix was so
+                    #       ill-conditioned that floating-point ops broke.
+                    # Both are handled identically: skip the iter, log to
+                    # ERRORS.txt, count toward the bail-out streak. No
+                    # in-iter recovery (extra-jitter retry) — keeps the
+                    # logic and gradient semantics simple.
+                    fwd_failure = None
+                    try:
+                        gp_posterior = model(x_b)
+                        if (not torch.isfinite(gp_posterior.mean).all() or
+                                not torch.isfinite(gp_posterior.variance).all()):
+                            fwd_failure = "nan_posterior"
+                    except gpytorch.utils.errors.NotPSDError as ex:
+                        fwd_failure = f"NotPSDError"
 
-                # ---- NaN-to-zero gradient sanitization with skip safety -
-                # Backward through the manifold kernel's Cholesky can
-                # produce NaN/Inf in a SUBSET of parameter gradients —
-                # typically variational covariance entries near a
-                # singular eigenmode of K_uu. We have two modes:
-                #
-                #   (a) Small fraction bad (<bad_grad_skip_frac): zero
-                #       the offending entries and step normally. The
-                #       remaining finite gradient direction is still
-                #       informative, just missing a few components.
-                #
-                #   (b) Large fraction bad (>=bad_grad_skip_frac): skip
-                #       the step entirely. Stepping with mostly-zeroed
-                #       gradients means moving in an essentially random
-                #       direction, which can push the model further into
-                #       the singular regime.
-                #
-                # Default threshold 1% — small enough that occasional
-                # numerical hiccups don't block training, big enough
-                # that a genuinely diverged step gets caught.
-                n_bad_grad = 0
-                n_total_grad = 0
-                for p in list(model.parameters()) + [log_var_n]:
-                    if p.grad is None:
+                    if fwd_failure is not None:
+                        bad_grad_count += 1
+                        _record_error(args, "forward", it, fwd_failure,
+                                      bad_grad_count, log)
+                        optimizer.zero_grad()
+                        it += 1
+                        pbar.update(1)
+                        _maybe_bail_on_nan_streak(
+                            bad_grad_count, it, args, skip_frac, log, pbar
+                        )
+                        if it >= n_iters:
+                            break
                         continue
-                    n_total_grad += p.grad.numel()
-                    bad = ~torch.isfinite(p.grad)
-                    if bad.any():
-                        n_bad_grad += int(bad.sum().item())
 
-                bad_frac = n_bad_grad / max(n_total_grad, 1)
-                skip_frac = float(args.get("bad_grad_skip_frac", 0.01))
+                    # ---- Analytic expected log-likelihood --------------------
+                    # For a Gaussian observation model with noise σ² = exp(log_var_n[t]),
+                    # the expected log-lik under q(f|x) has a closed form that
+                    # does NOT need samples:
+                    #
+                    #   E_q[(y - f)²]      = (y - E_q[f])² + Var_q[f]
+                    #                      = (y - mean)²  + variance
+                    #
+                    #   E_q[-log p(y|f)]   = 0.5 * [ ((y-mean)² + variance) / σ²
+                    #                                 + log(2π σ²) ]
+                    #
+                    # Dropping the y-independent 0.5 * log(2π) (constant, no
+                    # gradient) leaves us with the LGP-style nll_loss but
+                    # with `var` taking the place of the MC noise from a
+                    # single rsample. This is *exact* for the expectation,
+                    # not an estimator — gradients have zero MC variance.
+                    # The LGP framework can't use this because its MLP
+                    # decoder breaks the closed form; we can because we go
+                    # straight from GP to Gaussian loss.
+                    #
+                    # gp_posterior is MultitaskMVN with shape (bs, n_tasks).
+                    # .mean and .variance are both (bs, n_tasks). .variance
+                    # extracts ONLY the diagonal of the posterior covariance,
+                    # which avoids the full Cholesky that rsample requires
+                    # — that's where the per-iter speedup comes from.
+                    mean_f = gp_posterior.mean
+                    var_f = gp_posterior.variance.clamp(min=0)
+                    inv_sigma2 = torch.exp(-log_var_n).unsqueeze(0)  # (1, n_tasks)
+                    recon = 0.5 * torch.sum(
+                        ((y_b - mean_f).pow(2) + var_f) * inv_sigma2
+                        + log_var_n.unsqueeze(0)
+                    )
 
-                if n_bad_grad > 0 and bad_frac >= skip_frac:
-                    # Too much of the gradient is bad — skip the step
-                    # rather than stepping with mostly-zeroed grads.
-                    bad_grad_count += 1
-                    if bad_grad_count <= 3 or bad_grad_count % 100 == 0:
-                        log.warning(
-                            f"[it {it}] {n_bad_grad}/{n_total_grad} "
-                            f"({100*bad_frac:.1f}%) gradient entries "
-                            f"are NaN/Inf — SKIPPING step "
-                            f"(loss={loss.item():.3g}, "
-                            f"consecutive_skips={bad_grad_count})"
+                    # ---- KL from the variational strategy ----
+                    kl = model.variational_strategy.kl_divergence().sum()
+
+                    # ELBO upweighting: the recon was summed over a mini-batch of
+                    # bs points, but the KL is exact (total over all data). To
+                    # keep the gradient unbiased w.r.t. the full-data ELBO, we
+                    # rescale either the KL down by bs/n_train or scale recon up
+                    # by n_train/bs. The LGP scripts use the latter implicitly
+                    # by accumulating recon across all batches in an epoch and
+                    # adding the KL once per batch — we just inline the
+                    # equivalent: minimize (n_train/bs) * recon + kl.
+                    loss = (n_train / bs) * recon + kl
+
+                    # ---- Loss-NaN: treat same as any forward failure ----
+                    # The forward + posterior-NaN check upstream already
+                    # catches most kernel ill-conditioning. A NaN here is
+                    # rarer — usually log_var_n drift or KL overflow. Route
+                    # it through the same bad-grad streak counter so it
+                    # contributes to the bail-out logic uniformly.
+                    if not torch.isfinite(loss):
+                        bad_grad_count += 1
+                        _record_error(
+                            args, "loss_nan", it,
+                            f"loss={loss.item()}, "
+                            f"recon={recon.item():.3g}, "
+                            f"kl={kl.item():.3g}, "
+                            f"lvn=[{float(log_var_n.min().item()):.2f},"
+                            f"{float(log_var_n.max().item()):.2f}]",
+                            bad_grad_count, log,
                         )
-                    optimizer.zero_grad()
-                    # Advance `it` so we don't spin forever; the
-                    # DataLoader keeps serving fresh minibatches.
-                    it += 1
-                    pbar.update(1)
-                    if bad_grad_count >= 200:
-                        pbar.close()
-                        raise RuntimeError(
-                            f"200+ consecutive steps with "
-                            f">={100*skip_frac:.1f}% bad gradients at "
-                            f"iter {it}. The model has diverged. "
-                            f"Common fixes:\n"
-                            f"  • smaller --learning-rate (currently "
-                            f"{args['learning_rate']})\n"
-                            f"  • smaller --grad-clip (currently "
-                            f"{args.get('grad_clip', 10.0)}; try 1.0)\n"
-                            f"  • smaller --bump-scale on the manifold "
-                            f"kernel\n"
-                            f"  • larger gpytorch cholesky_jitter\n"
-                            f"  • larger --bad-grad-skip-frac if you "
-                            f"want to tolerate more zeroing (currently "
-                            f"{skip_frac})"
+                        optimizer.zero_grad()
+                        it += 1
+                        pbar.update(1)
+                        _maybe_bail_on_nan_streak(
+                            bad_grad_count, it, args, skip_frac, log, pbar
                         )
-                    if it >= n_iters:
-                        break
-                    continue
+                        if it >= n_iters:
+                            break
+                        continue
 
-                if n_bad_grad > 0:
-                    # Small fraction bad — zero the bad entries and
-                    # proceed. The well-defined gradient directions
-                    # still update normally.
+                    # Capture loss components NOW (before backward) so the
+                    # diagnostic shown in NaN warnings reflects the CURRENT
+                    # iter, not the last clean-grad iter. Without this,
+                    # warnings keep showing stale `recon=6.64e+04` from
+                    # iter 1 even after recon has dropped 20×, making the
+                    # logs look like nothing is happening.
+                    last_recon = float(recon.detach().item())
+                    last_kl = float(kl.detach().item())
+
+                    loss.backward()
+
+                    # ---- NaN-to-zero gradient sanitization with skip safety -
+                    # Backward through the manifold kernel's Cholesky can
+                    # produce NaN/Inf in a SUBSET of parameter gradients —
+                    # typically variational covariance entries near a
+                    # singular eigenmode of K_uu. We have two modes:
+                    #
+                    #   (a) Small fraction bad (<bad_grad_skip_frac): zero
+                    #       the offending entries and step normally. The
+                    #       remaining finite gradient direction is still
+                    #       informative, just missing a few components.
+                    #
+                    #   (b) Large fraction bad (>=bad_grad_skip_frac): skip
+                    #       the step entirely. Stepping with mostly-zeroed
+                    #       gradients means moving in an essentially random
+                    #       direction, which can push the model further into
+                    #       the singular regime.
+                    #
+                    # Default threshold 1% — small enough that occasional
+                    # numerical hiccups don't block training, big enough
+                    # that a genuinely diverged step gets caught.
+                    n_bad_grad = 0
+                    n_total_grad = 0
                     for p in list(model.parameters()) + [log_var_n]:
                         if p.grad is None:
                             continue
+                        n_total_grad += p.grad.numel()
                         bad = ~torch.isfinite(p.grad)
                         if bad.any():
-                            p.grad.masked_fill_(bad, 0.0)
-                    bad_grad_count += 1
-                    if bad_grad_count <= 3 or bad_grad_count % 100 == 0:
-                        log.warning(
-                            f"[it {it}] {n_bad_grad}/{n_total_grad} "
-                            f"({100*bad_frac:.2f}%) gradient entries "
-                            f"zeroed (loss={loss.item():.3g}, "
-                            f"consecutive_with_nan={bad_grad_count})"
+                            n_bad_grad += int(bad.sum().item())
+
+                    bad_frac = n_bad_grad / max(n_total_grad, 1)
+                    skip_frac = float(args.get("bad_grad_skip_frac", 0.01))
+
+                    if n_bad_grad > 0 and bad_frac >= skip_frac:
+                        # Too much of the gradient is bad — skip the step
+                        # rather than stepping with mostly-zeroed grads.
+                        bad_grad_count += 1
+                        _record_error(
+                            args, "grad_skip", it,
+                            f"{n_bad_grad}/{n_total_grad} ({100*bad_frac:.2f}%) "
+                            f"grad entries NaN/Inf, loss={loss.item():.3g}",
+                            bad_grad_count, log,
                         )
-                else:
-                    bad_grad_count = 0
+                        optimizer.zero_grad()
+                        # Advance `it` so we don't spin forever; the
+                        # DataLoader keeps serving fresh minibatches.
+                        it += 1
+                        pbar.update(1)
+                        _maybe_bail_on_nan_streak(
+                            bad_grad_count, it, args, skip_frac, log, pbar
+                        )
+                        if it >= n_iters:
+                            break
+                        continue
 
-                # ---- gradient clipping ---------------------------------
-                # After NaN sanitization, gradients are finite — clipping
-                # caps any remaining large-but-finite values. Helps with
-                # the analytic ELBO's large gradients at init.
-                grad_clip = float(args.get("grad_clip", 10.0))
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + [log_var_n],
-                    max_norm=grad_clip,
-                )
+                    if n_bad_grad > 0:
+                        # Small fraction bad — zero the bad entries and
+                        # proceed. The well-defined gradient directions
+                        # still update normally.
+                        for p in list(model.parameters()) + [log_var_n]:
+                            if p.grad is None:
+                                continue
+                            bad = ~torch.isfinite(p.grad)
+                            if bad.any():
+                                p.grad.masked_fill_(bad, 0.0)
+                        bad_grad_count += 1
+                        _record_error(
+                            args, "grad_zero", it,
+                            f"{n_bad_grad}/{n_total_grad} ({100*bad_frac:.3f}%) "
+                            f"grad entries zeroed, recon={last_recon:.3g}, "
+                            f"kl={last_kl:.3g}, loss={loss.item():.3g}",
+                            bad_grad_count, log,
+                        )
+                        # SAME bail-out: sustained NaN noise — even when
+                        # low-fraction per step — signals a kernel that
+                        # isn't healing itself. Better to stop and let the
+                        # operator pick a different config than to grind
+                        # through a long run that may never converge.
+                        _maybe_bail_on_nan_streak(
+                            bad_grad_count, it, args, skip_frac, log, pbar
+                        )
+                    else:
+                        bad_grad_count = 0
 
-                optimizer.step()
-                # Clamp log_var_n back into a sane range so the noise term
-                # can't explode/underflow. Done after the step so AdamW's
-                # update can move freely, then we project.
-                with torch.no_grad():
-                    log_var_n.clamp_(log_var_n_min, log_var_n_max)
-
-                last_recon = float(recon.detach().item())
-                last_kl = float(kl.detach().item())
-
-                # ---- periodic log line (cluster-friendly) -----------------
-                # Visible even when tqdm output is suppressed (non-tty, log
-                # capture, runai, etc). Includes recon / KL / log_var_n
-                # range / elapsed / ETA so a cluster job log gives a
-                # full picture.
-                if it % log_every == 0 or it == n_iters - 1:
-                    elapsed = time.time() - fit_t0
-                    done = it + 1
-                    rate = done / max(elapsed, 1e-9)
-                    eta = (n_iters - done) / max(rate, 1e-9)
-                    lvn_min = float(log_var_n.min().item())
-                    lvn_max = float(log_var_n.max().item())
-                    log.info(
-                        f"  [{pbar_desc}] it {done:>6d}/{n_iters} "
-                        f"({100 * done / n_iters:5.1f}%) "
-                        f"recon={last_recon:.4g} kl={last_kl:.4g} "
-                        f"lvn=[{lvn_min:+.2f},{lvn_max:+.2f}] "
-                        f"{rate:.1f} it/s  elapsed={elapsed:.0f}s "
-                        f"eta={eta:.0f}s"
+                    # ---- gradient clipping ---------------------------------
+                    # After NaN sanitization, gradients are finite — clipping
+                    # caps any remaining large-but-finite values. Helps with
+                    # the analytic ELBO's large gradients at init.
+                    grad_clip = float(args.get("grad_clip", 10.0))
+                    torch.nn.utils.clip_grad_norm_(
+                        list(model.parameters()) + [log_var_n],
+                        max_norm=grad_clip,
                     )
 
-                # ---- epoch boundary log + checkpoint ---------------------
-                new_epoch = (it + 1) // iters_per_epoch
-                if new_epoch > current_epoch and new_epoch <= int(args["epochs"]):
-                    epoch_elapsed = time.time() - epoch_t0
-                    log.info(
-                        f"  [{pbar_desc}] === epoch {new_epoch}/{args['epochs']} "
-                        f"done in {epoch_elapsed:.1f}s "
-                        f"(recon={last_recon:.4g}, kl={last_kl:.4g}) ==="
-                    )
-                    current_epoch = new_epoch
-                    epoch_t0 = time.time()
-                    # Periodic checkpoint — every N epochs (configurable).
-                    # Saves the SAME path each time so disk usage is bounded.
-                    if ckpt_every > 0 and current_epoch % ckpt_every == 0:
-                        _save_ckpt(it + 1)
+                    optimizer.step()
+                    # Clamp log_var_n back into a sane range so the noise term
+                    # can't explode/underflow. Done after the step so AdamW's
+                    # update can move freely, then we project.
+                    with torch.no_grad():
+                        log_var_n.clamp_(log_var_n_min, log_var_n_max)
 
-                if (it % max(1, n_iters // 30)) == 0:
-                    pbar.set_postfix(
-                        recon=f"{last_recon:.3g}",
-                        kl=f"{last_kl:.3g}",
-                        lvn=f"[{log_var_n.min().item():.2f},"
-                            f"{log_var_n.max().item():.2f}]",
-                    )
+                    # ---- periodic log line (cluster-friendly) -----------------
+                    # Visible even when tqdm output is suppressed (non-tty, log
+                    # capture, runai, etc). Includes recon / KL / log_var_n
+                    # range / elapsed / ETA so a cluster job log gives a
+                    # full picture.
+                    if it % log_every == 0 or it == n_iters - 1:
+                        elapsed = time.time() - fit_t0
+                        done = it + 1
+                        rate = done / max(elapsed, 1e-9)
+                        eta = (n_iters - done) / max(rate, 1e-9)
+                        lvn_min = float(log_var_n.min().item())
+                        lvn_max = float(log_var_n.max().item())
+                        log.info(
+                            f"  [{pbar_desc}] it {done:>6d}/{n_iters} "
+                            f"({100 * done / n_iters:5.1f}%) "
+                            f"recon={last_recon:.4g} kl={last_kl:.4g} "
+                            f"lvn=[{lvn_min:+.2f},{lvn_max:+.2f}] "
+                            f"{rate:.1f} it/s  elapsed={elapsed:.0f}s "
+                            f"eta={eta:.0f}s"
+                        )
 
-                # Advance the global iter counter + progress bar. The
-                # `for x_b, y_b in train_loader:` loop doesn't auto-
-                # increment `it` like the old `for it in pbar:` did.
-                it += 1
-                pbar.update(1)
+                    # ---- epoch boundary log + checkpoint ---------------------
+                    new_epoch = (it + 1) // iters_per_epoch
+                    if new_epoch > current_epoch and new_epoch <= int(args["epochs"]):
+                        epoch_elapsed = time.time() - epoch_t0
+                        log.info(
+                            f"  [{pbar_desc}] === epoch {new_epoch}/{args['epochs']} "
+                            f"done in {epoch_elapsed:.1f}s "
+                            f"(recon={last_recon:.4g}, kl={last_kl:.4g}) ==="
+                        )
+                        current_epoch = new_epoch
+                        epoch_t0 = time.time()
+                        # Periodic checkpoint — every N epochs (configurable).
+                        # Saves the SAME path each time so disk usage is bounded.
+                        if ckpt_every > 0 and current_epoch % ckpt_every == 0:
+                            _save_ckpt(it + 1)
+
+                    if (it % max(1, n_iters // 30)) == 0:
+                        pbar.set_postfix(
+                            recon=f"{last_recon:.3g}",
+                            kl=f"{last_kl:.3g}",
+                            lvn=f"[{log_var_n.min().item():.2f},"
+                                f"{log_var_n.max().item():.2f}]",
+                        )
+
+                    # Advance the global iter counter + progress bar. The
+                    # `for x_b, y_b in train_loader:` loop doesn't auto-
+                    # increment `it` like the old `for it in pbar:` did.
+                    it += 1
+                    pbar.update(1)
+                    if it >= n_iters:
+                        break  # break out of inner (DataLoader) loop
+                # Inner loop done (epoch complete OR break for iter cap).
+                # Re-check the cap to also break the outer (epoch) loop —
+                # `break` only escapes one level in Python.
                 if it >= n_iters:
-                    break  # break out of inner (DataLoader) loop
-            # Inner loop done (epoch complete OR break for iter cap).
-            # Re-check the cap to also break the outer (epoch) loop —
-            # `break` only escapes one level in Python.
-            if it >= n_iters:
-                break
+                    break
+        except RuntimeError as ex:
+            # Training diverged (sustained NaN streak, etc.). Before
+            # giving up entirely, try to load the in-progress
+            # checkpoint we saved every `ckpt_every` epochs — that's a
+            # state from BEFORE the divergence and is usable for
+            # prediction. Caller gets to decide whether to save those
+            # predictions or skip them.
+            pbar.close()
+            log.warning(
+                f"  [{pbar_desc}] TRAINING ABORTED: {ex.__class__.__name__}"
+            )
+            if ckpt_path is not None and Path(ckpt_path).exists():
+                try:
+                    ckpt = torch.load(ckpt_path, map_location=device)
+                    if ckpt.get("n_tasks") == n_tasks:
+                        model.load_state_dict(ckpt["model_state"])
+                        with torch.no_grad():
+                            log_var_n.copy_(ckpt["log_var_n"].to(device))
+                        log.warning(
+                            f"  [{pbar_desc}] recovered from "
+                            f"{Path(ckpt_path).name} @ iter "
+                            f"{ckpt.get('iter', 0)} / epoch "
+                            f"{ckpt.get('epoch', 0)} — predictions will "
+                            f"use this state (early stop). Caller still "
+                            f"counts this as a failed batch."
+                        )
+                        model.eval()
+                        return model, log_var_n.detach(), "early_stopped_from_ckpt"
+                    else:
+                        log.warning(
+                            f"  [{pbar_desc}] checkpoint n_tasks "
+                            f"mismatch — cannot recover from it"
+                        )
+                except Exception as load_err:
+                    log.warning(
+                        f"  [{pbar_desc}] could not load checkpoint "
+                        f"{ckpt_path}: {load_err}"
+                    )
+            log.warning(
+                f"  [{pbar_desc}] no usable checkpoint — no predictions "
+                f"will be written for this batch"
+            )
+            raise  # re-raise so caller sees the failure
     pbar.set_postfix(recon=f"{last_recon:.3g}", kl=f"{last_kl:.3g}")
     pbar.close()
     fit_elapsed = time.time() - fit_t0
@@ -1109,7 +1183,7 @@ def train_lipid_batch(
     )
 
     model.eval()
-    return model, log_var_n.detach()
+    return model, log_var_n.detach(), "ok"
 
 
 def predict_batched(model, log_var_n, x: torch.Tensor, n_tasks: int,
@@ -1436,6 +1510,10 @@ def main():
     log.info("=" * 72)
 
     grand_t0 = time.time()
+    # Tracker for any lipid-batches that came back as
+    # "early_stopped_from_ckpt" — we still save their predictions but
+    # the whole run is marked failed at the end.
+    early_stopped_batches = []
     for batch_i in range(n_batches):
         s = batch_i * B
         e = min(s + B, n_lipids)
@@ -1472,7 +1550,7 @@ def main():
 
         t0 = time.time()
         try:
-            model, log_var_n = train_lipid_batch(
+            model, log_var_n, train_status = train_lipid_batch(
                 coords_train=coords_tr_z,
                 y_train=y_tr_z_batch,
                 inducing_points=inducing_points,
@@ -1483,52 +1561,80 @@ def main():
                 log=log,
                 pbar_desc=f"batch {batch_i+1}/{n_batches}",
             )
+            if train_status == "early_stopped_from_ckpt":
+                # Training diverged but we recovered the last checkpoint
+                # so we can still save predictions. Mark the run as
+                # failed — once the predictions land on disk, we'll
+                # write FAILED.txt and abort.
+                early_stopped_batches.append({
+                    "batch": batch_i + 1,
+                    "of_total": n_batches,
+                    "lipid_names": batch_names,
+                    "lipid_indices": list(batch_lipid_global),
+                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+                })
+                try:
+                    with open(out_root / "ERRORS.txt", "a") as f:
+                        f.write(
+                            f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+                            f"early_stopped batch={batch_i+1}/{n_batches}  "
+                            f"lipids={batch_names}  "
+                            f"(predictions saved from in-progress ckpt)\n"
+                        )
+                except OSError:
+                    pass
+                log.warning(
+                    f"[batch {batch_i+1}/{n_batches}] early-stopped — "
+                    f"predictions will be from in-progress checkpoint"
+                )
         except RuntimeError as ex:
-            # Sustained divergence (>=200 consecutive bad-grad skips, or
-            # an explicit NaN-loss bail-out in nan_action='raise' mode).
-            # We treat this as a TERMINAL failure for the whole pipeline:
-            # any further batches would likely diverge the same way, the
-            # operator needs to investigate and pick new hyperparameters.
-            #
-            # Write a sticky FAILED.txt marker so:
-            #   (1) the cluster job manager sees a non-zero exit code
-            #       (RuntimeError will propagate after this block)
-            #   (2) an auto-restarter that re-runs the same exp_name
-            #       can detect prior failure via FAILED.txt presence
-            #       (resume logic at startup refuses to proceed).
-            #   (3) a human inspecting the output dir gets a clear
-            #       record of what went wrong, when, and at which batch.
-            #
-            # The operator removes FAILED.txt manually after fixing the
-            # config — this is intentional, not auto-cleared.
+            # Training diverged AND no checkpoint to recover from — no
+            # predictions can be saved for this batch. This means the
+            # divergence happened before the first --checkpoint-every-
+            # epochs interval, OR the checkpoint itself was unloadable.
+            # The minibatch-level failure threshold inside
+            # train_lipid_batch (max_consecutive_bad_grads) already
+            # exhausted, so the config is structurally broken — write
+            # FAILED.txt and abort the whole run.
             failure_marker = out_root / "FAILED.txt"
             try:
                 failure_marker.write_text(
                     f"Run failed at batch {batch_i+1}/{n_batches}\n"
                     f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"Lipids in failing batch: {batch_names}\n"
-                    f"Lipid global indices: {batch_lipid_global}\n"
+                    f"Lipid global indices: {list(batch_lipid_global)}\n"
                     f"\n"
                     f"Error:\n{ex}\n"
                     f"\n"
+                    f"No checkpoint existed when the training diverged "
+                    f"— no predictions saved for this batch. Reduce "
+                    f"--checkpoint-every-epochs to checkpoint earlier "
+                    f"so at least partial predictions can be recovered "
+                    f"next time.\n"
+                    f"\n"
+                    f"Full per-iter log: ERRORS.txt\n\n"
                     f"To retry: remove this file (FAILED.txt) and "
-                    f"re-run with the same --exp-name (or change "
-                    f"hyperparameters). The failing batch will be "
-                    f"re-attempted from scratch; previously-completed "
-                    f"batches will be skipped via the resume logic.\n"
+                    f"re-run with the same --exp-name. Previously-"
+                    f"completed batches will be skipped via resume.\n"
                 )
                 log.error(
-                    f"[batch {batch_i+1}/{n_batches}] TRAINING FAILED. "
-                    f"Wrote {failure_marker}. Aborting pipeline."
+                    f"[batch {batch_i+1}/{n_batches}] FAILED, no ckpt "
+                    f"— wrote {failure_marker}. Aborting."
                 )
             except OSError as write_err:
-                # Best-effort — if even the marker write fails, log it
-                # but still re-raise the original training error.
                 log.error(
-                    f"[batch {batch_i+1}/{n_batches}] TRAINING FAILED "
-                    f"AND could not write {failure_marker}: {write_err}"
+                    f"could not write {failure_marker}: {write_err}"
                 )
-            raise  # propagate the original RuntimeError unchanged
+            try:
+                with open(out_root / "ERRORS.txt", "a") as f:
+                    f.write(
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+                        f"batch_failed batch={batch_i+1}/{n_batches}  "
+                        f"lipids={batch_names}\n  {ex}\n"
+                    )
+            except OSError:
+                pass
+            raise  # propagate the RuntimeError, killing the run
         fit_sec = time.time() - t0
 
         # Predict on test set + brain. predict_batched returns y-space
@@ -1624,6 +1730,49 @@ def main():
         del model, log_var_n, test_mean_z, test_var_z
         del brain_mean_z, brain_var_z, y_tr_z_batch
         torch.cuda.empty_cache() if args["device"].startswith("cuda") else None
+
+        # If this batch was early-stopped (training diverged but we
+        # recovered from a checkpoint), the predictions ARE on disk
+        # now — but the run is failed. Write FAILED.txt and abort
+        # AFTER the save completes so the partial-but-useful
+        # predictions are preserved.
+        if early_stopped_batches and early_stopped_batches[-1]["batch"] == batch_i + 1:
+            b = early_stopped_batches[-1]
+            failure_marker = out_root / "FAILED.txt"
+            try:
+                failure_marker.write_text(
+                    f"Run failed: batch {b['batch']}/{b['of_total']} "
+                    f"diverged during training.\n"
+                    f"Timestamp: {b['timestamp']}\n"
+                    f"Lipids in failing batch: {b['lipid_names']}\n"
+                    f"Lipid global indices: {b['lipid_indices']}\n"
+                    f"\n"
+                    f"The minibatch failure threshold "
+                    f"(--max-consecutive-bad-grads) was hit during "
+                    f"SGD. Training was aborted, but we recovered the "
+                    f"last in-progress checkpoint, so predictions for "
+                    f"this batch ARE in predictions/<slug>/ — they "
+                    f"reflect the model's state at the last checkpoint "
+                    f"epoch BEFORE divergence (useful diagnostic, not "
+                    f"fully trained).\n\n"
+                    f"Full per-iter log: ERRORS.txt\n\n"
+                    f"To retry: remove this file (FAILED.txt) and "
+                    f"re-run with the same --exp-name. Successful "
+                    f"earlier batches will be skipped via resume; "
+                    f"this batch will be re-attempted.\n"
+                )
+                log.error(
+                    f"WROTE FAILED.txt — predictions from in-progress "
+                    f"checkpoint were preserved. Aborting."
+                )
+            except OSError as write_err:
+                log.error(
+                    f"could not write {failure_marker}: {write_err}"
+                )
+            raise RuntimeError(
+                f"Aborting: batch {b['batch']}/{b['of_total']} "
+                f"diverged; predictions saved from checkpoint."
+            )
 
     grand_t = time.time() - grand_t0
     log.info("=" * 72)
