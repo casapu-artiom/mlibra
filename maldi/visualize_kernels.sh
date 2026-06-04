@@ -1,0 +1,12 @@
+python maldi/visualize_kernels.py \
+    --template-name reference \
+    --reference-file /home/casap/mlibra/mlibra_data/reference_image.npy \
+    --annotations-file /home/casap/mlibra/mlibra_data/level_15annot.npy \
+    --eigenvector-dir /home/casap/mlibra/output/eigenvectors \
+    --knn-method anatomical_atlas --knn-k 5 \
+    --num-modes 1000 \
+    --laplacian-norm symmetric \
+    --graphbandwidth 1.0 \
+    --n-sources 4 --n-targets 60 --k-show 30 \
+    --source-marker-size 6 \
+    --fabric-edge-sample 200000 --laplacian-edge-sample 80000

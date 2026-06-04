@@ -3,14 +3,14 @@ python maldi/visualize_laplacian.py \
     --reference-file /home/casap/mlibra/mlibra_data/reference_image.npy \
     --annotations-file /home/casap/mlibra/mlibra_data/level_15annot.npy \
     --eigenvector-dir /home/casap/mlibra/output/eigenvectors \
-    --knn-method faiss_atlas_weighted --knn-k 180 \
-    --num-modes 1000 \
-    --laplacian-norm randomwalk \
-    --graphbandwidth 1.0 \
+    --knn-method anatomical_atlas --knn-k 120 \
+    --num-modes 1300 \
+    --laplacian-norm symmetric \
+    --graphbandwidth 0.1 \
     --n-sources 100 --n-targets 60 --k-show 30 \
     --source-marker-size 6 \
     --fabric-edge-sample 200000 --laplacian-edge-sample 80000 \
-    --threshold 40 \
+    --threshold 5 \
     --stride 4 \
     --force-recompute-graph \
     --force-recompute-eigvecs

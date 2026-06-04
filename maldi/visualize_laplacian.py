@@ -132,7 +132,7 @@ def parse_args() -> dict:
 
     p.add_argument("--knn-method", choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted"],
                    default="anatomical_atlas")
-    p.add_argument("--cross-region-inflation", type=float, default=10.0,
+    p.add_argument("--cross-region-inflation", type=float, default=100.0,
                    help=("For --knn-method=faiss_atlas_weighted only. "
                          "Multiplier applied to squared Euclidean "
                          "distance on edges that connect two atlas "
