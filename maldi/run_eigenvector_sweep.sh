@@ -4,15 +4,16 @@
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
+: "${TEMPLATE_NAME:=reference}"
 
 cd $SRC_PATH
 #pip install -e .
 
-python $SRC_PATH/maldi/laplacian_psd_sweep.py \
-    --template-name reference \
+python $SRC_PATH/maldi/laplacian_sweep.py \
+    --template-name "$TEMPLATE_NAME" \
     --reference-file "$REFERENCE_FILE" \
     --annotations-file "$ANNOTATION_FILE" \
-    --eigenvector-dir /home/casap/mlibra/output/eigenvectors \
+    --eigenvector-dir "$EIGENVECTOR_DIR" \
     --stride 4 \
     --n-list 1 \
     --num-modes 1300 \
