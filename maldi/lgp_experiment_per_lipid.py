@@ -894,7 +894,7 @@ def train_lipid_batch(
 
                     if fwd_failure is not None:
                         bad_grad_count += 1
-                        _record_error(args, "forward", it, fwd_failure,
+                        _record_error(config, "forward", it, fwd_failure,
                                       bad_grad_count, log)
                         optimizer.zero_grad()
                         it += 1
@@ -966,7 +966,7 @@ def train_lipid_batch(
                     if not torch.isfinite(loss):
                         bad_grad_count += 1
                         _record_error(
-                            args, "loss_nan", it,
+                            config, "loss_nan", it,
                             f"loss={loss.item()}, "
                             f"recon={recon.item():.3g}, "
                             f"kl={kl.item():.3g}, "
@@ -1019,16 +1019,25 @@ def train_lipid_batch(
                     # that a genuinely diverged step gets caught.
                     n_bad_grad = 0
                     n_total_grad = 0
-                    for p in list(model.parameters()) + [log_var_n]:
+                    # Collect (param_name, n_bad) so error messages identify
+                    # which parameter had the bad gradient entries.
+                    bad_params: list[tuple[str, int]] = []
+                    for pname, p in (
+                        list(model.named_parameters()) + [("log_var_n", log_var_n)]
+                    ):
                         if p.grad is None:
                             continue
                         n_total_grad += p.grad.numel()
                         bad = ~torch.isfinite(p.grad)
                         if bad.any():
-                            n_bad_grad += int(bad.sum().item())
+                            nb = int(bad.sum().item())
+                            n_bad_grad += nb
+                            bad_params.append((pname, nb))
 
                     bad_frac = n_bad_grad / max(n_total_grad, 1)
                     skip_frac = float(args.get("bad_grad_skip_frac", 0.01))
+                    # e.g. "variational_strategy.chol_variational_covar:1"
+                    bad_params_str = ", ".join(f"{n}:{k}" for n, k in bad_params)
 
                     # Minimum number of bad gradient entries before we treat
                     # the step as genuinely problematic. A single NaN in 5M
@@ -1039,14 +1048,15 @@ def train_lipid_batch(
                     # at or above this threshold are suspicious.
                     MIN_BAD_GRAD_ENTRIES = 100
 
-                    if n_bad_grad > 0 and bad_frac >= skip_frac:
+                    if n_bad_grad > 0:# and bad_frac >= skip_frac:
                         # Large fraction bad — skip the step entirely rather
                         # than moving in an essentially random direction.
                         bad_grad_count += 1
                         _record_error(
-                            args, "grad_skip", it,
+                            config, "grad_skip", it,
                             f"{n_bad_grad}/{n_total_grad} ({100*bad_frac:.2f}%) "
-                            f"grad entries NaN/Inf, loss={loss.item():.3g}",
+                            f"grad entries NaN/Inf [{bad_params_str}], "
+                            f"loss={loss.item():.3g}",
                             bad_grad_count, log,
                         )
                         optimizer.zero_grad()
@@ -1068,36 +1078,39 @@ def train_lipid_batch(
                             bad = ~torch.isfinite(p.grad)
                             if bad.any():
                                 p.grad.masked_fill_(bad, 0.0)
-
-                    if n_bad_grad >= MIN_BAD_GRAD_ENTRIES:
-                        # Enough bad entries to be suspicious — count toward
-                        # the bail-out streak and log to ERRORS.txt.
-                        bad_grad_count += 1
-                        _record_error(
-                            args, "grad_zero", it,
-                            f"{n_bad_grad}/{n_total_grad} ({100*bad_frac:.3f}%) "
-                            f"grad entries zeroed, recon={last_recon:.3g}, "
-                            f"kl={last_kl:.3g}, loss={loss.item():.3g}",
-                            bad_grad_count, log,
-                        )
-                        _maybe_bail_on_nan_streak(
-                            bad_grad_count, it, args, skip_frac, log, pbar
-                        )
-                    elif n_bad_grad > 0:
-                        # 1–(MIN_BAD_GRAD_ENTRIES-1) bad entries out of
-                        # millions: a harmless numerical glitch (one
-                        # eigenvalue boundary, one Laplacian pivot). Silently
-                        # zeroed above. Do NOT increment bad_grad_count and
-                        # do NOT reset it — this step is neither clean nor
-                        # genuinely problematic, so it's neutral w.r.t. the
-                        # streak. The streak only resets on a fully clean step
-                        # (n_bad_grad == 0), ensuring that a sequence of
-                        # single-entry glitches interleaved with clean steps
-                        # never accumulates toward the bail-out threshold.
-                        pass
                     else:
-                        # Fully clean step — reset the streak counter.
                         bad_grad_count = 0
+
+                    # if n_bad_grad >= MIN_BAD_GRAD_ENTRIES:
+                    #     # Enough bad entries to be suspicious — count toward
+                    #     # the bail-out streak and log to ERRORS.txt.
+                    #     bad_grad_count += 1
+                    #     _record_error(
+                    #         config, "grad_zero", it,
+                    #         f"{n_bad_grad}/{n_total_grad} ({100*bad_frac:.3f}%) "
+                    #         f"grad entries zeroed [{bad_params_str}], "
+                    #         f"recon={last_recon:.3g}, "
+                    #         f"kl={last_kl:.3g}, loss={loss.item():.3g}",
+                    #         bad_grad_count, log,
+                    #     )
+                    #     _maybe_bail_on_nan_streak(
+                    #         bad_grad_count, it, args, skip_frac, log, pbar
+                    #     )
+                    # elif n_bad_grad > 0:
+                    #     # 1–(MIN_BAD_GRAD_ENTRIES-1) bad entries out of
+                    #     # millions: a harmless numerical glitch (one
+                    #     # eigenvalue boundary, one Laplacian pivot). Silently
+                    #     # zeroed above. Do NOT increment bad_grad_count and
+                    #     # do NOT reset it — this step is neither clean nor
+                    #     # genuinely problematic, so it's neutral w.r.t. the
+                    #     # streak. The streak only resets on a fully clean step
+                    #     # (n_bad_grad == 0), ensuring that a sequence of
+                    #     # single-entry glitches interleaved with clean steps
+                    #     # never accumulates toward the bail-out threshold.
+                    #     pass
+                    # else:
+                    #     # Fully clean step — reset the streak counter.
+                    #     bad_grad_count = 0
 
                     # ---- gradient clipping ---------------------------------
                     # After NaN sanitization, gradients are finite — clipping
