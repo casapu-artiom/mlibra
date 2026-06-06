@@ -4,43 +4,18 @@ Layers — all share the same coordinate frame (full-resolution template
 voxel coords). Toggle visibility in napari's left panel.
 
   Layer A  — KNN graph fabric
-    A1: every node as a faint point
-    A2: a subsample of edges as faint gray lines
-
   Layer B  — Graph Laplacian (operator-level)
-    B1: nodes colored by diag(L)[i] (uniform for normalized L — usually
-        more informative is Layer H below)
-    B2: edges colored by L[i, j] (off by default — harder to read)
-
-  Layer C  — Kernel diagonal Σ_k w(λ_k) φ_k(i)² (prior variance per node)
-
+  Layer C  — Kernel diagonal K(i, i) via `kernel.features()`
   Layer D  — Laplacian response: L · δ_src
-    Sharp/local; nonzero only at src and its KNN neighbors.
-
   Layer D_dense — Laplacian response L · δ_src at full stride (Nystrom)
-    Out-of-sample extension showing continuous operator propagation.
-
   Layer E  — Euclidean Matern K_ν,ℓ(src, ·)
-    The covariance an *Euclidean* Matern GP would assign from src.
-
-  Layer F  — Manifold Matern K_ν,ℓ(src, ·)
-    The covariance your library's RiemannMaternKernel actually computes,
-    at the training nodes.
-
+  Layer F  — Manifold Matern K(src, ·) via `kernel.features()`
   Layer G  — Single eigenvector inspector: φ_k(i)
-
-  Layer G_dense — Single eigenvector φ_k at dense full stride (Nystrom)
-    Visualizes the continuous geometry of the anatomical manifold mode.
-
-  Layer H  — Weighted node degree D_i (real per-node connectivity)
-
-  Layer J  — Manifold Matern at dense stride (Nyström interpolation)
-
+  Layer G_dense — Single eigenvector φ_k at dense full stride
+  Layer H  — Weighted node degree D_i
+  Layer J  — Manifold Matern at dense stride via `kernel.features()`
   Layer K  — L · density (graph Laplacian applied to reference image)
-
-  Layer K_dense — L · density at full stride (Nystrom)
-    Continuous structural edge detection over image values.
-
+  Layer K_dense — L · density at full stride
   Layer L  — Euclidean Matern at dense stride
 """
 from __future__ import annotations
@@ -51,8 +26,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import matplotlib
 import matplotlib.cm as cm
 
+from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 from manifold_gp.utils.anatomical_knn import inflate_cross_region_edges, labels_for_nodes_from_sub_atlas
 from manifold_gp.utils.compute_eigenvectors import (
@@ -140,7 +117,7 @@ def parse_args() -> dict:
     p.add_argument("--bump-decay", type=float, default=0.05)
     p.add_argument("--density-smooth-sigma", type=float, default=0.0)
     p.add_argument("--nystrom-batch-size", type=int, default=20_000)
-    p.add_argument("--dense-max-render-points", type=int, default=30_000_000)
+    p.add_argument("--dense-max-render-points", type=int, default=2000000)
     p.add_argument("--dense-render-threshold-frac", type=float, default=5e-3)
 
     p.add_argument("--gamma", type=float, default=0.5)
@@ -243,6 +220,23 @@ def setup(args: dict, log: logging.Logger):
         graphbandwidth=bw, laplacian_normalization=args["laplacian_norm"],
         extra=eigvec_key_parts, force_recompute=args["force_recompute_eigvecs"], device=device,
     )
+
+    matern_kernel = RiemannMaternKernel(
+        nu=args["nu"],
+        lengthscale=args["lengthscale"],
+        knn=knn,
+        edge_index=edge_index,
+        edge_value=edge_value,
+        eigval=eigval,
+        eigvec=eigvec,
+        nearest_neighbors=args["knn_k"],
+        laplacian_normalization=args["laplacian_norm"],
+        num_modes=args["num_modes"],
+        bump_scale=args["bump_scale"],
+        bump_decay=args["bump_decay"],
+        graphbandwidth_init=bw
+    ).to(device)
+
     return dict(
         device=device, template_full=template_full, sub_volume=sub_volume,
         node_voxel_idx=node_voxel_idx, reference_nodes=reference_nodes,
@@ -252,6 +246,7 @@ def setup(args: dict, log: logging.Logger):
         coord_mean=coord_mean, coord_std=coord_std,
         voxel_offset=voxel_offset, voxel_scale_mm=voxel_scale_mm,
         stride=int(args["stride"]), threshold=int(args["threshold"]),
+        matern_kernel=matern_kernel
     )
 
 
@@ -283,7 +278,7 @@ def _full_voxel_to_normalized(voxel_idx_full: np.ndarray, ctx: dict) -> torch.Te
     return (torch.from_numpy(mm) - ctx["coord_mean"]) / ctx["coord_std"]
 
 
-# ---- General Out-Of-Sample Nystrom Extension Helper for Node-Level Fields ----
+# ---- General Out-Of-Sample Projection Helper for Non-Kernel Fields (L*delta, etc) ----
 def interpolate_function_to_dense_grid(
     f_node: torch.Tensor, ctx: dict, laplacian_op: GraphLaplacianOperator,
     render_stride: int, nearest_neighbors: int = 10,
@@ -363,40 +358,11 @@ def apply_laplacian_to_density(laplacian_op: GraphLaplacianOperator, sub_volume:
     return laplacian_op._matmul(f).squeeze(-1).cpu().numpy()
 
 
-def kernel_diagonal_from_eigvecs(eigval: torch.Tensor, eigvec: torch.Tensor, nu: int, lengthscale: float, num_modes: int) -> np.ndarray:
-    K = int(min(num_modes, eigvec.shape[1]))
-    safe_lam = eigval[:K].clamp(min=0.0)
-    weight = (2.0 * float(nu) / (float(lengthscale) ** 2) + safe_lam).pow(-float(nu))
-    return (eigvec[:, :K] ** 2 * weight).sum(dim=-1).cpu().numpy()
-
-
-def matern_euclidean_at_source(src_coord: torch.Tensor, all_coords: torch.Tensor, nu: int, lengthscale: float) -> np.ndarray:
-    from scipy.special import kv, gamma as gamma_fn
-    d = ((all_coords - src_coord) ** 2).sum(dim=-1).sqrt().cpu().numpy()
-    nu_f, ell_f = float(nu), float(lengthscale)
-    out = np.ones_like(d, dtype=np.float64)
-    nz = d > 0
-    if nz.any():
-        z = np.sqrt(2.0 * nu_f) * d[nz] / ell_f
-        out[nz] = ((2.0 ** (1.0 - nu_f)) / gamma_fn(nu_f)) * (z ** nu_f) * kv(nu_f, z)
-    return out
-
-
-def manifold_matern_at_source(src_idx: int, eigval: torch.Tensor, eigvec: torch.Tensor, nu: int, lengthscale: float, num_modes: int) -> np.ndarray:
-    K = int(min(num_modes, eigvec.shape[1]))
-    safe_lam = eigval[:K].clamp(min=0.0)
-    weight = (2.0 * float(nu) / (float(lengthscale) ** 2) + safe_lam).pow(-float(nu))
-    return (weight * eigvec[src_idx, :K] * eigvec[:, :K]).sum(dim=-1).cpu().numpy()
-
-
+# ---- DRYes Dense Kernel Interpolation using underlying `kernel.features()` ----
 def kernel_at_dense_grid(
-    src_idx: int, ctx: dict, laplacian_op: GraphLaplacianOperator,
-    eigval: torch.Tensor, eigvec: torch.Tensor, nu: int, lengthscale: float, num_modes: int,
-    render_stride: int, nearest_neighbors: int = 10, bump_scale: float = 3.0, bump_decay: float = 0.05,
-    batch_size: int = 20_000,
+    src_idx: int, ctx: dict, render_stride: int, batch_size: int = 20_000,
 ) -> tuple[np.ndarray, np.ndarray]:
-    from scipy.spatial import cKDTree
-    K_modes = int(min(num_modes, eigvec.shape[1]))
+    matern_kernel = ctx["matern_kernel"]
     tmpl = ctx["template_full"]
     mask = tmpl > ctx["threshold"]
     sub_mask = mask[::render_stride, ::render_stride, ::render_stride]
@@ -404,46 +370,43 @@ def kernel_at_dense_grid(
     voxel_idx = sub_idx * render_stride
     Q = voxel_idx.shape[0]
 
-    coords_z_cpu = _full_voxel_to_normalized(voxel_idx, ctx).numpy()
-    if "_query_kdt" not in ctx:
-        ctx["_query_kdt"] = cKDTree(ctx["reference_nodes"].cpu().numpy())
-    kdt = ctx["_query_kdt"]
-
-    safe_lam = eigval[:K_modes].clamp(min=0.0)
-    weight = (2.0 * float(nu) / (float(lengthscale) ** 2) + safe_lam).pow(-float(nu))
-    v_src = (weight * eigvec[src_idx, :K_modes]).contiguous()
-    bump_radius = float(laplacian_op.graphbandwidth.squeeze()) * float(bump_scale)
-
+    coords_z_cpu = _full_voxel_to_normalized(voxel_idx, ctx)
+    device = ctx["device"]
+    
+    # Evaluate exact features for the source node using library primitive
+    src_coord = ctx["reference_nodes"][src_idx].unsqueeze(0)
+    feat_src = matern_kernel.features(src_coord).squeeze(0)
+    
     K_q_all = np.zeros(Q, dtype=np.float32)
-    device, dtype = eigvec.device, eigvec.dtype
 
     for batch_start in range(0, Q, batch_size):
         batch_end = min(batch_start + batch_size, Q)
-        coords_b = coords_z_cpu[batch_start:batch_end]
-        dists_b, idxs_b = kdt.query(coords_b, k=nearest_neighbors, workers=-1)
-        edge_value_b = torch.from_numpy((dists_b.astype(np.float32) ** 2)).to(device=device, dtype=dtype)
-        edge_index_b = torch.from_numpy(idxs_b.astype(np.int64)).to(device)
-
-        sqrt_d_nearest_b = edge_value_b[:, 0].sqrt()
-        within_b = sqrt_d_nearest_b < bump_radius
-
-        if within_b.any():
-            projected_b = laplacian_op.out_of_sample(eigvec[:, :K_modes], edge_value_b[within_b], edge_index_b[within_b])
-            bump_vals_b = bump_function(sqrt_d_nearest_b[within_b], bump_radius, float(bump_decay))
-            kvals_b = (projected_b * bump_vals_b.unsqueeze(-1) * v_src).sum(dim=-1).cpu().numpy()
-            
-            within_mask_cpu = within_b.cpu().numpy()
-            global_positions = np.arange(batch_start, batch_end)[within_mask_cpu]
-            K_q_all[global_positions] = kvals_b
-            del projected_b, bump_vals_b
-        del edge_value_b, edge_index_b, sqrt_d_nearest_b, within_b
+        coords_b = coords_z_cpu[batch_start:batch_end].to(device).contiguous()
+        
+        # OOS Nystrom + Bump implicitly handled by library primitive!
+        feat_b = matern_kernel.features(coords_b) 
+        
+        kvals_b = (feat_b * feat_src).sum(dim=-1).detach().cpu().numpy()
+        K_q_all[batch_start:batch_end] = kvals_b
 
     return K_q_all, voxel_idx
 
 
+def matern_euclidean_at_source(src_coord: torch.Tensor, all_coords: torch.Tensor, nu: int, lengthscale: float) -> np.ndarray:
+    from scipy.special import kv, gamma as gamma_fn
+    d = ((all_coords - src_coord) ** 2).sum(dim=-1).sqrt().cpu().numpy()
+    nu_f, float_ls = float(nu), float(lengthscale)
+    out = np.ones_like(d, dtype=np.float64)
+    nz = d > 0
+    if nz.any():
+        z = np.sqrt(2.0 * nu_f) * d[nz] / float_ls
+        out[nz] = ((2.0 ** (1.0 - nu_f)) / gamma_fn(nu_f)) * (z ** nu_f) * kv(nu_f, z)
+    return out
+
+
 def euclidean_kernel_at_dense_grid(src_idx: int, ctx: dict, nu: int, lengthscale: float, render_stride: int) -> tuple[np.ndarray, np.ndarray]:
     from scipy.special import kv, gamma as gamma_fn
-    nu_f, ell_f = float(nu), float(lengthscale)
+    nu_f, float_ls = float(nu), float(lengthscale)
     tmpl = ctx["template_full"]
     mask = tmpl > ctx["threshold"]
     sub_mask = mask[::render_stride, ::render_stride, ::render_stride]
@@ -457,7 +420,7 @@ def euclidean_kernel_at_dense_grid(src_idx: int, ctx: dict, nu: int, lengthscale
     out = np.ones_like(d, dtype=np.float64)
     nz = d > 0
     if nz.any():
-        z = np.sqrt(2.0 * nu_f) * d[nz] / ell_f
+        z = np.sqrt(2.0 * nu_f) * d[nz] / float_ls
         out[nz] = ((2.0 ** (1.0 - nu_f)) / gamma_fn(nu_f)) * (z ** nu_f) * kv(nu_f, z)
     return out.astype(np.float32), voxel_idx
 
@@ -465,7 +428,7 @@ def euclidean_kernel_at_dense_grid(src_idx: int, ctx: dict, nu: int, lengthscale
 # =============================================================================
 # Plotting and Per-Source Lines UI Builders
 # =============================================================================
-def col_matern_euclidean_kernel(src_coord: torch.Tensor, tgt_coords: torch.Tensor, lengthscale: float, nu: float = 1.0) -> np.ndarray:
+def make_lines_for_kernel(src_coord: torch.Tensor, tgt_coords: torch.Tensor, lengthscale: float, nu: float = 1.0) -> np.ndarray:
     d = torch.sqrt(((tgt_coords - src_coord) ** 2).sum(dim=-1))
     r = d / lengthscale
     if nu == 0.5: k = torch.exp(-r)
@@ -473,14 +436,6 @@ def col_matern_euclidean_kernel(src_coord: torch.Tensor, tgt_coords: torch.Tenso
     elif nu == 2.5: k = (1.0 + (5**0.5)*r + (5.0/3.0)*r**2) * torch.exp(-(5**0.5)*r)
     else: k = torch.exp(-0.5 * r ** 2)
     return k.cpu().numpy()
-
-
-def col_riemann_manifold_kernel(src_idx: int, tgt_idxs: np.ndarray, eigval: torch.Tensor, eigvec: torch.Tensor, nu: float, lengthscale: float, num_modes: int) -> np.ndarray:
-    K = int(min(num_modes, eigvec.shape[1]))
-    safe_lam = eigval[:K].clamp(min=0.0)
-    weight = (2.0 * nu / (lengthscale ** 2) + safe_lam).pow(-nu)
-    return (weight * eigvec[src_idx, :K] * eigvec[tgt_idxs, :K]).sum(dim=-1).cpu().numpy()
-
 
 def pick_target_nodes(src_idx: int, reference_nodes: torch.Tensor, n_targets: int, strategy: str, seed: int) -> np.ndarray:
     N = reference_nodes.shape[0]
@@ -491,7 +446,6 @@ def pick_target_nodes(src_idx: int, reference_nodes: torch.Tensor, n_targets: in
     order = order[order != src_idx]
     return order[np.linspace(0, len(order) - 1, n_targets).astype(np.int64)]
 
-
 def knn_neighbors_of(src_idx: int, edge_index: torch.Tensor, edge_value: torch.Tensor, k_show: int) -> tuple[np.ndarray, np.ndarray]:
     src_eq, dst_eq = (edge_index[0] == src_idx), (edge_index[1] == src_idx)
     nbrs = torch.cat([edge_index[1, src_eq], edge_index[0, dst_eq]]).cpu().numpy()
@@ -499,7 +453,6 @@ def knn_neighbors_of(src_idx: int, edge_index: torch.Tensor, edge_value: torch.T
     nbrs_uniq, first = np.unique(nbrs, return_index=True)
     order = np.argsort(dists[first])[:k_show]
     return nbrs_uniq[order], dists[first][order]
-
 
 def make_lines(src_voxel: np.ndarray, nbr_voxels: np.ndarray, sv_scale: np.ndarray, sv_translate: np.ndarray) -> np.ndarray:
     src_full = src_voxel.astype(np.float32) * sv_scale + sv_translate
@@ -509,21 +462,19 @@ def make_lines(src_voxel: np.ndarray, nbr_voxels: np.ndarray, sv_scale: np.ndarr
     lines[:, 1, :] = nbr_full
     return lines
 
-
 def colors_widths(strengths: np.ndarray, cmap_name: str = "viridis", gamma: float = 0.5, min_width: float = 0.3, max_width: float = 2.5):
     s = np.asarray(strengths, dtype=np.float32)
     has_negative = bool((s < 0).any())
     abs_max = np.abs(s).max() if s.size else 1.0
     if abs_max == 0: abs_max = 1.0
     if has_negative:
-        colors = cm.get_cmap("RdBu_r")(0.5 + 0.5 * s / abs_max)
+        colors = matplotlib.colormaps.get_cmap("RdBu_r")(0.5 + 0.5 * s / abs_max)
     else:
-        colors = cm.get_cmap(cmap_name)((np.abs(s) / abs_max) ** gamma)
+        colors = matplotlib.colormaps.get_cmap(cmap_name)((np.abs(s) / abs_max) ** gamma)
     widths = min_width + (max_width - min_width) * (np.abs(s) / abs_max) ** gamma
     return colors, widths
 
-
-def build_lines_for_source(src_idx: int, ctx: dict, num_modes: int, lengthscale: float, gamma: float, k_show: int, n_targets: int, target_strategy: str, source_seed: int, nu: float, knn_color_by: str) -> dict:
+def build_lines_for_source(src_idx: int, ctx: dict, lengthscale: float, gamma: float, k_show: int, n_targets: int, target_strategy: str, source_seed: int, nu: float, knn_color_by: str) -> dict:
     src_voxel = ctx["node_voxel_idx"][src_idx]
     knn_idxs, knn_sq_dists = knn_neighbors_of(int(src_idx), ctx["edge_index"], ctx["edge_value"], k_show)
     knn_strengths = (1.0 - np.sqrt(knn_sq_dists)/max(np.sqrt(knn_sq_dists).max(), 1e-8)) if knn_color_by == "distance" else np.exp(-knn_sq_dists / (4.0 * ctx["bw"]**2))
@@ -531,11 +482,16 @@ def build_lines_for_source(src_idx: int, ctx: dict, num_modes: int, lengthscale:
     knn_colors, knn_widths = colors_widths(knn_strengths, "viridis", gamma)
 
     tgt_idxs = pick_target_nodes(int(src_idx), ctx["reference_nodes"], n_targets, target_strategy, source_seed)
-    matern_strengths = col_matern_euclidean_kernel(ctx["reference_nodes"][src_idx], ctx["reference_nodes"][tgt_idxs], lengthscale, nu)
+    matern_strengths = make_lines_for_kernel(ctx["reference_nodes"][src_idx], ctx["reference_nodes"][tgt_idxs], lengthscale, nu)
     matern_lines = make_lines(src_voxel, ctx["node_voxel_idx"][tgt_idxs], ctx["sv_scale"], ctx["sv_translate"])
     matern_colors, matern_widths = colors_widths(matern_strengths, "plasma", gamma)
 
-    riemann_strengths = col_riemann_manifold_kernel(int(src_idx), tgt_idxs, ctx["eigval"], ctx["eigvec"], nu=nu, lengthscale=lengthscale, num_modes=num_modes)
+    # Use underlying library to compute strengths!
+    matern_kernel = ctx["matern_kernel"]
+    feat_src = matern_kernel.features(ctx["reference_nodes"][src_idx].unsqueeze(0)).squeeze(0)
+    feat_tgt = matern_kernel.features(ctx["reference_nodes"][tgt_idxs])
+    riemann_strengths = (feat_tgt * feat_src).sum(dim=-1).detach().cpu().numpy()
+    
     riemann_colors, riemann_widths = colors_widths(riemann_strengths, "magma", gamma)
 
     return {
@@ -575,39 +531,10 @@ def replace_shapes_layer(viewer, layer_state, key, lines, colors, widths):
 # =============================================================================
 # Node and Grid Colorization Engines
 # =============================================================================
-def color_nodes_sequential(layer, values: np.ndarray, gamma: float, cmap_name: str = "magma"):
-    vmin, vmax = float(values.min()), float(values.max())
-    norm = np.clip((values - vmin) / (vmax - vmin), 0, 1) ** gamma if vmax > vmin else np.zeros_like(values)
-    colors = cm.get_cmap(cmap_name)(norm).astype(np.float32)
-    colors[:, 3] = 1.0
-    layer.face_color_mode = 'direct'
-    layer.face_color = colors
-    layer.border_color = colors * [1,1,1,0]
-
-
-def color_nodes_diverging(layer, values: np.ndarray, cmap_name: str = "RdBu_r", pct: float = 99.0, gamma: float = 0.5):
-    amax = max(float(np.percentile(np.abs(values), pct)), 1e-12)
-    norm = np.clip(0.5 + 0.5 * np.sign(values) * (np.clip(np.abs(values) / amax, 0, 1) ** float(gamma)), 0, 1)
-    colors = cm.get_cmap(cmap_name)(norm).astype(np.float32)
-    colors[:, 3] = 1.0
-    layer.face_color_mode = 'direct'
-    layer.face_color = colors
-    layer.border_color = colors * [1,1,1,0]
-
-
-def color_nodes_signed_sparse(layer, values: np.ndarray, cmap_name: str = "RdBu_r", threshold: float = 1e-12):
-    cmap = cm.get_cmap(cmap_name)
-    pos, neg = (values > threshold), (values < -threshold)
-    pos_max = float(values[pos].max()) if pos.any() else 1.0
-    neg_min = float(values[neg].min()) if neg.any() else -1.0
-    norm = np.full_like(values, 0.5, dtype=np.float64)
-    if pos.any(): norm[pos] = 0.5 + 0.5 * (values[pos] / pos_max)
-    if neg.any(): norm[neg] = 0.5 - 0.5 * (values[neg] / neg_min)
-    colors = cmap(norm).astype(np.float32)
-    colors[:, 3] = np.where(np.abs(values) > threshold, 1.0, 0.0)
-    layer.face_color_mode = 'direct'
-    layer.face_color = colors
-    layer.border_color = colors * [1,1,1,0]
+# Node and Grid Colorization Engines (legacy Points helpers — removed.
+# All diagnostic layers now render as Image volumes through
+# _update_sparse_image_layer / _update_dense_image_layer, which give solid
+# voxel rendering in 2D and 3D with a single colour/alpha curve.)
 
 
 def make_layer_info_panel():
@@ -636,10 +563,8 @@ def make_layer_info_panel():
 def fmt_info_sequential(vmin, vmax, sat, gamma, cmap):
     return f"range=[{vmin:>+10.3g}, {vmax:>+10.3g}]  sat={sat:>+10.3g}  γ={gamma:>4.2f}  cmap={cmap}"
 
-
 def fmt_info_diverging(vmin, vmax, sat, gamma, cmap):
     return f"range=[{vmin:>+10.3g}, {vmax:>+10.3g}]  sat=±{sat:>9.3g}  γ={gamma:>4.2f}  cmap={cmap}"
-
 
 def fmt_info_sparse_signed(vmin, vmax, pos_max, neg_min, cmap):
     return f"range=[{vmin:>+10.3g}, {vmax:>+10.3g}]  +sat={pos_max:>+9.3g}  −sat={neg_min:>+9.3g}  cmap={cmap}"
@@ -653,7 +578,7 @@ def make_bump_widget(graphbandwidth: float, initial_scale: float, initial_decay:
     except ImportError:
         return None, (lambda *_args, **_kw: None)
     bw = float(graphbandwidth)
-    fig = Figure(figsize=(4.0, 2.5), tight_layout=True)
+    fig = Figure(figsize=(4.0, 3.0), layout="constrained")
     ax = fig.add_subplot(1, 1, 1)
     d_grid = np.linspace(0.0, 5.0 * bw * max(initial_scale, 1.0), 400)
     line, = ax.plot([], [], "-", color="#3578a8", lw=1.5)
@@ -701,59 +626,65 @@ def main():
     deg_vals = weighted_degree(ctx["laplacian_op"])
 
     viewer = napari.Viewer(title="Kernel & graph debugger")
-    viewer.dims.ndisplay = 3
+    # NOTE: viewer.dims.ndisplay starts at 2. We deliberately stay in 2D mode
+    # while constructing the Image layers — some napari/vispy versions raise
+    # "Volume visual needs a 3D array" when constructing volume visuals at
+    # add_image time with a tiny placeholder, even though the array IS 3D.
+    # Creating in 2D mode sidesteps that path entirely; we switch to 3D right
+    # before napari.run() once all layers have real sub_shape data.
 
     viewer.add_points(all_node_positions, name="A1: graph nodes", size=float(args["fabric_node_size"]), face_color="white", border_color="white", symbol="o", opacity=0.25, blending="additive")
     fabric_lines = make_lines_array(fabric_pairs, all_node_positions)
     viewer.add_shapes([fabric_lines[i] for i in range(fabric_lines.shape[0])], shape_type="line", edge_color=np.tile([[0.6, 0.6, 0.6, 0.35]], (fabric_lines.shape[0], 1)), edge_width=float(args["fabric_edge_width"]), name="A2: KNN fabric (edges)", opacity=0.7, blending="translucent")
 
-    # Diagnostic point layers tile the brain at the inter-node spacing so the
-    # rendered volume looks solid in both 2D and 3D views. In napari, point
-    # `size` is in data units, so size = inter-point spacing means each disc
-    # exactly covers its Voronoi cell. For the strided graph (stride S) that
-    # spacing is S full-res voxels; for the bbox path sv_scale is [1,1,1] so
-    # spacing is 1 voxel — bump that up a little so a single graph node still
-    # shows as a visible disc in 2D.
-    _sparse_size = max(float(ctx["sv_scale"][0]), 1.5)
-    _pt_kw = dict(size=_sparse_size, face_color="black", border_color="black", symbol="disc", opacity=1.0, blending="translucent")
+    placeholder_vol = np.zeros((2, 2, 2), dtype=np.float32)
+    _img_kw = dict(opacity=1.0, rendering="translucent")
 
-    b1_layer = viewer.add_points(all_node_positions, name="B1: Laplacian diag (often uniform)", visible=False, **_pt_kw)
-    color_nodes_sequential(b1_layer, lap_diag_vals, gamma=float(args["gamma"]), cmap_name="cividis")
+    # All scalar-per-node diagnostic layers render as Image volumes built by
+    # splatting per-node values into a sub_volume-shaped array via
+    # node_voxel_idx. Image layers give solid voxel rendering in both 2D
+    # slices and 3D volume mode, with proper depth and contrast, where the
+    # earlier Points approach was sub-pixel and dim in 2D.
+    #
+    # Layers are created with a tiny (2,2,2) placeholder (same pattern as the
+    # dense layers below) — vispy/napari objects to having a full-size
+    # zero-volume forced through volume rendering at construction time. The
+    # real sub_shape array is assigned by _update_sparse_image_layer, which
+    # the boot sequence calls right before napari.run().
+    sub_shape = ctx["sub_volume"].shape
+    node_idx = ctx["node_voxel_idx"]   # (N, 3) sub-volume indices
 
+    def _new_img(name, visible=False):
+        lyr = viewer.add_image(placeholder_vol, name=name, visible=visible, **_img_kw)
+        lyr.scale = ctx["sv_scale"]; lyr.translate = ctx["sv_translate"]
+        return lyr
+
+    b1_layer = _new_img("B1: Laplacian diag (often uniform)")
     lap_edge_lines = make_lines_array(lap_pairs, all_node_positions)
-    viewer.add_shapes([lap_edge_lines[i] for i in range(lap_edge_lines.shape[0])], shape_type="line", edge_color=cm.get_cmap("RdBu_r")(0.5 + 0.5 * lap_edge_vals / max(np.abs(lap_edge_vals).max(), 1e-12)), edge_width=0.4, name="B2: Laplacian off-diag (edges)", opacity=0.75, blending="translucent", visible=False)
+    viewer.add_shapes([lap_edge_lines[i] for i in range(lap_edge_lines.shape[0])], shape_type="line", edge_color=matplotlib.colormaps.get_cmap("RdBu_r")(0.5 + 0.5 * lap_edge_vals / max(np.abs(lap_edge_vals).max(), 1e-12)), edge_width=0.4, name="B2: Laplacian off-diag (edges)", opacity=0.75, blending="translucent", visible=False)
 
-    h_layer = viewer.add_points(all_node_positions, name="H: weighted degree D_i", visible=False, **_pt_kw)
-    color_nodes_sequential(h_layer, deg_vals, gamma=float(args["gamma"]), cmap_name="cividis")
+    h_layer = _new_img("H: weighted degree D_i")
 
     initial_modes = min(args["initial_modes"] or args["num_modes"], ctx["eigvec"].shape[1])
-    c_layer = viewer.add_points(all_node_positions, name="C: kernel diag K(i, i)", visible=False, **_pt_kw)
-    d_layer = viewer.add_points(all_node_positions, name="D: L · δ_src (sharp, diverging)", visible=False, **_pt_kw)
-    e_layer = viewer.add_points(all_node_positions, name="E: Euclidean Matern K(src, ·)", visible=True, **_pt_kw)
-    f_layer = viewer.add_points(all_node_positions, name="F: Manifold Matern K(src, ·)", visible=True, **_pt_kw)
-    g_layer = viewer.add_points(all_node_positions, name="G: eigenvector φ_k(i)", visible=False, **_pt_kw)
-    k_layer = viewer.add_points(all_node_positions, name="K: L · density", visible=False, **_pt_kw)
+    c_layer = _new_img("C: kernel diag K(i, i)")
+    d_layer = _new_img("D: L · δ_src (sharp, diverging)")
+    e_layer = _new_img("E: Euclidean Matern K(src, ·)", visible=True)
+    f_layer = _new_img("F: Manifold Matern K(src, ·)",  visible=True)
+    g_layer = _new_img("G: eigenvector φ_k(i)")
+    k_layer = _new_img("K: L · density")
 
-    placeholder_pts = np.empty((0, 3), dtype=np.float32)
-    j_layer = viewer.add_points(placeholder_pts, name=f"J: K(src, ·) dense @ stride={args['render_stride']} (Nyström)", visible=False, **_pt_kw)
-    l_layer = viewer.add_points(placeholder_pts, name=f"L: Euclidean K(d) dense @ stride={args['render_stride']}", visible=False, **_pt_kw)
-
-    # ---- Dense full-stride layers: discs sized to fill the render_stride cell.
-    # At render_stride=1 each disc is one voxel wide; we bump it slightly so it
-    # remains screen-visible at the default brain-fit zoom in 2D where one data
-    # voxel projects to roughly 1-2 screen pixels.
-    _dense_size = max(float(args["render_stride"]) * 1.2, 1.5)
-    _dense_kw = dict(size=_dense_size, face_color="black", border_color="black", symbol="disc", opacity=1.0, blending="translucent_no_depth")
-    g_dense_layer = viewer.add_points(placeholder_pts, name=f"G_dense: eigenvector φ_k dense @ full-stride", visible=False, **_dense_kw)
-    d_dense_layer = viewer.add_points(placeholder_pts, name=f"D_dense: L · δ_src dense @ full-stride", visible=False, **_dense_kw)
-    k_dense_layer = viewer.add_points(placeholder_pts, name=f"K_dense: L · density dense @ full-stride", visible=False, **_dense_kw)
+    j_layer = viewer.add_image(placeholder_vol, name=f"J: K(src, ·) dense @ stride={args['render_stride']} (Nyström)", visible=False, **_img_kw)
+    l_layer = viewer.add_image(placeholder_vol, name=f"L: Euclidean K(d) dense @ stride={args['render_stride']}", visible=False, **_img_kw)
+    g_dense_layer = viewer.add_image(placeholder_vol, name=f"G_dense: eigenvector φ_k dense @ full-stride", visible=False, **_img_kw)
+    d_dense_layer = viewer.add_image(placeholder_vol, name=f"D_dense: L · δ_src dense @ full-stride", visible=False, **_img_kw)
+    k_dense_layer = viewer.add_image(placeholder_vol, name=f"K_dense: L · density dense @ full-stride", visible=False, **_img_kw)
 
     src_points = ctx["node_voxel_idx"][src_idxs].astype(np.float32) * ctx["sv_scale"] + ctx["sv_translate"]
     viewer.add_points(src_points, name="source nodes", size=float(args["source_marker_size"]), face_color="red", border_color="white", symbol="o", opacity=0.95)
 
     state = dict(
         src_pick=0, num_modes=initial_modes, nu=int(args["nu"]), lengthscale=float(args["lengthscale"]),
-        eigvec_idx=0, gamma=float(args["gamma"]), alpha_power=1.0, render_stride=int(args["render_stride"]),
+        eigvec_idx=0, gamma=float(args["gamma"]), alpha_power=3.0, render_stride=int(args["render_stride"]),
         bump_scale=float(args["bump_scale"]), bump_decay=float(args["bump_decay"]), density_smooth_sigma=float(args["density_smooth_sigma"]),
     )
     layer_state = {"knn": None, "matern": None, "riemann": None}
@@ -765,52 +696,119 @@ def main():
 
     rng_render = np.random.default_rng(args["source_seed"])
     
-    def _update_dense_points_layer(layer, K_q_flat, voxel_idx, label, tag):
+    def _update_dense_image_layer(layer, K_q_flat, voxel_idx, label, tag):
         if K_q_flat.size == 0:
             set_info(tag, "(empty result)")
             return
-        vmax = float(np.abs(K_q_flat).max()) if K_q_flat.size else 0.0
-        thresh = vmax * float(args["dense_render_threshold_frac"])
-        mask = np.abs(K_q_flat) > max(thresh, 1e-12)
-        K_keep, idx_keep = K_q_flat[mask], voxel_idx[mask]
-        
-        max_pts = int(args["dense_max_render_points"])
-        if idx_keep.shape[0] > max_pts:
-            sel = rng_render.choice(idx_keep.shape[0], size=max_pts, replace=False)
-            K_keep, idx_keep = K_keep[sel], idx_keep[sel]
             
-        positions = idx_keep.astype(np.float32)
-        if positions.shape[0] == 0:
-            layer.data = np.empty((0, 3), dtype=np.float32)
-            set_info(tag, f"no points above threshold ({thresh:.3g})")
-            return
-            
-        layer.data = positions
-        sat = float(np.percentile(np.abs(K_keep), 99))
+        render_stride = int(state["render_stride"])
+        sub_mask = (ctx["template_full"] > ctx["threshold"])[::render_stride, ::render_stride, ::render_stride]
+        vol = np.zeros(sub_mask.shape, dtype=np.float32)
+
+        # voxel_idx may arrive as float (callers cast for various reasons).
+        # numpy fancy-indexing requires integer arrays — cast to int64 here
+        # so refresh_J / refresh_L can pass whatever dtype is convenient.
+        vox_i = np.asarray(voxel_idx, dtype=np.int64)
+        sub_idx = vox_i // render_stride
+        vol[sub_idx[:, 0], sub_idx[:, 1], sub_idx[:, 2]] = K_q_flat
         
-        if (K_keep < 0).any():
-            color_nodes_diverging(layer, K_keep, "RdBu_r", gamma=state["gamma"])
-            # Dense layers already drop background via dense_render_threshold_frac,
-            # so every surviving point is signal. Alpha is rescaled so the minimum
-            # value still renders visibly: alpha = min_alpha + (1 - min_alpha) * norm.
-            # alpha_power state acts as min_alpha (1/alpha_power so the existing
-            # slider still ranges from sharp peaks → bright everywhere).
-            min_alpha = float(np.clip(1.0 / max(state.get("alpha_power", 1.0), 1e-6), 0.0, 1.0))
-            norm_val = np.clip(np.abs(K_keep) / (sat if sat > 0 else 1.0), 0, 1)
-            alphas = min_alpha + (1.0 - min_alpha) * norm_val
-            layer.face_color[:, 3] = alphas
+        sat = float(np.percentile(np.abs(K_q_flat), 99))
+        
+        from napari.utils.colormaps import Colormap
+        is_3d = viewer.dims.ndisplay == 3
+        eff_alpha_power = float(state.get("alpha_power", 3.0)) if is_3d else 1.0
+        
+        if (K_q_flat < 0).any():
+            t = np.linspace(0, 1, 1024)
+            val = (t - 0.5) * 2.0
+            mag = np.abs(val) ** state["gamma"]
+            norm = 0.5 + 0.5 * np.sign(val) * mag
+            colors = matplotlib.colormaps.get_cmap("RdBu_r")(norm)
+            colors[:, 3] = mag ** eff_alpha_power
+            
+            layer.colormap = Colormap(colors, name='custom_diverging')
+            layer.contrast_limits = [-sat, sat]
             info_line = fmt_info_diverging(float(K_q_flat.min()), float(K_q_flat.max()), sat, state["gamma"], "RdBu_r")
         else:
-            color_nodes_sequential(layer, K_keep, state["gamma"], "magma")
-            vmin, vmax = K_keep.min(), K_keep.max()
-            min_alpha = float(np.clip(1.0 / max(state.get("alpha_power", 1.0), 1e-6), 0.0, 1.0))
-            norm_val = np.clip((K_keep - vmin) / (vmax - vmin), 0, 1) if vmax > vmin else np.ones_like(K_keep)
-            alphas = min_alpha + (1.0 - min_alpha) * norm_val
-            layer.face_color[:, 3] = alphas
+            vmin, vmax = float(K_q_flat.min()), float(K_q_flat.max())
+            if vmax == vmin: vmax = vmin + 1e-6
+            t = np.linspace(0, 1, 1024)
+            mag = t ** state["gamma"]
+            colors = matplotlib.colormaps.get_cmap("magma")(mag)
+            colors[:, 3] = mag ** eff_alpha_power
+            
+            layer.colormap = Colormap(colors, name='custom_sequential')
+            layer.contrast_limits = [vmin, vmax]
             info_line = fmt_info_sequential(float(K_q_flat.min()), float(K_q_flat.max()), sat, state["gamma"], "magma")
             
-        layer.border_color[:, 3] = 0.0
-        set_info(tag, info_line + f"  ({positions.shape[0]:,} / {K_q_flat.size:,} pts, thresh={thresh:.3g})")
+        layer.data = vol
+        # Dense layers iterate over template_full[::R, ::R, ::R] and produce
+        # voxel_idx = sub_idx * R (full-resolution voxel indices). To place
+        # dense voxel (i, j, k) at full-res display position (i*R, j*R, k*R)
+        # the scale is just (R, R, R) and translate is zero — regardless of
+        # graph stride or bbox mode. Multiplying by sv_scale (= [stride]*3 in
+        # the strided path) used to inflate the volume by a factor of `stride`,
+        # which is why the dense brain rendered far larger than the sparse
+        # training-node layers in the same scene.
+        rs = float(render_stride)
+        layer.scale = np.array([rs, rs, rs], dtype=np.float32)
+        layer.translate = np.zeros(3, dtype=np.float32)
+        
+        set_info(tag, info_line + f"  ({K_q_flat.size:,} voxels)")
+
+    def _update_sparse_image_layer(layer, values: np.ndarray, label: str, tag: str,
+                                   cmap_name: str | None = None,
+                                   mode: str = "auto"):
+        """Splat per-node `values` into a sub_volume-shaped array at
+        node_voxel_idx and update an Image layer.
+
+        mode: "sequential" → magma, "diverging" → RdBu_r centred at 0,
+              "auto" picks diverging if values have any negatives, else sequential.
+        cmap_name: optional override for the colormap name.
+        """
+        from napari.utils.colormaps import Colormap
+        if values.size == 0:
+            set_info(tag, "(empty result)")
+            return
+
+        # Splat into a fresh sub-volume each time (cheap: shape = sub_volume).
+        vol = np.zeros(sub_shape, dtype=np.float32)
+        vol[node_idx[:, 0], node_idx[:, 1], node_idx[:, 2]] = values
+
+        sat = float(np.percentile(np.abs(values), 99))
+        is_3d = viewer.dims.ndisplay == 3
+        eff_alpha_power = float(state.get("alpha_power", 3.0)) if is_3d else 1.0
+
+        effective_mode = mode
+        if effective_mode == "auto":
+            effective_mode = "diverging" if (values < 0).any() else "sequential"
+
+        if effective_mode == "diverging":
+            cname = cmap_name or "RdBu_r"
+            t = np.linspace(0, 1, 1024)
+            val = (t - 0.5) * 2.0
+            mag = np.abs(val) ** state["gamma"]
+            norm = 0.5 + 0.5 * np.sign(val) * mag
+            colors = matplotlib.colormaps.get_cmap(cname)(norm)
+            colors[:, 3] = mag ** eff_alpha_power
+            layer.colormap = Colormap(colors, name=f'sparse_div_{tag}')
+            layer.contrast_limits = [-sat if sat > 0 else -1e-6, sat if sat > 0 else 1e-6]
+            info_line = fmt_info_diverging(float(values.min()), float(values.max()), sat, state["gamma"], cname)
+        else:
+            cname = cmap_name or "magma"
+            vmin, vmax = float(values.min()), float(values.max())
+            if vmax == vmin: vmax = vmin + 1e-6
+            t = np.linspace(0, 1, 1024)
+            mag = t ** state["gamma"]
+            colors = matplotlib.colormaps.get_cmap(cname)(mag)
+            colors[:, 3] = mag ** eff_alpha_power
+            layer.colormap = Colormap(colors, name=f'sparse_seq_{tag}')
+            layer.contrast_limits = [vmin, vmax]
+            info_line = fmt_info_sequential(float(values.min()), float(values.max()), sat, state["gamma"], cname)
+
+        layer.data = vol
+        # scale/translate were set at creation; no need to reapply each refresh
+        set_info(tag, info_line + f"  ({values.size:,} nodes)")
 
     def refresh_G_dense():
         if not g_dense_layer.visible: return
@@ -819,7 +817,7 @@ def main():
             ctx["eigvec"][:, k], ctx, ctx["laplacian_op"], state["render_stride"],
             bump_scale=state["bump_scale"], bump_decay=state["bump_decay"], batch_size=int(args["nystrom_batch_size"])
         )
-        _update_dense_points_layer(g_dense_layer, phi_q, voxel_idx.astype(np.float32), f"G_dense φ_{k}", "G_dense")
+        _update_dense_image_layer(g_dense_layer, phi_q, voxel_idx, f"G_dense φ_{k}", "G_dense")
 
     def refresh_D_dense():
         if not d_dense_layer.visible: return
@@ -829,7 +827,7 @@ def main():
             Lf_node, ctx, ctx["laplacian_op"], state["render_stride"],
             bump_scale=state["bump_scale"], bump_decay=state["bump_decay"], batch_size=int(args["nystrom_batch_size"])
         )
-        _update_dense_points_layer(d_dense_layer, Lf_q, voxel_idx.astype(np.float32), f"D_dense L·δ_{s}", "D_dense")
+        _update_dense_image_layer(d_dense_layer, Lf_q, voxel_idx, f"D_dense L·δ_{s}", "D_dense")
 
     def refresh_K_dense():
         if not k_dense_layer.visible: return
@@ -838,62 +836,100 @@ def main():
             Lf_node, ctx, ctx["laplacian_op"], state["render_stride"],
             bump_scale=state["bump_scale"], bump_decay=state["bump_decay"], batch_size=int(args["nystrom_batch_size"])
         )
-        _update_dense_points_layer(k_dense_layer, Lf_q, voxel_idx.astype(np.float32), "K_dense L·density", "K_dense")
+        _update_dense_image_layer(k_dense_layer, Lf_q, voxel_idx, "K_dense L·density", "K_dense")
 
     def refresh_J():
         if j_layer is None or not j_layer.visible: return
         s = current_src()
-        K_q, voxel_idx = kernel_at_dense_grid(s, ctx, ctx["laplacian_op"], ctx["eigval"], ctx["eigvec"], state["nu"], state["lengthscale"], state["num_modes"], state["render_stride"], bump_scale=state["bump_scale"], bump_decay=state["bump_decay"], batch_size=int(args["nystrom_batch_size"]))
-        _update_dense_points_layer(j_layer, K_q, voxel_idx.astype(np.float32), "J Manif Kernel", "J")
+        K_q, voxel_idx = kernel_at_dense_grid(s, ctx, state["render_stride"], batch_size=int(args["nystrom_batch_size"]))
+        _update_dense_image_layer(j_layer, K_q, voxel_idx, "J Manif Kernel", "J")
 
     def refresh_L():
         if l_layer is None or not l_layer.visible: return
         s = current_src()
         K_q, voxel_idx = euclidean_kernel_at_dense_grid(s, ctx, state["nu"], state["lengthscale"], state["render_stride"])
-        _update_dense_points_layer(l_layer, K_q, voxel_idx.astype(np.float32), "L Eucl Kernel", "L")
+        _update_dense_image_layer(l_layer, K_q, voxel_idx, "L Eucl Kernel", "L")
 
     def refresh_per_source():
         s = current_src()
-        data = build_lines_for_source(s, ctx, state["num_modes"], state["lengthscale"], state["gamma"], args["k_show"], args["n_targets"], args["target_strategy"], args["source_seed"], state["nu"], args["knn_color_by"])
+        data = build_lines_for_source(s, ctx, state["lengthscale"], state["gamma"], args["k_show"], args["n_targets"], args["target_strategy"], args["source_seed"], state["nu"], args["knn_color_by"])
         for key in ("knn", "matern", "riemann"): replace_shapes_layer(viewer, layer_state, key, data[key]["lines"], data[key]["colors"], data[key]["widths"])
 
+        face_colors = ["red"] * len(src_idxs)
+        face_colors[state["src_pick"] % len(src_idxs)] = "yellow"
+        viewer.layers["source nodes"].face_color_mode = 'direct'
+        viewer.layers["source nodes"].face_color = face_colors
+
+    def _batched_features_reduce(reduce_fn, batch_size: int):
+        """Iterate matern_kernel.features over training nodes in batches and
+        reduce per-batch on GPU before moving to CPU. `reduce_fn(feat_batch)`
+        must return a 1D tensor of length batch_size that can be concatenated.
+
+        Avoids the OOM in refresh_C / refresh_F where calling features() on the
+        full reference_nodes set tries to materialise an (N, K_nn, num_modes)
+        intermediate inside out_of_sample — ~133 GiB at N=458K, K=15, modes=1300.
+        Batching keeps the intermediate to (batch, K_nn, num_modes).
+        """
+        nodes = ctx["reference_nodes"]
+        N = nodes.shape[0]
+        out = np.empty(N, dtype=np.float32)
+        mk = ctx["matern_kernel"]
+        for s_ in range(0, N, batch_size):
+            e_ = min(s_ + batch_size, N)
+            feat_b = mk.features(nodes[s_:e_])
+            out[s_:e_] = reduce_fn(feat_b).detach().cpu().numpy()
+            del feat_b
+        return out
+
     def refresh_C():
-        d = kernel_diagonal_from_eigvecs(ctx["eigval"], ctx["eigvec"], state["nu"], state["lengthscale"], state["num_modes"])
-        color_nodes_sequential(c_layer, d, state["gamma"], "magma")
-        set_info("C", fmt_info_sequential(float(d.min()), float(d.max()), float(np.percentile(np.abs(d), 99)), state["gamma"], "magma"))
+        # d_i = ||features(node_i)||^2 — reduce within each batch so the full
+        # features tensor never lives in memory at once.
+        d = _batched_features_reduce(
+            lambda fb: (fb ** 2).sum(dim=-1),
+            batch_size=int(args["nystrom_batch_size"]),
+        )
+        _update_sparse_image_layer(c_layer, d, "C", "C", cmap_name="magma", mode="sequential")
 
     def refresh_D():
         s = current_src()
         Lf = apply_laplacian_to_delta(ctx["laplacian_op"], s)
-        color_nodes_signed_sparse(d_layer, Lf, "RdBu_r")
-        set_info("D", fmt_info_sparse_signed(float(Lf.min()), float(Lf.max()), float(Lf[Lf>1e-12].max()) if (Lf>1e-12).any() else 0.0, float(Lf[Lf<-1e-12].min()) if (Lf<-1e-12).any() else 0.0, "RdBu_r") + f" (src={s})")
+        _update_sparse_image_layer(d_layer, Lf, f"D (src={s})", "D", cmap_name="RdBu_r", mode="diverging")
 
     def refresh_E():
         s = current_src()
         k_eu = matern_euclidean_at_source(ctx["reference_nodes"][s], ctx["reference_nodes"], state["nu"], state["lengthscale"])
-        color_nodes_sequential(e_layer, k_eu, state["gamma"], "magma")
-        set_info("E", fmt_info_sequential(float(k_eu.min()), float(k_eu.max()), float(np.percentile(np.abs(k_eu), 99)), state["gamma"], "magma") + f" (src={s})")
+        _update_sparse_image_layer(e_layer, k_eu, f"E (src={s})", "E", cmap_name="magma", mode="sequential")
 
     def refresh_F():
+        # k_mf[i] = features(node_i) · features(src) — feat_src is a single
+        # vector, computed once; the inner product reduces each batch's
+        # (batch, num_modes) features to a (batch,) scalar before leaving GPU.
         s = current_src()
-        k_mf = manifold_matern_at_source(s, ctx["eigval"], ctx["eigvec"], state["nu"], state["lengthscale"], state["num_modes"])
-        if (k_mf < 0).any(): color_nodes_diverging(f_layer, k_mf, "RdBu_r", gamma=state["gamma"])
-        else: color_nodes_sequential(f_layer, k_mf, state["gamma"], "magma")
-        set_info("F", fmt_info_sequential(float(k_mf.min()), float(k_mf.max()), float(np.percentile(np.abs(k_mf), 99)), state["gamma"], "magma") + f" (src={s})")
+        matern_kernel = ctx["matern_kernel"]
+        feat_src = matern_kernel.features(ctx["reference_nodes"][s].unsqueeze(0)).squeeze(0)
+        k_mf = _batched_features_reduce(
+            lambda fb: (fb * feat_src).sum(dim=-1),
+            batch_size=int(args["nystrom_batch_size"]),
+        )
+        # mode="auto" → diverging if k_mf has negatives (truncation artefacts),
+        # else sequential. Matches the previous behaviour.
+        _update_sparse_image_layer(f_layer, k_mf, f"F (src={s})", "F", mode="auto")
 
     def refresh_G():
         k = int(state["eigvec_idx"])
         phi = ctx["eigvec"][:, k].cpu().numpy()
-        color_nodes_diverging(g_layer, phi, "RdBu_r", gamma=state["gamma"])
-        set_info("G", fmt_info_diverging(float(phi.min()), float(phi.max()), float(np.percentile(np.abs(phi), 99)), state["gamma"], "RdBu_r") + f" (λ={ctx['eigval'][k].item():.4g})")
+        _update_sparse_image_layer(g_layer, phi, f"G φ_{k}", "G", cmap_name="RdBu_r", mode="diverging")
 
     def refresh_K():
         if not k_layer.visible: return
         Lf = apply_laplacian_to_density(ctx["laplacian_op"], ctx["sub_volume"], ctx["node_voxel_idx"], sigma=state["density_smooth_sigma"])
-        color_nodes_diverging(k_layer, Lf, "RdBu_r", gamma=state["gamma"])
-        set_info("K", fmt_info_diverging(float(Lf.min()), float(Lf.max()), float(np.percentile(np.abs(Lf), 99)), state["gamma"], "RdBu_r"))
+        _update_sparse_image_layer(k_layer, Lf, "K L·density", "K", cmap_name="RdBu_r", mode="diverging")
 
-    # Initial boot sequence
+    # Initial boot sequence (B1 and H are static — set once from precomputed
+    # diag/degree values; the others depend on src / k / etc and get refreshed
+    # via the controls callback below)
+    _update_sparse_image_layer(b1_layer, lap_diag_vals, "B1 diag(L)", "B1", cmap_name="cividis", mode="sequential")
+    _update_sparse_image_layer(h_layer,   deg_vals,      "H D_i",     "H",  cmap_name="cividis", mode="sequential")
     refresh_per_source(); refresh_C(); refresh_D(); refresh_E(); refresh_F(); refresh_G()
 
     bump_widget, update_bump_plot = make_bump_widget(ctx["bw"], state["bump_scale"], state["bump_decay"])
@@ -907,15 +943,24 @@ def main():
         lengthscale={"label": "ℓ (Matern lengthscale)", "min": 1e-3, "max": 10.0, "step": 1e-3},
         eigvec_idx={"label": "eigenvector index (G)", "min": 0, "max": ctx["eigvec"].shape[1] - 1},
         gamma={"label": "color gamma", "min": 0.1, "max": 2.0, "step": 0.05},
-        alpha_power={"label": "contrast (1=flat, ↑=peak isolation)", "min": 1.0, "max": 16.0, "step": 0.5},
+        alpha_power={"label": "opacity sharpness", "min": 0.5, "max": 8.0, "step": 0.5},
         render_stride={"label": "render stride (J, L)", "min": 1, "max": 8},
         bump_scale={"label": "bump scale (× bw)", "min": 0.001, "max": 200.0, "step": 0.1},
         bump_decay={"label": "bump decay", "min": 0.001, "max": 2.0, "step": 0.001},
         density_smooth_sigma={"label": "L·density: σ (voxels)", "min": 0.0, "max": 10.0, "step": 0.1},
     )
-    def controls(src_pick=state["src_pick"], num_modes=state["num_modes"], nu=state["nu"], lengthscale=state["lengthscale"], eigvec_idx=state["eigvec_idx"], gamma=state["gamma"], alpha_power=state.get("alpha_power", 1.0), render_stride=state["render_stride"], bump_scale=state["bump_scale"], bump_decay=state["bump_decay"], density_smooth_sigma=state["density_smooth_sigma"]):
-        chg_src, chg_K, chg_nu, chg_ls, chg_eig, chg_gamma, chg_alpha, chg_rs, chg_bs, chg_bd, chg_sigma = src_pick != state["src_pick"], num_modes != state["num_modes"], nu != state["nu"], lengthscale != state["lengthscale"], eigvec_idx != state["eigvec_idx"], gamma != state["gamma"], alpha_power != state.get("alpha_power", 1.0), render_stride != state["render_stride"], bump_scale != state["bump_scale"], bump_decay != state["bump_decay"], density_smooth_sigma != state["density_smooth_sigma"]
+    def controls(src_pick=state["src_pick"], num_modes=state["num_modes"], nu=state["nu"], lengthscale=state["lengthscale"], eigvec_idx=state["eigvec_idx"], gamma=state["gamma"], alpha_power=state.get("alpha_power", 3.0), render_stride=state["render_stride"], bump_scale=state["bump_scale"], bump_decay=state["bump_decay"], density_smooth_sigma=state["density_smooth_sigma"]):
+        chg_src, chg_K, chg_nu, chg_ls, chg_eig, chg_gamma, chg_alpha, chg_rs, chg_bs, chg_bd, chg_sigma = src_pick != state["src_pick"], num_modes != state["num_modes"], nu != state["nu"], lengthscale != state["lengthscale"], eigvec_idx != state["eigvec_idx"], gamma != state["gamma"], alpha_power != state.get("alpha_power", 3.0), render_stride != state["render_stride"], bump_scale != state["bump_scale"], bump_decay != state["bump_decay"], density_smooth_sigma != state["density_smooth_sigma"]
         state.update(src_pick=src_pick, num_modes=num_modes, nu=nu, lengthscale=lengthscale, eigvec_idx=eigvec_idx, gamma=gamma, alpha_power=alpha_power, render_stride=render_stride, bump_scale=bump_scale, bump_decay=bump_decay, density_smooth_sigma=density_smooth_sigma)
+
+        # Sync visualizer state back to the actual library kernel!
+        kernel = ctx["matern_kernel"]
+        kernel.nu = state["nu"]
+        # Use torch.tensor for lengthscale to match gpytorch params
+        kernel.lengthscale = torch.tensor(state["lengthscale"], device=ctx["device"])
+        kernel.num_modes = state["num_modes"]
+        kernel.bump_scale = state["bump_scale"]
+        kernel.bump_decay = state["bump_decay"]
 
         if chg_src or chg_K or chg_nu or chg_ls or chg_gamma or chg_alpha: refresh_per_source()
         if chg_K or chg_nu or chg_ls or chg_gamma or chg_alpha: refresh_C()
@@ -941,8 +986,13 @@ def main():
     d_dense_layer.events.visible.connect(lambda e: refresh_D_dense() if d_dense_layer.visible else None)
     k_dense_layer.events.visible.connect(lambda e: refresh_K_dense() if k_dense_layer.visible else None)
 
-
     def force_refresh_on_dim_switch(event):
+        # B1 and H are static-input but their colormap alpha curve depends
+        # on ndisplay (2D vs 3D), so re-splat with the current mode too.
+        if b1_layer.visible:
+            _update_sparse_image_layer(b1_layer, lap_diag_vals, "B1 diag(L)", "B1", cmap_name="cividis", mode="sequential")
+        if h_layer.visible:
+            _update_sparse_image_layer(h_layer, deg_vals, "H D_i", "H", cmap_name="cividis", mode="sequential")
         if c_layer.visible: refresh_C()
         if d_layer.visible: refresh_D()
         if e_layer.visible: refresh_E()
@@ -958,8 +1008,14 @@ def main():
 
     viewer.dims.events.ndisplay.connect(force_refresh_on_dim_switch)
 
-    napari.run()
+    # All layers now have real sub_shape data (boot sequence populated B1/H
+    # statically and the refresh_X functions populated C/D/E/F/G dynamically).
+    # Flipping to 3D here builds volume visuals against real data, not the
+    # (2,2,2) placeholder — sidestepping the vispy "Volume visual needs a 3D
+    # array" error on first construction.
+    viewer.dims.ndisplay = 3
 
+    napari.run()
 
 if __name__ == "__main__":
     main()
