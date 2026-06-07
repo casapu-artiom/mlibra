@@ -17,6 +17,11 @@ set -eu
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${TEMPLATE_NAME:=reference}"
+: "${LIPIDS_FILE:=/home/casap/mlibra_git/maldi/data/lipid_subset.txt}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
+: "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
+: "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
+: "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 
 # -------------------------------------------------------------------------
 # Graph / kernel config — every one of these is a sweep dimension when
@@ -39,6 +44,7 @@ set -eu
 : "${N_TEST_ON:=200}"
 : "${N_TEST_OFF:=200}"
 : "${TEST_SEED:=42}"
+: "${GEODESIC_ANCHORS:=500}"
 
 # -------------------------------------------------------------------------
 # Output filename. Defaults to a slug-named per-config CSV under OUTPUT_DIR
@@ -107,6 +113,13 @@ python "$SRC_PATH/maldi/laplacian_test.py" \
     --n-test-off "$N_TEST_OFF" \
     --test-seed "$TEST_SEED" \
     --out "$OUT_CSV" \
-    --skip-if-row-exists \
+    --maldi-file        "$MALDI_FILE" \
+    --dataset-path      "$DATA_PATH" \
+    --available-lipids-file "$AVAILABLE_LIPIDS_FILE" \
+    --slices-dataset-file   "$SLICES_DATASET_FILE" \
+    --lipids-file           "$LIPIDS_FILE" \
+    --output-dir "$OUTPUT_DIR" \
+    --fold-side test \
+    --geodesic-anchors $GEODESIC_ANCHORS \
     "${EXTRA_ARGS[@]}" \
     "$@"

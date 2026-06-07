@@ -29,13 +29,34 @@ Diagnostics:
                        if the Laplacian itself is fine
   spectral_gap         λ_2 − λ_1; tiny gap ⇒ near-disconnected components
   condition_number     λ_max / λ_min_positive; large ⇒ near-singular
+
+Extended diagnostics (columns prefixed diag_*), answering why the implicit-
+manifold GP can underperform a Euclidean Matern:
+  Q1/Q3 diag_geo_*, diag_dspec_*  geodesic vs spectral vs euclidean distance
+                       (opt-in: --geodesic-anchors N). geo_euc_spearman ~1 and
+                       ratio_p95 ~1 ⇒ manifold buys nothing here.
+  Q2  diag_ortho_l2_offmax vs diag_ortho_deg_offmax  reveals whether the
+                       eigvecs are degree-orthonormal (kernel assumes L2) ⇒
+                       density-modulated prior variance (diag_varproxy_ratio).
+                       diag_eig_resid_* convergence; diag_weyl_* intrinsic dim;
+                       diag_n_components vs diag_n_zero_modes connectivity.
+       diag_oos_*      (1 - bw²λ)² OOS-denominator zero-crossings; participation
+                       ratio = effective #modes the kernel actually uses.
+  Q4  diag_maldi_*     (opt-in: --maldi-file + a fold). Configure the fold the
+                       same way the per-lipid trainer does: --slices-dataset-file
+                       + --available-lipids-file (+ --lipids-file) via MaldiConfig,
+                       or manually with --fold-filter / --fold-column. Reports snap
+                       + bump coverage, spectral content of the lipid signal vs
+                       prior weight, and manifold-vs-euclidean structure match.
 """
+
 from __future__ import annotations
 
 import argparse
 import csv
 import json
 import logging
+import re
 import sys
 import time
 import traceback
@@ -44,6 +65,10 @@ from typing import Any
 
 import numpy as np
 import torch
+
+import scipy.sparse as _sp
+import scipy.sparse.csgraph as _csg
+from scipy.stats import spearmanr as _spearmanr
 
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
@@ -54,7 +79,7 @@ from manifold_gp.utils.compute_eigenvectors import (
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
 )
-from utils import crop_or_stride_volume, reference_ccf_from_subvolume
+from utils import coord_norm_from_reference, crop_or_stride_volume, reference_ccf_from_subvolume
 
 try:
     from manifold_gp.utils import bump_function as _lib_bump_function
@@ -290,6 +315,656 @@ def evaluate_kernel_psd(
     return out
 
 
+# =========================================================================
+# EXTENDED DIAGNOSTICS
+#
+# These answer the four questions about *why* the implicit-manifold GP can
+# underperform a Euclidean Matern, and emit flat scalar metrics so they slot
+# straight into the one-row-per-config CSV:
+#
+#   Q1  do the eigvecs/eigvals approximate geodesic distance?   (geodesic_*)
+#   Q2  is the eigen/Laplacian computation healthy / bug-free?  (eigen_health_*)
+#   Q3  is geodesic distance even meaningful, or ~= euclidean?  (geo_euc_*)
+#   Q4  does the kernel match the real MALDI lipid structure?   (maldi_*)
+#
+# Cheap checks (eigen-health, bandwidth/OOS) run by default. The expensive
+# geodesic (Dijkstra) and MALDI-data checks are opt-in: geodesic via
+# --geodesic-anchors > 0, MALDI via --maldi-file. Pass --diag-plot-dir to
+# also dump PNGs (off by default so the sweep stays headless).
+# =========================================================================
+def _spectral_density_np(eigval: np.ndarray, nu: float, lengthscale: float) -> np.ndarray:
+    """Matches RiemannMaternKernel.spectral_density()."""
+    safe = np.clip(eigval.astype(np.float64), 0.0, None)
+    return (2.0 * float(nu) / float(lengthscale) ** 2 + safe) ** (-float(nu))
+
+
+def _kernel_features_np(eigval: np.ndarray, eigvec: np.ndarray,
+                        nu: float, lengthscale: float,
+                        node_idx: np.ndarray) -> np.ndarray:
+    """In-sample feature map for selected nodes, matching
+    RiemannKernel.features(): f_k(i) = sqrt(S_k/sum(S) * N) * phi_k(i)."""
+    S = _spectral_density_np(eigval, nu, lengthscale)
+    S = S / max(S.sum(), 1e-12)
+    scale = np.sqrt(S * eigvec.shape[0])
+    return scale[None, :] * eigvec[node_idx]
+
+
+def eigen_health_diagnostics(
+    laplacian_op: GraphLaplacianOperator,
+    eigval: torch.Tensor,
+    eigvec: torch.Tensor,
+    edge_index: torch.Tensor,
+    norm: str,
+    n_res_modes: int = 64,
+) -> dict:
+    """Q2 — health of the eigen-decomposition and the graph.
+
+    * connected components vs number of ~zero eigenvalues
+    * orthonormality in BOTH inner products: phi^T phi (L2) and phi^T D phi
+      (degree). For randomwalk, LaplacianEigensolver._postprocess returns
+      DEGREE-orthonormal vectors (it applies D^-1/2 and does NOT re-L2-
+      normalize), while the kernel's feature scaling assumes a uniform (L2)
+      measure -> a degree-modulated, non-stationary prior variance. These two
+      numbers make that visible.
+    * eigen-residual ||L phi - lambda phi||/|lambda| via the REAL operator
+      matmul (faithful to deployment, both norms).
+    * Weyl-law slope of lambda_k vs k -> intrinsic dimension estimate.
+    """
+    N, M = int(eigvec.shape[0]), int(eigvec.shape[1])
+    out: dict[str, Any] = {}
+
+    # --- connected components (CPU, from edge_index) ---
+    ei = edge_index.detach().cpu().numpy()
+    data = np.ones(ei.shape[1], dtype=np.float64)
+    A = _sp.coo_matrix((data, (ei[0], ei[1])), shape=(N, N))
+    A = A + A.T
+    n_comp, _ = _csg.connected_components(A, directed=False)
+    ev_np = eigval.detach().cpu().numpy().astype(np.float64)
+    lam_scale = max(abs(ev_np).max(), 1e-30)
+    n_zero = int(np.sum(np.abs(ev_np) < 1e-8 * lam_scale))
+    out["diag_n_components"] = int(n_comp)
+    out["diag_n_zero_modes"] = n_zero
+
+    # --- orthonormality (L2 vs degree) on a column subset ---
+    k = min(M, 200)
+    cols = torch.linspace(0, M - 1, k).round().long().to(eigvec.device)
+    Phi = eigvec.index_select(1, cols)
+    eye = torch.eye(k, device=eigvec.device, dtype=Phi.dtype)
+    G_l2 = Phi.t() @ Phi
+    deg = laplacian_op.degree_mat.to(Phi.dtype)
+    G_D = Phi.t() @ (deg.view(-1, 1) * Phi)
+    out["diag_ortho_l2_offmax"] = float((G_l2 - eye).abs().max().item())
+    out["diag_ortho_deg_offmax"] = float((G_D - eye).abs().max().item())
+    # marginal-variance non-uniformity proxy: sum_k phi_k(i)^2 across nodes
+    var_proxy = (eigvec ** 2).sum(dim=1)
+    out["diag_varproxy_ratio"] = float(
+        (var_proxy.max() / var_proxy.clamp(min=1e-30).min()).item()
+    )
+
+    # --- eigen-residuals via the real operator matmul ---
+    nres = min(n_res_modes, M)
+    sel = torch.linspace(0, M - 1, nres).round().long().to(eigvec.device)
+    V = eigvec.index_select(1, sel)
+    lam = eigval.index_select(0, sel)
+    with torch.no_grad():
+        LV = laplacian_op._matmul(V)
+    resid = torch.linalg.norm(LV - lam.view(1, -1) * V, dim=0)
+    rel = (resid / lam.abs().clamp(min=1e-12)).detach().cpu().numpy()
+    out["diag_eig_resid_median"] = float(np.median(rel))
+    out["diag_eig_resid_p90"] = float(np.percentile(rel, 90))
+    out["diag_eig_resid_max"] = float(rel.max())
+
+    # --- Weyl law ---
+    pos = ev_np[ev_np > lam_scale * 1e-8]
+    if pos.size > 10:
+        kk = np.arange(1, pos.size + 1)
+        lo, hi = int(0.1 * pos.size), int(0.8 * pos.size)
+        slope = float(np.polyfit(np.log(kk[lo:hi]), np.log(pos[lo:hi]), 1)[0])
+        out["diag_weyl_slope"] = slope
+        out["diag_weyl_dim"] = float(2.0 / slope) if slope > 0 else float("nan")
+    return out
+
+
+def bandwidth_oos_diagnostics(
+    eigval: torch.Tensor, graphbandwidth: float, nu: float, lengthscale: float,
+) -> dict:
+    """Cheap bandwidth/OOS sanity.
+
+    The out-of-sample spectral density divides by (1 - bw^2 lambda)^2 (clamped
+    at 1e-6). If bw^2*lambda crosses 1 for high modes, that correction blows
+    up / sign-flips on OFF-graph test points. The eigvals are FROZEN at the
+    solve-time bandwidth, so if training learns a different graphbandwidth the
+    misalignment worsens. Also report the spectral-density participation ratio
+    (effective number of modes the kernel actually uses)."""
+    ev = eigval.detach().cpu().numpy().astype(np.float64)
+    z = (float(graphbandwidth) ** 2) * ev
+    n_bad = int(np.sum(z >= 1.0))
+    out = {
+        "diag_oos_bw2lam_max": float(z.max()),
+        "diag_oos_denom_crossings": n_bad,
+        "diag_oos_first_crossing_mode": int(np.argmax(z >= 1.0)) if n_bad else -1,
+    }
+    S = _spectral_density_np(ev, nu, lengthscale)
+    S = S / max(S.sum(), 1e-30)
+    out["diag_smat_participation_ratio"] = float((S.sum() ** 2) / (S ** 2).sum())
+    return out
+
+
+def geodesic_distance_diagnostics(
+    edge_index: torch.Tensor, edge_value: torch.Tensor,
+    reference_nodes: torch.Tensor,
+    eigval: torch.Tensor, eigvec: torch.Tensor,
+    nu: float, lengthscale: float,
+    n_anchors: int, seed: int = 0,
+    plot_dir: Path | None = None, plot_tag: str = "",
+) -> dict:
+    """Q1 + Q3 — geodesic vs spectral vs euclidean distance.
+
+    Geodesic = Dijkstra on the graph with euclidean edge lengths
+    (sqrt(edge_value)). Spectral = the kernel-induced distance from the frozen
+    eigenpairs + Matern spectral density. Reports Spearman correlations and the
+    geodesic/euclidean ratio. If geodesic ~= euclidean the manifold buys
+    nothing here; if d_spec tracks geodesic poorly at full num_modes you're
+    mode-starved or the basis is wrong (see eigen-health)."""
+    N = int(reference_nodes.shape[0])
+    rng = np.random.default_rng(seed)
+    anchors = rng.choice(N, size=min(n_anchors, N), replace=False)
+
+    ei = edge_index.detach().cpu().numpy()
+    ev = edge_value.detach().cpu().numpy().astype(np.float64)
+    lengths = np.sqrt(np.maximum(ev, 0.0))
+    Wlen = _sp.coo_matrix((lengths, (ei[0], ei[1])), shape=(N, N)).tocsr()
+    Dgeo_full = _csg.dijkstra(Wlen, directed=False, indices=anchors)  # (A, N)
+    reach = float(np.isfinite(Dgeo_full).mean())
+    Dgeo = Dgeo_full[:, anchors]
+
+    coords = reference_nodes.detach().cpu().numpy().astype(np.float64)[anchors]
+    diff = coords[:, None, :] - coords[None, :, :]
+    Deuc = np.sqrt((diff ** 2).sum(-1))
+
+    iu = np.triu_indices(len(anchors), k=1)
+    geo_v, euc_v = Dgeo[iu], Deuc[iu]
+    ok = np.isfinite(geo_v)
+    ratio = geo_v[ok] / np.maximum(euc_v[ok], 1e-9)
+
+    ev_np = eigval.detach().cpu().numpy()
+    evec_np = eigvec.detach().cpu().numpy()
+
+    def dspec(modes):
+        F = _kernel_features_np(ev_np[:modes], evec_np[:, :modes],
+                                nu, lengthscale, anchors)
+        Kg = F @ F.T
+        dK = np.diag(Kg)
+        return np.sqrt(np.clip(dK[:, None] + dK[None, :] - 2 * Kg, 0, None))[iu]
+
+    M = evec_np.shape[1]
+    m_low = max(1, M // 10)
+    ds_full = dspec(M)
+    ds_low = dspec(m_low)
+    out = {
+        "diag_geo_reachable_frac": reach,
+        "diag_geo_euc_spearman": float(_spearmanr(geo_v[ok], euc_v[ok]).statistic),
+        "diag_geo_euc_ratio_median": float(np.median(ratio)),
+        "diag_geo_euc_ratio_p95": float(np.percentile(ratio, 95)),
+        "diag_dspec_geo_spearman_full": float(_spearmanr(ds_full[ok], geo_v[ok]).statistic),
+        "diag_dspec_geo_spearman_low": float(_spearmanr(ds_low[ok], geo_v[ok]).statistic),
+        "diag_dspec_euc_spearman_full": float(_spearmanr(ds_full[ok], euc_v[ok]).statistic),
+        "diag_geo_n_anchors": int(len(anchors)),
+        "diag_geo_modes_low": int(m_low),
+    }
+    if plot_dir is not None:
+        _try_plot_geodesic(plot_dir, plot_tag, euc_v[ok], geo_v[ok],
+                           ds_full[ok], out)
+    return out
+
+
+def _kernel_vs_data_core(
+    Xs: np.ndarray, Y: np.ndarray,
+    knn, reference_nodes: torch.Tensor,
+    eigval: torch.Tensor, eigvec: torch.Tensor,
+    nu: float, lengthscale: float, graphbandwidth: float, bump_scale: float,
+    seed: int = 0, n_pairs: int = 40000,
+    plot_dir: Path | None = None, plot_tag: str = "",
+) -> dict:
+    """Shared analysis: given standardized coords Xs (N,3) and z-scored lipid
+    values Y (N,K) — already in the GRAPH's coordinate space — report:
+      * snap distances + fraction within the bump support (bump_scale*bw)
+      * spectral content of the lipid signal on the eigenbasis vs prior weight
+      * Spearman(kernel correlation, -|y_i - y_j|) for manifold vs euclidean.
+    Used by both the parquet front-end and the run-dir (fold) front-end."""
+    device = reference_nodes.device
+    Xs_t = torch.tensor(Xs, dtype=torch.float32, device=device).contiguous()
+    val, idx = knn.search(Xs_t, 1)
+    snap_d = val.squeeze(-1).clamp(min=0).sqrt().detach().cpu().numpy()
+    snap_i = idx.squeeze(-1).detach().cpu().numpy().astype(np.int64)
+    support = float(bump_scale) * float(graphbandwidth)
+
+    N = int(reference_nodes.shape[0])
+    out: dict[str, Any] = {
+        "diag_maldi_n_points": int(Xs.shape[0]),
+        "diag_maldi_snap_median": float(np.median(snap_d)),
+        "diag_maldi_snap_p95": float(np.percentile(snap_d, 95)),
+        "diag_maldi_bump_support": support,
+        "diag_maldi_frac_in_support": float(np.mean(snap_d < support)),
+    }
+
+    sig = Y.mean(axis=1)
+    node_sum = np.zeros(N); node_cnt = np.zeros(N)
+    np.add.at(node_sum, snap_i, sig)
+    np.add.at(node_cnt, snap_i, 1.0)
+    hit = node_cnt > 0
+    s_node = np.zeros(N)
+    s_node[hit] = node_sum[hit] / node_cnt[hit]
+    out["diag_maldi_node_coverage"] = float(hit.mean())
+
+    evec_np = eigvec.detach().cpu().numpy()
+    ev_np = eigval.detach().cpu().numpy()
+    s = s_node.copy(); s[hit] -= s[hit].mean()
+    c = evec_np.T @ s
+    energy = c ** 2; energy /= max(energy.sum(), 1e-30)
+    cum = np.cumsum(energy)
+    S = _spectral_density_np(ev_np, nu, lengthscale); S /= S.sum()
+    cumS = np.cumsum(S)
+    M = len(c)
+    mode_at = lambda f, cu: int(np.searchsorted(cu, f)) + 1
+    out["diag_maldi_e50_mode"] = mode_at(.5, cum)
+    out["diag_maldi_e90_mode"] = mode_at(.9, cum)
+    out["diag_maldi_e90_mode_frac"] = float(mode_at(.9, cum) / M)
+    out["diag_maldi_prior_e90_mode"] = mode_at(.9, cumS)
+    out["diag_maldi_tail_energy_beyond_modes"] = float(max(0.0, 1.0 - cum[-1]))
+
+    rng = np.random.default_rng(seed)
+    hit_nodes = np.flatnonzero(hit)
+    if hit_nodes.size >= 2:
+        if hit_nodes.size > 4000:
+            hit_nodes = rng.choice(hit_nodes, 4000, replace=False)
+        a = rng.choice(hit_nodes, n_pairs); b = rng.choice(hit_nodes, n_pairs)
+        keep = a != b; a, b = a[keep], b[keep]
+        F = _kernel_features_np(ev_np, evec_np, nu, lengthscale,
+                                np.concatenate([a, b]))
+        Fa, Fb = F[:len(a)], F[len(a):]
+        Kab = (Fa * Fb).sum(1)
+        Kman = Kab / np.sqrt(np.clip((Fa * Fa).sum(1) * (Fb * Fb).sum(1), 1e-30, None))
+        coords = reference_nodes.detach().cpu().numpy().astype(np.float64)
+        dd = np.sqrt(((coords[a] - coords[b]) ** 2).sum(1))
+        from scipy.special import kv, gamma as gfn
+        z = np.sqrt(2 * nu) * dd / lengthscale
+        Keuc = np.ones_like(dd); nz = dd > 0
+        Keuc[nz] = (2 ** (1 - nu) / gfn(nu)) * (z[nz] ** nu) * kv(nu, z[nz])
+        dissim = np.abs(s_node[a] - s_node[b])
+        out["diag_maldi_match_spearman_manifold"] = float(_spearmanr(Kman, -dissim).statistic)
+        out["diag_maldi_match_spearman_euclidean"] = float(_spearmanr(Keuc, -dissim).statistic)
+        if plot_dir is not None:
+            _try_plot_maldi(plot_dir, plot_tag, cum, cumS, dd, dissim)
+    return out
+
+
+def _parse_fold_filter(fold_filter_json: str | None,
+                       fold_column: str | None,
+                       fold_test_values: list | None):
+    """Turn CLI fold args into a pyarrow `filters` expression — the SAME shape
+    as MaldiConfig.test_filter (which is what the experiment passes to
+    read_parquet). Two ways to specify a fold:
+
+      --fold-filter '[["Section","in",["S1","S2"]]]'   (general; copy your
+          MaldiConfig.test_filter verbatim, or hand-write it). JSON: a list of
+          [col, op, val] predicates (AND), or a list of such lists (OR of ANDs).
+      --fold-column Section --fold-test-values S1 S2    (convenience → "in").
+
+    Returns a pyarrow-style filters object, or None (whole parquet)."""
+    if fold_filter_json:
+        spec = json.loads(fold_filter_json)
+
+        def to_tuples(x):
+            # innermost predicate [col, op, val] -> tuple
+            if (isinstance(x, list) and len(x) == 3 and isinstance(x[0], str)
+                    and isinstance(x[1], str)):
+                return tuple(x)
+            if isinstance(x, list):
+                return [to_tuples(e) for e in x]
+            return x
+        return to_tuples(spec)
+    if fold_column and fold_test_values:
+        return [(fold_column, "in", list(fold_test_values))]
+    return None
+
+
+def maldi_data_diagnostics(
+    maldi_file: str, lipids: list, log_transform: bool,
+    knn, reference_nodes: torch.Tensor,
+    eigval: torch.Tensor, eigvec: torch.Tensor,
+    nu: float, lengthscale: float,
+    graphbandwidth: float, bump_scale: float,
+    fold_filter=None,
+    max_rows: int = 400000, n_pairs: int = 40000, seed: int = 0,
+    plot_dir: Path | None = None, plot_tag: str = "",
+) -> dict:
+    """Q4 — does the kernel match the MALDI lipid structure on a given FOLD?
+
+    The fold is configured ON THE COMMAND LINE via `fold_filter` (a pyarrow
+    filter expression == MaldiConfig.test_filter), so no trained run dir is
+    needed. Reads coords + the requested lipids for the fold's rows the way
+    experiment.py does, snaps each point to the nearest graph node, and reports
+    snap/bump coverage, the spectral content of the lipid signal vs the prior
+    weight, and the manifold-vs-euclidean structure match.
+
+    Coordinate normalization: by default coord_mean/std are computed from the
+    GLOBAL parquet coords (all rows) — matching get_inducing_points' whole-brain
+    statistics, which the deployed model uses and which are fold-independent.
+    Override with coord_mean/coord_std (e.g. --coord-mean/--coord-std) if your
+    get_inducing_points does something else."""
+    import pandas as pd
+    coord_cols = ["xccf", "yccf", "zccf"]
+    lip_cols = [str(l) for l in lipids]
+
+    # --- coord normalization: global whole-brain stats unless overridden ---
+    g = pd.read_parquet(maldi_file, columns=coord_cols)  # all rows, 3 cols
+    if max_rows and len(g) > max_rows:
+        g = g.sample(max_rows, random_state=0)
+    gx = g[coord_cols].to_numpy(np.float64)
+    cm, cs = gx.mean(0), gx.std(0)
+    cs[cs < 1e-6] = 1e-6
+    logging.info(f"[maldi] coord stats from GLOBAL parquet: mean={cm}, std={cs}")
+
+    # --- fold rows: coords + requested lipids ---
+    df = pd.read_parquet(maldi_file, columns=coord_cols + lip_cols,
+                         filters=fold_filter)
+    if df.shape[0] == 0:
+        raise RuntimeError(
+            f"Fold filter {fold_filter!r} selected 0 rows from {maldi_file}. "
+            "Check the column name / values."
+        )
+    if max_rows and len(df) > max_rows:
+        df = df.sample(max_rows, random_state=0)
+    X = df[coord_cols].to_numpy(np.float64).copy()
+    Y = df[lip_cols].to_numpy(np.float64).copy()
+    Y[Y < 0] = 0.0
+    if log_transform:
+        Y = np.log(Y + 1e-10)
+    Y = (Y - Y.mean(0)) / (Y.std(0) + 1e-12)
+
+    Xs = (X - cm) / cs
+    out = _kernel_vs_data_core(
+        Xs, Y, knn, reference_nodes, eigval, eigvec,
+        nu, lengthscale, graphbandwidth, bump_scale,
+        seed=seed, n_pairs=n_pairs, plot_dir=plot_dir, plot_tag=plot_tag,
+    )
+    out["diag_maldi_n_lipids"] = int(Y.shape[1])
+    return out
+
+def _safe_filename(name: str) -> str:
+    """Lipid name -> slug, matching lgp_experiment_per_lipid.safe_filename:
+    'PA 36:1 PA 38:4' -> 'PA_36-1_PA_38-4'."""
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.replace(":", "-"))
+    return s.strip("_")
+
+
+def load_fold_from_run_dir(run_dir: Path, lipids: list | None = None):
+    """Load a particular experiment FOLD straight from a trained run dir
+    (the one with config.json / lipid_names.json / graph_meta.npz /
+    predictions/<slug>/). Returns the exact held-out test points and the
+    z-scored ground truth the GP was scored against — no parquet filter
+    reconstruction, and the exact coord normalization from graph_meta.
+
+    Returns dict: coords_mm (N,3), Y (N,K z-scored true), pred (N,K z pred or
+    None), names (K), coord_mean (3), coord_std (3), log_transform, config."""
+    run_dir = Path(run_dir)
+    with open(run_dir / "config.json") as f:
+        config = json.load(f)
+    with open(run_dir / "lipid_names.json") as f:
+        names_all = json.load(f)
+
+    gm_path = run_dir / "graph_meta.npz"
+    if not gm_path.exists():
+        raise FileNotFoundError(
+            f"{gm_path} not found. graph_meta.npz (with coord_mean/coord_std) "
+            "is written only for manifold runs; for a euclidean run pass "
+            "--coord-mean/--coord-std and use --maldi-file instead."
+        )
+    gm = np.load(gm_path)
+    coord_mean = gm["coord_mean"].astype(np.float64)
+    coord_std = gm["coord_std"].astype(np.float64)
+
+    pred_root = run_dir / "predictions"
+    # which lipids: those requested (by name) that are on disk, else all on disk
+    want = set(lipids) if lipids else None
+    sel_names, coords_ref = [], None
+    cols_true, cols_pred = [], []
+    for name in names_all:
+        if want is not None and name not in want:
+            continue
+        slug = _safe_filename(name)
+        d = pred_root / slug
+        cpath, tpath = d / "test_coords_mm.npy", d / "test_true_z.npy"
+        if not (cpath.exists() and tpath.exists()):
+            continue
+        coords = np.load(cpath).astype(np.float64)
+        true_z = np.load(tpath).astype(np.float64).ravel()
+        if coords_ref is None:
+            coords_ref = coords
+        if coords.shape[0] != coords_ref.shape[0] or true_z.shape[0] != coords_ref.shape[0]:
+            logging.warning(f"[fold] {slug}: point count mismatch; skipping.")
+            continue
+        sel_names.append(name)
+        cols_true.append(true_z)
+        ppath = d / "test_pred_z.npy"
+        cols_pred.append(np.load(ppath).astype(np.float64).ravel()
+                         if ppath.exists() else None)
+    if coords_ref is None or not sel_names:
+        raise RuntimeError(
+            f"No usable predictions/<slug>/ with test_coords_mm.npy + "
+            f"test_true_z.npy found under {pred_root} for the requested lipids."
+        )
+    Y = np.stack(cols_true, axis=1)
+    pred = (np.stack(cols_pred, axis=1)
+            if all(p is not None for p in cols_pred) else None)
+    return {
+        "coords_mm": coords_ref, "Y": Y, "pred": pred, "names": sel_names,
+        "coord_mean": coord_mean, "coord_std": coord_std,
+        "log_transform": bool(config.get("log_transform", False)),
+        "config": config,
+    }
+
+
+def fold_data_diagnostics(
+    run_dir: Path, lipids: list | None,
+    knn, reference_nodes: torch.Tensor,
+    eigval: torch.Tensor, eigvec: torch.Tensor,
+    nu: float, lengthscale: float, graphbandwidth: float, bump_scale: float,
+    n_pairs: int = 40000, seed: int = 0,
+    plot_dir: Path | None = None, plot_tag: str = "",
+) -> dict:
+    """Q4 (run-dir / fold front-end). Loads the exact held-out test fold from a
+    trained run dir, standardizes coords with that run's coord_mean/std (from
+    graph_meta), and runs the kernel-vs-data analysis. Also reports the run's
+    achieved per-lipid test Spearman so kernel-structure quality can be related
+    to actual fold performance, and flags kernel-hyperparameter mismatches
+    between config.json and this script's flags."""
+    fold = load_fold_from_run_dir(run_dir, lipids)
+    Xs = (fold["coords_mm"] - fold["coord_mean"]) / fold["coord_std"]
+    out = _kernel_vs_data_core(
+        Xs, fold["Y"], knn, reference_nodes, eigval, eigvec,
+        nu, lengthscale, graphbandwidth, bump_scale,
+        seed=seed, n_pairs=n_pairs, plot_dir=plot_dir, plot_tag=plot_tag,
+    )
+    out["diag_fold_name"] = Path(run_dir).name
+    out["diag_fold_n_lipids"] = int(fold["Y"].shape[1])
+    out["diag_fold_n_test"] = int(fold["Y"].shape[0])
+    # achieved test performance the run actually got (mean per-lipid Spearman)
+    if fold["pred"] is not None:
+        rs = [float(_spearmanr(fold["pred"][:, j], fold["Y"][:, j]).statistic)
+              for j in range(fold["Y"].shape[1])]
+        out["diag_fold_test_spearman_mean"] = float(np.nanmean(rs))
+    # cross-check kernel hyperparameters against the run's config
+    cfg = fold["config"]
+    for cli_val, cfg_key, label in (
+        (graphbandwidth, "graphbandwidth", "graphbandwidth"),
+        (nu, "nu", "nu"),
+    ):
+        try:
+            cv = float(cfg.get(cfg_key))
+        except (TypeError, ValueError):
+            continue
+        if abs(cv - float(cli_val)) > 1e-9:
+            logging.warning(
+                f"[fold] {label} mismatch: run config={cv} but this script "
+                f"used {cli_val}. The diagnostic kernel won't match the fold's "
+                f"kernel — pass matching flags for a faithful comparison."
+            )
+    return out
+
+
+def _resolve_lipids(spec, lipid_names):
+    """Names OR integer indices -> list of names. Mirrors
+    lgp_experiment_per_lipid.resolve_lipids (de-dup, preserve order)."""
+    if spec is None:
+        return list(lipid_names)
+    out = []
+    for tok in spec:
+        try:
+            i = int(tok)
+            if 0 <= i < len(lipid_names):
+                out.append(i); continue
+        except (ValueError, TypeError):
+            pass
+        if tok in lipid_names:
+            out.append(lipid_names.index(tok))
+        else:
+            logging.warning(f"[fold] lipid spec {tok!r} not found; skipped.")
+    seen = set()
+    return [lipid_names[i] for i in out if not (i in seen or seen.add(i))]
+
+
+def _or_filters(f1, f2):
+    """OR two pyarrow filter expressions (list-of-tuples or list-of-lists)."""
+    def groups(f):
+        if f is None:
+            return None
+        return f if (f and isinstance(f[0], list)) else [f]
+    g1, g2 = groups(f1), groups(f2)
+    if g1 is None or g2 is None:
+        return None
+    return g1 + g2
+
+
+def fold_and_lipids_from_config(args: dict, log: logging.Logger):
+    """Build the EXACT fold filter + lipid set the per-lipid training uses, by
+    constructing the same MaldiConfig from --slices-dataset-file /
+    --available-lipids-file (and friends), then reading config.section_filter /
+    config.test_filter / config.selected_lipids_names. This is the faithful
+    analogue of how lgp_experiment_per_lipid.py defines a fold.
+
+    Returns (fold_filter, lipid_names). `--fold-side` picks train/test/all."""
+    try:
+        from config import MaldiConfig
+    except Exception as e:
+        raise RuntimeError(
+            "Could not import MaldiConfig (`from config import MaldiConfig`). "
+            "Run from the same environment as lgp_experiment_per_lipid.py, or "
+            "use the manual --fold-filter / --fold-column instead. "
+            f"(import error: {e})"
+        )
+
+    # MaldiConfig.from_args reads a dict shaped like the per-lipid experiment's
+    # parsed args. Start from this script's args and fill in the per-lipid keys
+    # (with harmless defaults) that MaldiConfig may require.
+    import tempfile
+    cfg_args = dict(args)
+    defaults = {
+        "mode": args.get("mode", "per_lipid"),
+        "exp_name": args.get("exp_name", "laplacian_diag"),
+        "output_dir": args.get("output_dir") or tempfile.mkdtemp(prefix="diagcfg_"),
+        "dataset_path": args.get("dataset_path"),
+        "maldi_file": args.get("maldi_file"),
+        "available_lipids_file": args.get("available_lipids_file"),
+        "slices_dataset_file": args.get("slices_dataset_file"),
+        "template_name": args.get("template_name"),
+        "reference_file": args.get("reference_file"),
+        "annotations_file": args.get("annotations_file"),
+        "num_inducing": args.get("num_inducing", 1000),
+        "latent_dim": args.get("latent_dim", 1),
+        "n_pixels": args.get("n_pixels", 10),
+        "seed": args.get("seed", 42),
+        "log_transform": args.get("log_transform", False),
+        "region_bbox": args.get("region_bbox"),
+        "device": args.get("device", "cpu"),
+    }
+    for k, v in defaults.items():
+        cfg_args.setdefault(k, v)
+
+    config = MaldiConfig.from_args(cfg_args)
+
+    side = args.get("fold_side", "test")
+    if side == "train":
+        filt = config.section_filter
+    elif side == "all":
+        filt = _or_filters(config.section_filter, config.test_filter)
+    else:
+        filt = config.test_filter
+    log.info(f"[fold] MaldiConfig fold-side={side} filter: {filt}")
+
+    names_all = list(config.selected_lipids_names)
+    spec = list(args.get("lipids") or [])
+    if args.get("lipids_file"):
+        with open(args["lipids_file"]) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    spec.append(line)
+    spec = spec or None
+    lipid_names = _resolve_lipids(spec, names_all)
+    log.info(f"[fold] resolved {len(lipid_names)} lipids "
+             f"(of {len(names_all)} available).")
+    return filt, lipid_names
+
+
+# ---- optional plotting (guarded; only when --diag-plot-dir given) ----------
+def _try_plot_geodesic(plot_dir, tag, euc, geo, dspec, metrics):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    Path(plot_dir).mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4.3))
+    ax[0].scatter(euc, geo, s=4, alpha=.3)
+    lim = [0, np.nanmax(geo)]; ax[0].plot(lim, lim, "r--", lw=1)
+    ax[0].set(xlabel="euclidean", ylabel="geodesic",
+              title=f"geo vs euc (rho={metrics['diag_geo_euc_spearman']:.3f})")
+    ax[1].scatter(geo, dspec, s=4, alpha=.3)
+    ax[1].set(xlabel="geodesic", ylabel="d_spec (full modes)",
+              title=f"spec vs geo (rho={metrics['diag_dspec_geo_spearman_full']:.3f})")
+    fig.tight_layout()
+    fig.savefig(Path(plot_dir) / f"geodesic_{tag}.png", dpi=120)
+    plt.close(fig)
+
+
+def _try_plot_maldi(plot_dir, tag, cum, cumS, dd, dissim):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    Path(plot_dir).mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4.3))
+    ax[0].plot(np.arange(1, len(cum) + 1), cum, label="data signal energy")
+    ax[0].plot(np.arange(1, len(cumS) + 1), cumS, label="Matern prior weight")
+    ax[0].set(xlabel="mode k", ylabel="cumulative fraction",
+              title="data vs prior spectral content"); ax[0].legend()
+    bins = np.linspace(0, np.percentile(dd, 99), 25)
+    bi = np.digitize(dd, bins)
+    mv = [dissim[bi == k].mean() if np.any(bi == k) else np.nan
+          for k in range(1, len(bins))]
+    ax[1].plot(0.5 * (bins[1:] + bins[:-1]), mv, "o-")
+    ax[1].set(xlabel="euclidean distance", ylabel="mean |lipid_i - lipid_j|",
+              title="empirical variogram")
+    fig.tight_layout()
+    fig.savefig(Path(plot_dir) / f"maldi_{tag}.png", dpi=120)
+    plt.close(fig)
+
+
 # -------------------------------------------------------------------------
 # Graph construction — replicates visualize_laplacian.py:setup() but without
 # the kernel and napari pieces. Returns the laplacian_op for the eigensolver.
@@ -323,8 +998,7 @@ def build_graph_and_laplacian(
         sub_volume, voxel_offset, voxel_scale_mm, threshold,
     )
     reference_nodes_mm = torch.tensor(reference_ccf, dtype=torch.float32)
-    coord_mean = reference_nodes_mm.mean(dim=0)
-    coord_std = reference_nodes_mm.std(dim=0).clamp(min=1e-6)
+    coord_mean, coord_std = coord_norm_from_reference(template_full)
     reference_nodes = ((reference_nodes_mm - coord_mean) / coord_std).to(device)
 
     graph_key_parts = {
@@ -403,7 +1077,6 @@ def build_graph_and_laplacian(
         "coord_std":       coord_std,
     }
 
-
 # -------------------------------------------------------------------------
 # Driver
 # -------------------------------------------------------------------------
@@ -461,6 +1134,59 @@ def parse_args():
                    help="RNG seed for test-point sampling.")
     p.add_argument("--skip-kernel-psd", action="store_true",
                    help="Skip the kernel Gram-matrix PSD evaluation; emit only Laplacian diagnostics.")
+    # Extended diagnostics (Q1-Q4). Cheap eigen-health + bandwidth/OOS run by
+    # default; turn them off with --skip-extended-diagnostics. Geodesic and
+    # MALDI checks are opt-in (see below).
+    p.add_argument("--skip-extended-diagnostics", action="store_true",
+                   help="Skip the cheap eigen-health + bandwidth/OOS diagnostics.")
+    p.add_argument("--eig-resid-modes", type=int, default=64,
+                   help="How many modes to spot-check for ||L phi - lambda phi||.")
+    p.add_argument("--geodesic-anchors", type=int, default=300,
+                   help=("Q1/Q3: run Dijkstra geodesic vs spectral vs euclidean "
+                         "from this many anchor nodes. 0 = skip (it is the slow "
+                         "part on large graphs). 150-300 is plenty."))
+    p.add_argument("--geodesic-seed", type=int, default=0)
+    p.add_argument("--run-dir", type=Path, default=None,
+                   help=("Q4 (optional): a trained per-lipid run dir, if you "
+                         "happen to have one — uses its exact held-out fold + "
+                         "coord normalization. NOT required; prefer --maldi-file "
+                         "+ --fold-* to configure a fold directly on the CLI."))
+    p.add_argument("--maldi-file", default=None,
+                   help="Q4: MALDI parquet (enables the data-driven kernel check).")
+    p.add_argument("--lipids", nargs="*", default=None,
+                   help="Selected lipid column names (as in experiment.py).")
+    p.add_argument("--log-transform", action="store_true",
+                   help="Apply log(x+1e-10) to lipids, matching experiment.py.")
+    # ---- fold via the experiment's own split machinery (preferred) ----
+    # Mirrors lgp_experiment_per_lipid.py: the slices file + available-lipids
+    # file go through MaldiConfig, which yields the exact section/test filters
+    # and lipid names the training used.
+    p.add_argument("--slices-dataset-file", default=None,
+                   help="Fold split JSON (e.g. .../splits/fold_3.json). With "
+                        "--available-lipids-file, builds the SAME fold filter "
+                        "the per-lipid training uses, via MaldiConfig.")
+    p.add_argument("--available-lipids-file", default=None,
+                   help="Available-lipids .npy (as in run_lgp_per_lipid.sh).")
+    p.add_argument("--dataset-path", default=None,
+                   help="Dataset path passed to MaldiConfig.")
+    p.add_argument("--lipids-file", default=None,
+                   help="Text file with one lipid name (or index) per line; "
+                        "blanks/'#' ignored. Resolved against the available "
+                        "lipids, exactly like the per-lipid trainer.")
+    p.add_argument("--fold-side", choices=["test", "train", "all"], default="test",
+                   help="Which side of the split to run Q4 on (default: test).")
+    p.add_argument("--mode", default="per_lipid", help="Passed to MaldiConfig.")
+    p.add_argument("--exp-name", default="laplacian_diag",
+                   help="Passed to MaldiConfig (no training output is written).")
+    p.add_argument("--output-dir", default=None,
+                   help="Passed to MaldiConfig (defaults to a temp dir).")
+    p.add_argument("--num-inducing", type=int, default=1000,
+                   help="Passed to MaldiConfig for compatibility.")
+    p.add_argument("--latent-dim", type=int, default=1,
+                   help="Passed to MaldiConfig for compatibility.")
+    p.add_argument("--maldi-max-rows", type=int, default=400000)
+    p.add_argument("--diag-plot-dir", type=Path, default=None,
+                   help="If set, dump diagnostic PNGs here (off by default).")
     # Output
     p.add_argument("--out", type=Path, required=True,
                    help=("Output CSV path. One row will be written. The submit "
@@ -602,6 +1328,59 @@ def main():
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
+        # ---- Extended diagnostics (Q1-Q4) --------------------------------
+        plot_tag = ekey
+        if not args["skip_extended_diagnostics"]:
+            row.update(eigen_health_diagnostics(
+                laplacian_op, eigval, eigvec, built["edge_index"], norm,
+                n_res_modes=args["eig_resid_modes"],
+            ))
+            row.update(bandwidth_oos_diagnostics(
+                eigval, graphbandwidth=bw,
+                nu=args["nu"], lengthscale=args["lengthscale"],
+            ))
+        if args["geodesic_anchors"] > 0:
+            row.update(geodesic_distance_diagnostics(
+                built["edge_index"], built["edge_value"],
+                built["reference_nodes"], eigval, eigvec,
+                nu=args["nu"], lengthscale=args["lengthscale"],
+                n_anchors=args["geodesic_anchors"], seed=args["geodesic_seed"],
+                plot_dir=args["diag_plot_dir"], plot_tag=plot_tag,
+            ))
+        if args["run_dir"] is not None:
+            row.update(fold_data_diagnostics(
+                args["run_dir"], args["lipids"],
+                knn=built["knn"], reference_nodes=built["reference_nodes"],
+                eigval=eigval, eigvec=eigvec,
+                nu=args["nu"], lengthscale=args["lengthscale"],
+                graphbandwidth=bw, bump_scale=args["bump_scale"],
+                plot_dir=args["diag_plot_dir"], plot_tag=plot_tag,
+            ))
+        elif args["maldi_file"] and (args["slices_dataset_file"]
+                                      or args["lipids"] or args["lipids_file"]):
+            log = logging.getLogger()
+            if not args["slices_dataset_file"]:
+                raise RuntimeError(
+                        "--slices-dataset-file needs --available-lipids-file "
+                        "(MaldiConfig derives lipid names from it)."
+                    )
+            if not args["available_lipids_file"]:
+                raise RuntimeError(
+                    "--slices-dataset-file needs --available-lipids-file "
+                    "(MaldiConfig derives lipid names from it)."
+                )
+            fold_filter, lipid_names = fold_and_lipids_from_config(args, log)
+            row.update(maldi_data_diagnostics(
+                args["maldi_file"], lipid_names, args["log_transform"],
+                knn=built["knn"], reference_nodes=built["reference_nodes"],
+                eigval=eigval, eigvec=eigvec,
+                nu=args["nu"], lengthscale=args["lengthscale"],
+                graphbandwidth=bw, bump_scale=args["bump_scale"],
+                fold_filter=fold_filter,
+                max_rows=args["maldi_max_rows"],
+                plot_dir=args["diag_plot_dir"], plot_tag=plot_tag,
+            ))
+
         row["status"]   = "OK"
         row["wall_sec"] = round(time.time() - t0, 2)
         logging.info(
@@ -615,6 +1394,48 @@ def main():
             )
             + f"({row['wall_sec']:.1f}s)"
         )
+        # Compact extended-diagnostic summary in the log (CSV has everything).
+        if not args["skip_extended_diagnostics"]:
+            logging.info(
+                "diag orthoL2=%.2e orthoD=%.2e varproxy=%.1fx resid_med=%.1e "
+                "ncomp=%s weyl_dim=%.2f part_ratio=%.0f"
+                % (row.get("diag_ortho_l2_offmax", float("nan")),
+                   row.get("diag_ortho_deg_offmax", float("nan")),
+                   row.get("diag_varproxy_ratio", float("nan")),
+                   row.get("diag_eig_resid_median", float("nan")),
+                   row.get("diag_n_components", "?"),
+                   row.get("diag_weyl_dim", float("nan")),
+                   row.get("diag_smat_participation_ratio", float("nan")))
+            )
+        if args["geodesic_anchors"] > 0:
+            logging.info(
+                "diag geo: geo~euc rho=%.3f ratio_p95=%.2f | dspec~geo rho=%.3f "
+                "(low modes %.3f)"
+                % (row.get("diag_geo_euc_spearman", float("nan")),
+                   row.get("diag_geo_euc_ratio_p95", float("nan")),
+                   row.get("diag_dspec_geo_spearman_full", float("nan")),
+                   row.get("diag_dspec_geo_spearman_low", float("nan")))
+            )
+        if args["run_dir"] is not None or (
+            args["maldi_file"] and (args["slices_dataset_file"]
+                                    or args["lipids"] or args["lipids_file"])):
+            logging.info(
+                "diag maldi: in_support=%.3f snap_med=%.3f | e90_mode_frac=%.2f | "
+                "match man=%.3f euc=%.3f"
+                % (row.get("diag_maldi_frac_in_support", float("nan")),
+                   row.get("diag_maldi_snap_median", float("nan")),
+                   row.get("diag_maldi_e90_mode_frac", float("nan")),
+                   row.get("diag_maldi_match_spearman_manifold", float("nan")),
+                   row.get("diag_maldi_match_spearman_euclidean", float("nan")))
+            )
+        if args["run_dir"] is not None and "diag_fold_test_spearman_mean" in row:
+            logging.info(
+                "diag fold: %s  n_test=%s n_lipids=%s  achieved_test_spearman=%.3f"
+                % (row.get("diag_fold_name", "?"),
+                   row.get("diag_fold_n_test", "?"),
+                   row.get("diag_fold_n_lipids", "?"),
+                   row.get("diag_fold_test_spearman_mean", float("nan")))
+            )
     except Exception as e:
         row["status"] = "ERROR"
         row["error"]  = f"{type(e).__name__}: {e}"
@@ -660,8 +1481,37 @@ def write_csv(path: Path, rows: list[dict]):
                 k_cols.append(f"{mat}_{blk}{f}")
             k_cols.append(f"{mat}_{blk}status")
     fp_cols   = ["fp_n_nodes", "fp_n_edges"]
+    # Extended diagnostics (Q1-Q4). Blank when the corresponding check was
+    # skipped (cheap eigen-health/bandwidth run by default; geodesic and maldi
+    # are opt-in).
+    diag_cols = [
+        # Q2 eigen / graph health
+        "diag_n_components", "diag_n_zero_modes",
+        "diag_ortho_l2_offmax", "diag_ortho_deg_offmax", "diag_varproxy_ratio",
+        "diag_eig_resid_median", "diag_eig_resid_p90", "diag_eig_resid_max",
+        "diag_weyl_slope", "diag_weyl_dim",
+        # bandwidth / OOS sanity
+        "diag_oos_bw2lam_max", "diag_oos_denom_crossings",
+        "diag_oos_first_crossing_mode", "diag_smat_participation_ratio",
+        # Q1 / Q3 geodesic vs spectral vs euclidean
+        "diag_geo_reachable_frac", "diag_geo_euc_spearman",
+        "diag_geo_euc_ratio_median", "diag_geo_euc_ratio_p95",
+        "diag_dspec_geo_spearman_full", "diag_dspec_geo_spearman_low",
+        "diag_dspec_euc_spearman_full", "diag_geo_n_anchors", "diag_geo_modes_low",
+        # Q4 MALDI data-driven
+        "diag_maldi_n_points", "diag_maldi_snap_median", "diag_maldi_snap_p95",
+        "diag_maldi_bump_support", "diag_maldi_frac_in_support",
+        "diag_maldi_node_coverage", "diag_maldi_e50_mode", "diag_maldi_e90_mode",
+        "diag_maldi_e90_mode_frac", "diag_maldi_prior_e90_mode",
+        "diag_maldi_tail_energy_beyond_modes",
+        "diag_maldi_match_spearman_manifold", "diag_maldi_match_spearman_euclidean",
+        "diag_maldi_n_lipids",
+        # Q4 fold-specific (only when --run-dir is used)
+        "diag_fold_name", "diag_fold_n_lipids", "diag_fold_n_test",
+        "diag_fold_test_spearman_mean",
+    ]
     misc_cols = ["cache_key", "error"]
-    columns = id_cols + status_col + lap_cols + kpsd_meta + k_cols + fp_cols + misc_cols
+    columns = id_cols + status_col + lap_cols + kpsd_meta + k_cols + fp_cols + diag_cols + misc_cols
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:

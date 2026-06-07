@@ -153,6 +153,7 @@ def build_graph_and_laplacian(
         "nlist":    args["n_list"],
         "bbox":     tuple(args["region_bbox"]) if args["region_bbox"] is not None else None,
     }
+    
     if knn_method == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
         graph_key_parts["conn"]  = 3
