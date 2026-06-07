@@ -222,6 +222,71 @@ def sample_test_points(
     return torch.cat([pts_on, pts_off], dim=0), pts_on.shape[0]
 
 
+def sample_test_points_uniform_distance(
+    reference_nodes: torch.Tensor,
+    n_on: int, n_off: int,
+    dist_max: float, n_bins: int,
+    rng: np.random.Generator,
+    oversample: int = 60,
+):
+    """Seed from the manifold and spread off-manifold points UNIFORMLY across
+    distance-from-manifold.
+
+    Returns (test_points (N,3), n_on_actual, dist_per_point (N,) in z-units).
+
+    The first `n_on_actual` rows are exact manifold nodes (distance 0). The rest
+    are points `node + t * unit_direction` whose *actual* nearest-node distance
+    (measured with an exact cKDTree on reference_nodes -- identical to faiss
+    nlist=1) is binned into `n_bins` equal-width bins on (0, dist_max] and
+    subsampled to ~equal counts per bin, giving roughly uniform coverage of the
+    distance axis instead of the naturally clustered distribution. Random
+    directions + measured distance avoids needing the manifold normal: offsets
+    running along the manifold land in low bins, offsets that exit the tissue
+    fill the high bins. dist_max / dist bins are in standardized z-units.
+    """
+    from scipy.spatial import cKDTree
+    device = reference_nodes.device
+    nodes = reference_nodes.detach().cpu().numpy().astype(np.float64)
+    N = nodes.shape[0]
+    kdt = cKDTree(nodes)
+
+    n_on = min(n_on, N)
+    on_idx = rng.choice(N, size=n_on, replace=False)
+    pts_on = nodes[on_idx]
+    d_on = np.zeros(n_on, dtype=np.float64)
+
+    M = max(int(n_off) * int(oversample), int(n_bins) * 200)
+    seed = rng.choice(N, size=M, replace=True)
+    dirs = rng.normal(size=(M, 3))
+    dirs /= (np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12)
+    t = rng.uniform(0.0, float(dist_max) * 1.5, size=M)
+    cand = nodes[seed] + dirs * t[:, None]
+    d_cand, _ = kdt.query(cand, k=1, workers=-1)
+
+    edges = np.linspace(0.0, float(dist_max), int(n_bins) + 1)
+    per_bin = max(1, int(n_off) // int(n_bins))
+    sel_pts, sel_d, short = [], [], 0
+    for i in range(int(n_bins)):
+        lo, hi = edges[i], edges[i + 1]
+        in_bin = np.where((d_cand > lo) & (d_cand <= hi))[0]
+        if in_bin.size == 0:
+            short += 1; continue
+        take = min(per_bin, in_bin.size)
+        if in_bin.size < per_bin:
+            short += 1
+        pick = rng.choice(in_bin, size=take, replace=False)
+        sel_pts.append(cand[pick]); sel_d.append(d_cand[pick])
+    if short:
+        logging.info(f"uniform-distance sampler: {short}/{n_bins} distance bins "
+                     f"under-filled (manifold too dense / dist_max too large there).")
+    pts_off = np.concatenate(sel_pts, 0) if sel_pts else np.empty((0, 3))
+    d_off = np.concatenate(sel_d, 0) if sel_d else np.empty((0,))
+
+    pts = np.concatenate([pts_on, pts_off], 0).astype(np.float32)
+    dist = np.concatenate([d_on, d_off], 0).astype(np.float64)
+    return torch.from_numpy(pts).to(device), int(pts_on.shape[0]), dist
+
+
 def matern_euclidean_pairwise(
     coords: torch.Tensor, nu: float, lengthscale: float,
 ) -> np.ndarray:
@@ -245,22 +310,30 @@ def evaluate_kernel_psd(
     test_points: torch.Tensor,
     graphbandwidth: float,
     bump_scale: float, bump_decay: float,
-    nu: float, lengthscale: float,
     n_on_manifold: int,
     analyze_kwargs: dict,
+    per_point_csv: "Path | None" = None,
+    plot_dir: "Path | None" = None,
+    plot_tag: str = "",
+    coord_std: "float | None" = None,
 ) -> dict:
-    """Build the three Gram matrices and PSD-diagnose each:
+    """PSD-diagnose the deployed manifold Gram matrix:
 
-      K_m     = features(x) · features(y)            (bare manifold)
-      K_bm    = b(x) · K_m(x,y) · b(y)               (bump-modulated)
-      K_full  = K_bm + (1-b(x))(1-b(y)) · K_eucl     (deployed kernel)
+      K_m = features(x) · features(y)            (deployed kernel)
 
-    Reductions on the in-sample block and the out-of-sample block are
-    reported separately too — non-PSD restricted to the in-sample block
-    is a much stronger signal (the truncated Nyström features aren't even
-    PSD at training nodes) than non-PSD only on the off-manifold block
-    (Nyström extension can lose PSD on novel queries even when fine on
-    training nodes).
+    Since features() already applies the bump to out-of-sample rows, K_m IS the
+    kernel the model uses (forward() returns features·featuresᵀ). It is a Gram
+    matrix, hence PSD in exact arithmetic; a meaningfully negative eigenvalue
+    therefore flags numerically blown-up / ill-conditioned features (e.g. from
+    the out-of-sample (1-bw²λ)² denominator), not an invalid formula.
+
+    Reductions on the in-sample block and the out-of-sample block are reported
+    separately — trouble on the in-sample block (exact eigenvectors at training
+    nodes) is a much stronger signal than on the off-manifold block (Nyström
+    extension, naturally less well-conditioned on novel queries).
+
+    The bump weight b is still reported per point (and dumped vs distance) to
+    characterize the test set, even though it's already folded into K_m.
     """
     with torch.no_grad():
         feat = matern_kernel.features(test_points)        # (N, num_modes)
@@ -274,11 +347,6 @@ def evaluate_kernel_psd(
             decay=float(bump_decay),
         ).detach().cpu().numpy().astype(np.float64)
 
-    K_eu = matern_euclidean_pairwise(test_points, nu, lengthscale)
-    K_bm = b[:, None] * K_m * b[None, :]
-    one_m_b = 1.0 - b
-    K_full = K_bm + (one_m_b[:, None] * one_m_b[None, :]) * K_eu
-
     n_on  = int(n_on_manifold)
     n_off = int(test_points.shape[0] - n_on)
     out: dict[str, Any] = {
@@ -289,7 +357,6 @@ def evaluate_kernel_psd(
         "bump_max":    float(b.max()),
         "bump_on_mean":  float(b[:n_on].mean()) if n_on > 0 else float("nan"),
         "bump_off_mean": float(b[n_on:].mean()) if n_off > 0 else float("nan"),
-        "K_eu_max":    float(np.abs(K_eu).max()),
         "K_m_max":     float(np.abs(K_m).max()),
     }
     # Full-sample diagnostics, then submatrix diagnostics for the in-sample
@@ -299,7 +366,7 @@ def evaluate_kernel_psd(
         ("on_",  slice(0, n_on), slice(0, n_on)),
         ("off_", slice(n_on, None), slice(n_on, None)),
     ]
-    for tag, mat in [("K_m", K_m), ("K_bm", K_bm), ("K_full", K_full)]:
+    for tag, mat in [("K_m", K_m)]:
         for blk_prefix, ri, ci in blocks:
             sub = mat[ri, ci]
             if sub.size == 0:
@@ -312,7 +379,63 @@ def evaluate_kernel_psd(
             diag = analyze_eigvals(ev, **analyze_kwargs)
             for k, v in diag.items():
                 out[f"{tag}_{blk_prefix}{k}"] = v
+
+    # ---- Optional per-point dump: kernel quantities vs distance-from-manifold.
+    # This is what a uniform-distance test sample is for -- it lets you read the
+    # bump and the prior variance as smooth functions of distance to the graph.
+    if per_point_csv is not None or plot_dir is not None:
+        d_np = d_nearest.detach().cpu().numpy().astype(np.float64)
+        Km_diag = np.clip(np.diag(K_m), 0.0, None)
+        on_flag = np.zeros(d_np.shape[0], dtype=int); on_flag[:n_on] = 1
+        order = np.argsort(d_np)
+        df = {
+            "dist_z": d_np[order],
+            "on_manifold": on_flag[order],
+            "bump": b[order],
+            "Km_diag": Km_diag[order],          # deployed manifold prior variance
+            "manifold_prior_std": np.sqrt(Km_diag[order]),
+        }
+        if coord_std is not None:
+            df["dist_mm"] = d_np[order] * float(coord_std)
+        import pandas as _pd
+        _df = _pd.DataFrame(df)
+        if per_point_csv is not None:
+            Path(per_point_csv).parent.mkdir(parents=True, exist_ok=True)
+            _df.to_csv(per_point_csv, index=False)
+        if plot_dir is not None:
+            _try_plot_kernel_vs_distance(plot_dir, plot_tag, _df, coord_std)
+        out["per_point_n"] = int(d_np.shape[0])
+        out["per_point_dist_max"] = float(d_np.max())
+
     return out
+
+
+def _try_plot_kernel_vs_distance(plot_dir, tag, df, coord_std):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    Path(plot_dir).mkdir(parents=True, exist_ok=True)
+    x = df["dist_z"].to_numpy()
+    fig, ax1 = plt.subplots(figsize=(8, 4.4))
+    ax1.plot(x, df["bump"].to_numpy(), color="tab:blue", lw=1.5, label="bump weight")
+    ax1.set_xlabel("distance to nearest manifold node (z-units"
+                   + (f"; 1z={coord_std:.3f}mm)" if coord_std else ")"))
+    ax1.set_ylabel("bump weight", color="tab:blue")
+    ax1.set_ylim(-0.02, 1.05); ax1.tick_params(axis="y", labelcolor="tab:blue")
+    ax2 = ax1.twinx()
+    ax2.plot(x, df["manifold_prior_std"].to_numpy(), color="tab:red", lw=1.2,
+             alpha=0.85, label="manifold prior std sqrt(Km)")
+    ax2.set_ylabel("prior std", color="tab:red")
+    ax2.tick_params(axis="y", labelcolor="tab:red")
+    lines = ax1.get_lines() + ax2.get_lines()
+    ax1.legend(lines, [l.get_label() for l in lines], fontsize=7, loc="center right")
+    ax1.set_title(f"Kernel vs distance-from-manifold  [{tag}]")
+    fig.tight_layout()
+    fig.savefig(Path(plot_dir) / f"kernel_vs_distance_{tag}.png", dpi=120)
+    plt.close(fig)
 
 
 # =========================================================================
@@ -638,6 +761,7 @@ def maldi_data_diagnostics(
     fold_filter=None,
     max_rows: int = 400000, n_pairs: int = 40000, seed: int = 0,
     plot_dir: Path | None = None, plot_tag: str = "",
+    coord_mean=None, coord_std=None,
 ) -> dict:
     """Q4 — does the kernel match the MALDI lipid structure on a given FOLD?
 
@@ -648,23 +772,35 @@ def maldi_data_diagnostics(
     snap/bump coverage, the spectral content of the lipid signal vs the prior
     weight, and the manifold-vs-euclidean structure match.
 
-    Coordinate normalization: by default coord_mean/std are computed from the
-    GLOBAL parquet coords (all rows) — matching get_inducing_points' whole-brain
-    statistics, which the deployed model uses and which are fold-independent.
-    Override with coord_mean/coord_std (e.g. --coord-mean/--coord-std) if your
-    get_inducing_points does something else."""
+    Coordinate normalization: reuses the reference-template normalization from
+    utils.coord_norm_from_reference (passed in as coord_mean/coord_std) — the
+    SAME per-axis mean + scalar isotropic std the deployed model and
+    reference_nodes use, so the snapping/distances are in the model's space.
+    Falls back to global whole-brain parquet stats only if those aren't given."""
     import pandas as pd
     coord_cols = ["xccf", "yccf", "zccf"]
     lip_cols = [str(l) for l in lipids]
 
-    # --- coord normalization: global whole-brain stats unless overridden ---
-    g = pd.read_parquet(maldi_file, columns=coord_cols)  # all rows, 3 cols
-    if max_rows and len(g) > max_rows:
-        g = g.sample(max_rows, random_state=0)
-    gx = g[coord_cols].to_numpy(np.float64)
-    cm, cs = gx.mean(0), gx.std(0)
-    cs[cs < 1e-6] = 1e-6
-    logging.info(f"[maldi] coord stats from GLOBAL parquet: mean={cm}, std={cs}")
+    # --- coord normalization ---
+    # Reuse the reference-template normalization (utils.coord_norm_from_reference,
+    # threaded in as coord_mean/coord_std) -- the SAME mean/std the deployed model
+    # and reference_nodes use. Fall back to global parquet stats only if absent.
+    if coord_mean is not None and coord_std is not None:
+        cm = (coord_mean.detach().cpu().numpy() if torch.is_tensor(coord_mean)
+              else np.asarray(coord_mean)).astype(np.float64).reshape(-1)
+        cs = (coord_std.detach().cpu().numpy() if torch.is_tensor(coord_std)
+              else np.asarray(coord_std)).astype(np.float64)
+        cs = np.maximum(cs, 1e-6)
+        logging.info(f"[maldi] coord norm from reference template (util): "
+                     f"mean={cm}, std={cs}")
+    else:
+        g = pd.read_parquet(maldi_file, columns=coord_cols)  # all rows, 3 cols
+        if max_rows and len(g) > max_rows:
+            g = g.sample(max_rows, random_state=0)
+        gx = g[coord_cols].to_numpy(np.float64)
+        cm, cs = gx.mean(0), gx.std(0)
+        cs[cs < 1e-6] = 1e-6
+        logging.info(f"[maldi] coord stats from GLOBAL parquet: mean={cm}, std={cs}")
 
     # --- fold rows: coords + requested lipids ---
     df = pd.read_parquet(maldi_file, columns=coord_cols + lip_cols,
@@ -1132,6 +1268,19 @@ def parse_args():
                          "aren't enough sub-threshold voxels."))
     p.add_argument("--test-seed",  type=int, default=42,
                    help="RNG seed for test-point sampling.")
+    p.add_argument("--test-sampling", choices=["subthreshold", "uniform_distance"],
+                   default="uniform_distance",
+                   help=("Off-manifold test sampling. 'subthreshold' (default) uses "
+                         "real sub-threshold voxels. 'uniform_distance' seeds from "
+                         "manifold nodes and spreads points UNIFORMLY across "
+                         "distance-from-manifold (probe bump/kernel vs distance)."))
+    p.add_argument("--test-dist-max", type=float, default=1.0,
+                   help="(uniform_distance) max distance-from-manifold to span, z-units.")
+    p.add_argument("--test-dist-bins", type=int, default=30,
+                   help="(uniform_distance) number of equal-width distance bins.")
+    p.add_argument("--per-point-kernel", action="store_true",
+                   help=("Dump per-point bump + prior variance vs distance-from-manifold "
+                         "to --diag-plot-dir (CSV + plot). Auto-on for uniform_distance."))
     p.add_argument("--skip-kernel-psd", action="store_true",
                    help="Skip the kernel Gram-matrix PSD evaluation; emit only Laplacian diagnostics.")
     # Extended diagnostics (Q1-Q4). Cheap eigen-health + bandwidth/OOS run by
@@ -1161,6 +1310,11 @@ def parse_args():
     # Mirrors lgp_experiment_per_lipid.py: the slices file + available-lipids
     # file go through MaldiConfig, which yields the exact section/test filters
     # and lipid names the training used.
+    p.add_argument("--kernel", required=True)
+    p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    p.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    p.add_argument("--learning-rate", dest="learning_rate", type=float, default=0.001, help="Learning rate for the optimizer.")
+    p.add_argument("--batch-size", dest="batch_size", type=int, default=2000, help="Batch size for training")
     p.add_argument("--slices-dataset-file", default=None,
                    help="Fold split JSON (e.g. .../splits/fold_3.json). With "
                         "--available-lipids-file, builds the SAME fold filter "
@@ -1285,22 +1439,30 @@ def main():
 
         # Kernel-Gram PSD evaluation: build the deployed Matern kernel and
         # evaluate it at sampled in-sample (training nodes) and out-of-sample
-        # (sub-threshold voxels) test points. Three Gram matrices reported:
-        # K_m (bare), K_bm (bump-modulated), K_full (with Euclidean fallback).
-        # Each Gram matrix is diagnosed at the full block as well as the
-        # in-sample-only (on_) and out-of-sample-only (off_) sub-blocks.
+        # test points (sub-threshold voxels, or uniform-across-distance when
+        # --test-sampling uniform_distance). Reports the deployed Gram matrix K_m
+        # at the full block plus the in-sample-only (on_) and out-of-sample-only
+        # (off_) sub-blocks; optionally dumps bump/prior-variance vs distance.
         if not args["skip_kernel_psd"]:
             rng = np.random.default_rng(args["test_seed"])
-            test_pts, n_on = sample_test_points(
-                reference_nodes=built["reference_nodes"],
-                sub_volume=built["sub_volume"],
-                voxel_offset=built["voxel_offset"],
-                voxel_scale_mm=built["voxel_scale_mm"],
-                coord_mean=built["coord_mean"], coord_std=built["coord_std"],
-                threshold=threshold,
-                n_on=args["n_test_on"], n_off=args["n_test_off"],
-                rng=rng,
-            )
+            if args["test_sampling"] == "uniform_distance":
+                test_pts, n_on, _test_dist = sample_test_points_uniform_distance(
+                    reference_nodes=built["reference_nodes"],
+                    n_on=args["n_test_on"], n_off=args["n_test_off"],
+                    dist_max=args["test_dist_max"], n_bins=args["test_dist_bins"],
+                    rng=rng,
+                )
+            else:
+                test_pts, n_on = sample_test_points(
+                    reference_nodes=built["reference_nodes"],
+                    sub_volume=built["sub_volume"],
+                    voxel_offset=built["voxel_offset"],
+                    voxel_scale_mm=built["voxel_scale_mm"],
+                    coord_mean=built["coord_mean"], coord_std=built["coord_std"],
+                    threshold=threshold,
+                    n_on=args["n_test_on"], n_off=args["n_test_off"],
+                    rng=rng,
+                )
             matern_kernel = RiemannMaternKernel(
                 nu=args["nu"],
                 lengthscale=args["lengthscale"],
@@ -1315,13 +1477,21 @@ def main():
                 bump_decay=args["bump_decay"],
                 graphbandwidth_init=bw,
             ).to(device)
+            _dump_pp = args["per_point_kernel"] or args["test_sampling"] == "uniform_distance"
+            _pp_dir = args["diag_plot_dir"] if (_dump_pp and args["diag_plot_dir"]) else None
+            _pp_csv = (Path(_pp_dir) / f"kernel_vs_distance_{ekey}.csv") if _pp_dir else None
+            _cs = built["coord_std"]
+            _cs = float(_cs.mean()) if torch.is_tensor(_cs) else float(np.mean(_cs))
             kdiag = evaluate_kernel_psd(
                 matern_kernel, test_pts,
                 graphbandwidth=bw,
                 bump_scale=args["bump_scale"], bump_decay=args["bump_decay"],
-                nu=args["nu"], lengthscale=args["lengthscale"],
                 n_on_manifold=n_on,
                 analyze_kwargs=analyze_kwargs,
+                per_point_csv=_pp_csv,
+                plot_dir=_pp_dir,
+                plot_tag=ekey,
+                coord_std=_cs,
             )
             row.update(kdiag)
             del matern_kernel
@@ -1379,6 +1549,7 @@ def main():
                 fold_filter=fold_filter,
                 max_rows=args["maldi_max_rows"],
                 plot_dir=args["diag_plot_dir"], plot_tag=plot_tag,
+                coord_mean=built["coord_mean"], coord_std=built["coord_std"],
             ))
 
         row["status"]   = "OK"
@@ -1389,7 +1560,6 @@ def main():
                 f"K_m_full={row.get('K_m_ratio_min_over_max', float('nan')):+.2e} "
                 f"K_m_on={row.get('K_m_on_ratio_min_over_max', float('nan')):+.2e} "
                 f"K_m_off={row.get('K_m_off_ratio_min_over_max', float('nan')):+.2e} "
-                f"K_full_full={row.get('K_full_ratio_min_over_max', float('nan')):+.2e} "
                 if not args["skip_kernel_psd"] else ""
             )
             + f"({row['wall_sec']:.1f}s)"
@@ -1464,8 +1634,8 @@ def write_csv(path: Path, rows: list[dict]):
     kpsd_meta = ["n_test_on", "n_test_off",
                  "bump_min", "bump_mean", "bump_max",
                  "bump_on_mean", "bump_off_mean",
-                 "K_eu_max", "K_m_max"]
-    # Per-Gram-matrix diagnostics. Each matrix (K_m, K_bm, K_full) is reported
+                 "K_m_max"]
+    # Per-Gram-matrix diagnostics. Only K_m is reported (the deployed kernel),
     # at the full block plus the in-sample (on_) and out-of-sample (off_) blocks.
     block_prefixes = ["", "on_", "off_"]
     kernel_diag_fields = [
@@ -1475,11 +1645,12 @@ def write_csv(path: Path, rows: list[dict]):
         "spectral_gap", "condition_number", "lambda_min_positive",
     ]
     k_cols: list[str] = []
-    for mat in ("K_m", "K_bm", "K_full"):
+    for mat in ("K_m",):
         for blk in block_prefixes:
             for f in kernel_diag_fields:
                 k_cols.append(f"{mat}_{blk}{f}")
             k_cols.append(f"{mat}_{blk}status")
+    k_cols += ["per_point_n", "per_point_dist_max"]
     fp_cols   = ["fp_n_nodes", "fp_n_edges"]
     # Extended diagnostics (Q1-Q4). Blank when the corresponding check was
     # skipped (cheap eigen-health/bandwidth run by default; geodesic and maldi

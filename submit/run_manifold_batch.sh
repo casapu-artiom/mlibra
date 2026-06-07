@@ -26,8 +26,8 @@ GPU=0.5
 
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_9"
+S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_11"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -42,7 +42,7 @@ SRC_PATH="/myhome/mlibra"
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
-    local job_name=$1 template=$2 ref=$3 annot=$4 infl=$5 threshold=$6 knn=$7 knn_k=$8 laplacian_norm=$9 nu=$10 graphbandwidth=${11} bumpscale=${12} bumpdecay=${13} prefix=${14} slice=${15}
+    local job_name=$1 template=$2 ref=$3 annot=$4 infl=$5 threshold=$6 knn=$7 knn_k=$8 laplacian_norm=$9 nu=${10} graphbandwidth=${11} bumpscale=${12} bumpdecay=${13} prefix=${14} slice=${15}
 	shift 15
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
@@ -72,8 +72,9 @@ submit() {
         -e BUMP_DECAY="$bumpdecay" \
         -e N_EPOCHS="$N_EPOCHS" \
         -e NUM_INDUCING_POINTS=1000 \
-        -e NUM_MODES=1300 \
+        -e NUM_MODES=6000 \
         -e THRESHOLD="$threshold" \
+        -e STRIDE=4 \
         -e CROSS_REGION_INFLATION="$infl" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
@@ -92,17 +93,17 @@ submit() {
 # BUMP_DECAYS=(0.1 1.0)
 
 FOLDS=("fold-3")           # lowercase, dashed
-KNN_K=(15 120 180)
-MAN_KNN_METHODS=("faiss" "anatomical_atlas" "faiss_atlas_weighted")
-MAN_INFLATIONS=(10 100)   # only used when knn_method=faiss_atlas_weighted
-LAPLACIAN_NORMS=("symmetric" "randomwalk")
+KNN_K=(15 120)
+MAN_KNN_METHODS=("faiss" "faiss_atlas_weighted")
+MAN_INFLATIONS=(10)   # only used when knn_method=faiss_atlas_weighted
+LAPLACIAN_NORMS=("randomwalk")
 GRAPH_BANDWIDTHS=(0.1)
-BUMP_SCALES=(20)
-BUMP_DECAYS=(0.1)
+BUMP_SCALES=(0.25)
+BUMP_DECAYS=(0.01)
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.1 1.0)
 NU=(2)
-THRESHOLDS=(5 40)
+THRESHOLDS=(5 40 150 250)
 
 # Fixed across the whole sweep
 TEMPLATE="reference"

@@ -28,21 +28,21 @@ set -eu
 # called from run_eigenvector_sweep_batch.sh. Set any of them in the env
 # to override the local default.
 # -------------------------------------------------------------------------
-: "${KNN_METHOD:=anatomical_atlas}"
-: "${NORMALIZATION:=symmetric}"
+: "${KNN_METHOD:=faiss_atlas_weighted}"
+: "${NORMALIZATION:=randomwalk}"
 : "${THRESHOLD:=5}"
 : "${KNN_K:=120}"
 : "${GRAPHBANDWIDTH:=0.1}"
 : "${CROSS_REGION_INFLATION:=10.0}"
 : "${NUM_MODES:=1300}"
-: "${STRIDE:=4}"
+: "${STRIDE:=8}"
 : "${N_LIST:=1}"
 : "${NU:=2}"
 : "${LENGTHSCALE:=1.0}"
-: "${BUMP_SCALE:=3.0}"
-: "${BUMP_DECAY:=0.05}"
-: "${N_TEST_ON:=200}"
-: "${N_TEST_OFF:=200}"
+: "${BUMP_SCALE:=1.0}"
+: "${BUMP_DECAY:=0.01}"
+: "${N_TEST_ON:=500}"
+: "${N_TEST_OFF:=500}"
 : "${TEST_SEED:=42}"
 : "${GEODESIC_ANCHORS:=500}"
 
@@ -77,7 +77,7 @@ CFG_SLUG="${METHOD_TAG}-${NORM_TAG}-t${THRESHOLD}-k${KNN_K}-bw$(slug "$GRAPHBAND
 if [ "$KNN_METHOD" = "faiss_atlas_weighted" ]; then
     CFG_SLUG="${CFG_SLUG}-i$(slug "$CROSS_REGION_INFLATION")"
 fi
-CFG_SLUG="${CFG_SLUG}-bs$(slug "$BUMP_SCALE")-bd$(slug "$BUMP_DECAY")-nu${NU}-ls$(slug "$LENGTHSCALE")-nm${NUM_MODES}"
+CFG_SLUG="${CFG_SLUG}-bs$(slug "$BUMP_SCALE")-bd$(slug "$BUMP_DECAY")-nu${NU}-ls$(slug "$LENGTHSCALE")-s${STRIDE}-nm${NUM_MODES}"
 : "${OUT_CSV:=${OUTPUT_DIR}/psd_sweep/${CFG_SLUG}.csv}"
 
 # -------------------------------------------------------------------------
@@ -106,6 +106,7 @@ python "$SRC_PATH/maldi/laplacian_test.py" \
     --knn-k "$KNN_K" \
     --graphbandwidth "$GRAPHBANDWIDTH" \
     --nu "$NU" \
+    --kernel "symmetric" \
     --lengthscale "$LENGTHSCALE" \
     --bump-scale "$BUMP_SCALE" \
     --bump-decay "$BUMP_DECAY" \
