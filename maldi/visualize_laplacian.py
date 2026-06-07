@@ -101,6 +101,13 @@ def parse_args() -> dict:
 
     p.add_argument("--n-sources", type=int, default=4)
     p.add_argument("--source-seed", type=int, default=0)
+    # PSD diagnostic panel sampling — fixed at startup, doesn't sweep
+    p.add_argument("--psd-n-on",  type=int, default=100,
+                   help="In-sample test points for the PSD diagnostic panel.")
+    p.add_argument("--psd-n-off", type=int, default=100,
+                   help="Out-of-sample test points (sub-threshold voxels) for the PSD diagnostic panel.")
+    p.add_argument("--psd-seed",  type=int, default=42,
+                   help="RNG seed for PSD panel test-point sampling.")
     p.add_argument("--n-targets", type=int, default=50)
     p.add_argument("--target-strategy", choices=["random", "stratified"], default="stratified")
     p.add_argument("--k-show", type=int, default=30)
@@ -560,6 +567,272 @@ def make_layer_info_panel():
     return widget, (lambda t, i: [info_dict.update({t: i}), render()][1]), render
 
 
+# -----------------------------------------------------------------------------
+# PSD diagnostic panel — shows two sections:
+#   (1) Laplacian eigenvalue statistics (zero / near-zero / negative counts,
+#       λ_min, λ_max, condition number, spectral gap, below-Matern-floor count).
+#       These depend only on the loaded eigenpairs and are computed once at
+#       startup — they don't change as the user tweaks nu / lengthscale /
+#       num_modes / bump_scale, because the *Laplacian* spectrum is fixed.
+#   (2) Kernel-Gram PSD on a small sample of in-sample (training nodes) and
+#       out-of-sample (sub-threshold voxels) test points. Three Gram matrices
+#       are reported: K_m (bare manifold), K_bm (bump-modulated), K_full
+#       (deployed kernel including bump-Euclidean fallback). For each matrix
+#       at each block (in-sample, out-of-sample), we report the smallest
+#       eigenvalue / λ_max ratio and the condition number. This DOES depend
+#       on the current state — the refresh callback recomputes it whenever
+#       relevant params change.
+# -----------------------------------------------------------------------------
+def analyze_spectrum_for_panel(ev: np.ndarray, matern_floor: float = float("-inf"),
+                                tol_zero: float = 1e-10, tol_neg: float = 1e-6) -> dict:
+    """Lightweight reimplementation of laplacian_sweep.analyze_eigvals for the
+    UI panel. Standalone so we don't need to import the sweep script."""
+    ev = np.asarray(ev, dtype=np.float64).ravel()
+    if ev.size == 0:
+        return {}
+    lam_min = float(ev.min())
+    lam_max = float(ev.max())
+    scale = max(abs(lam_max), 1e-30)
+    pos = ev[ev > 0]
+    lam_min_pos = float(pos.min()) if pos.size else float("nan")
+    ev_sorted = np.sort(ev)
+    spectral_gap = float(ev_sorted[1] - ev_sorted[0]) if ev.size >= 2 else float("nan")
+    return {
+        "n":              int(ev.size),
+        "lam_min":        lam_min,
+        "lam_max":        lam_max,
+        "ratio":          lam_min / scale,
+        "n_zero_exact":   int(np.sum(ev == 0.0)),
+        "n_zero_eps":     int(np.sum(np.abs(ev) < tol_zero * scale)),
+        "n_neg":          int(np.sum(ev < 0)),
+        "n_neg_sig":      int(np.sum(ev < -tol_neg * scale)),
+        "n_below_floor":  int(np.sum(ev < matern_floor)),
+        "spectral_gap":   spectral_gap,
+        "cond":           (lam_max / lam_min_pos) if pos.size else float("inf"),
+        "lam_min_pos":    lam_min_pos,
+    }
+
+
+def classify_psd(ratio: float, tol_neg: float = 1e-6, tol_zero: float = 1e-10) -> str:
+    """Three-level classification: clean / jitter / violation."""
+    if ratio >= -tol_zero:
+        return "clean"
+    if ratio >= -tol_neg:
+        return "jitter"
+    return "violation"
+
+
+def matern_euclidean_pairwise(coords: torch.Tensor, nu: float, lengthscale: float) -> np.ndarray:
+    """N×N Euclidean Matern kernel via the scipy.special Bessel formula.
+    Matches matern_euclidean_at_source's convention."""
+    from scipy.special import kv, gamma as gamma_fn
+    pts = coords.detach().cpu().numpy()
+    diff = pts[:, None, :] - pts[None, :, :]
+    d = np.linalg.norm(diff, axis=-1)
+    nu_f = float(nu); ls = float(lengthscale)
+    K = np.ones_like(d, dtype=np.float64)
+    nz = d > 0
+    if nz.any():
+        z = np.sqrt(2.0 * nu_f) * d[nz] / ls
+        # Floor z away from zero — kv(nu, z) for tiny z is finite but the
+        # multiplication z^nu * kv(nu, z) can NaN through 0*inf cancellation.
+        z = np.maximum(z, 1e-12)
+        K[nz] = ((2.0 ** (1.0 - nu_f)) / gamma_fn(nu_f)) * (z ** nu_f) * kv(nu_f, z)
+    return K
+
+
+def make_psd_info_panel(ctx: dict, n_on: int = 100, n_off: int = 100, seed: int = 42):
+    """Returns (widget, refresh_callback, sample_dict). The widget can be
+    docked into napari; the callback recomputes the kernel-PSD section using
+    current state values (nu, lengthscale, num_modes, bump_scale, bump_decay).
+    The Laplacian section is computed once and cached in sample_dict.
+
+    sample_dict carries the precomputed test points and bookkeeping needed
+    by refresh so we don't re-sample on every parameter change (re-sampling
+    would make the diagnostic non-comparable across param tweaks).
+    """
+    try:
+        from qtpy.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QLabel
+        from qtpy.QtGui import QFont
+    except ImportError:
+        return None, (lambda *_a, **_k: None), {}
+
+    text = QTextEdit()
+    text.setReadOnly(True)
+    mono = QFont("Monospace")
+    mono.setStyleHint(QFont.TypeWriter)
+    mono.setPointSize(9)
+    text.setFont(mono)
+    text.setMinimumHeight(260)
+
+    widget = QWidget()
+    layout = QVBoxLayout(widget); layout.setContentsMargins(2, 2, 2, 2)
+    layout.addWidget(QLabel("Laplacian + Kernel PSD diagnostics"))
+    layout.addWidget(text)
+
+    # --- Sample test points once at startup; reuse across refreshes ---
+    device = ctx["device"]
+    rng = np.random.default_rng(seed)
+    reference_nodes = ctx["reference_nodes"]
+    N = reference_nodes.shape[0]
+
+    n_on  = min(n_on, N)
+    on_idx = rng.choice(N, size=n_on, replace=False)
+    pts_on = reference_nodes[on_idx].clone()
+
+    # Off-manifold: sub-threshold voxels (template > 0 and ≤ threshold).
+    sub_volume = ctx["sub_volume"]
+    threshold = int(ctx["threshold"])
+    off_mask = (sub_volume > 0) & (sub_volume <= threshold)
+    off_zyx = np.argwhere(off_mask)
+    if off_zyx.shape[0] > 0:
+        take = min(n_off, off_zyx.shape[0])
+        pick = rng.choice(off_zyx.shape[0], size=take, replace=False)
+        off_idx_full = off_zyx[pick].astype(np.float32)
+        oz, oy, ox = ctx["voxel_offset"]
+        # Same coord convention as reference_ccf_from_subvolume
+        if float(ctx["voxel_scale_mm"]) == 0.025:
+            off_mm = (off_idx_full + np.array([oz, oy, ox], dtype=np.float32)) * 0.025
+        else:
+            off_mm = off_idx_full * ctx["voxel_scale_mm"]
+        off_mm_t = torch.from_numpy(off_mm).to(device)
+        pts_off = (off_mm_t - ctx["coord_mean"].to(device)) / ctx["coord_std"].to(device)
+    else:
+        pts_off = torch.empty(0, 3, dtype=pts_on.dtype, device=device)
+
+    if pts_off.shape[0] < n_off:
+        # Fallback: jitter training nodes to fill the off sample.
+        deficit = n_off - pts_off.shape[0]
+        seed_idx = rng.choice(N, size=deficit, replace=True)
+        jitter = torch.from_numpy(
+            rng.normal(0, 0.05, size=(deficit, 3)).astype(np.float32)
+        ).to(device)
+        pts_off = torch.cat([pts_off, reference_nodes[seed_idx] + jitter], dim=0)
+
+    test_pts = torch.cat([pts_on, pts_off], dim=0)
+    n_on_actual = int(pts_on.shape[0])
+    n_off_actual = int(test_pts.shape[0] - n_on_actual)
+
+    sample_dict = {
+        "test_pts":    test_pts,
+        "n_on":        n_on_actual,
+        "n_off":       n_off_actual,
+        "lap_summary": None,  # filled in on first refresh
+    }
+
+    # --- Format helpers ---
+    def fmt(d: dict, prefix: str = "") -> str:
+        cls = classify_psd(d["ratio"])
+        color = {"clean": "#2a8", "jitter": "#888", "violation": "#c44"}[cls]
+        return (
+            f"{prefix:<18} n={d['n']:>5d}  "
+            f"λ_min={d['lam_min']:>+10.3e}  λ_max={d['lam_max']:>10.3e}  "
+            f"<span style='color:{color}'>ratio={d['ratio']:>+10.3e}</span>  "
+            f"n_neg={d['n_neg']:>4d}/{d['n_neg_sig']:>4d}  "
+            f"n_zero={d['n_zero_eps']:>4d}  cond={d['cond']:>10.2e}"
+        )
+
+    # --- Laplacian section: computed once ---
+    eigval_np = ctx["eigval"].detach().cpu().numpy()
+    matern_floor = -2.0 * float(ctx.get("_nu_for_floor", 2)) / (float(ctx.get("_ls_for_floor", 1.0)) ** 2)
+    lap_summary = analyze_spectrum_for_panel(eigval_np, matern_floor=matern_floor)
+    sample_dict["lap_summary"] = lap_summary
+
+    # --- Kernel-Gram section: recomputed on demand ---
+    def refresh(nu: float, lengthscale: float, num_modes: int,
+                bump_scale: float, bump_decay: float):
+        """Recompute the kernel-Gram diagnostics with current state values.
+        Uses ctx['matern_kernel'] which gets rebuilt by the surrounding code
+        when num_modes / nu / lengthscale change."""
+        try:
+            matern_kernel = ctx["matern_kernel"]
+            graphbandwidth = float(ctx["bw"])
+
+            with torch.no_grad():
+                feat = matern_kernel.features(test_pts)
+                K_m = (feat @ feat.t()).detach().cpu().numpy().astype(np.float64)
+                K_m = 0.5 * (K_m + K_m.T)
+                edge_value, _ = matern_kernel.knn.search(test_pts, 1)
+                d_nearest = edge_value.sqrt().squeeze(-1)
+                b = bump_function(
+                    d_nearest,
+                    scale=float(bump_scale) * graphbandwidth,
+                    decay=float(bump_decay),
+                ).detach().cpu().numpy().astype(np.float64)
+
+            K_eu = matern_euclidean_pairwise(test_pts, nu, lengthscale)
+            K_bm = b[:, None] * K_m * b[None, :]
+            one_m_b = 1.0 - b
+            K_full = K_bm + (one_m_b[:, None] * one_m_b[None, :]) * K_eu
+
+            # Recompute floor with the CURRENT nu/lengthscale (the Laplacian
+            # spectrum doesn't change, but where the floor lands does).
+            floor_now = -2.0 * float(nu) / (float(lengthscale) ** 2)
+            n_below = int(np.sum(eigval_np < floor_now))
+
+            blocks = [
+                ("on",  slice(0, n_on_actual)),
+                ("off", slice(n_on_actual, None)),
+            ]
+            kernel_lines: list[str] = []
+            for tag, mat in [("K_m", K_m), ("K_bm", K_bm), ("K_full", K_full)]:
+                for blk_name, sl in blocks:
+                    sub = mat[sl, sl]
+                    if sub.size == 0:
+                        continue
+                    try:
+                        ev = np.linalg.eigvalsh(sub)
+                    except np.linalg.LinAlgError as e:
+                        kernel_lines.append(f"{tag:<7s} {blk_name:<3s}  EIG_FAIL: {e}")
+                        continue
+                    d = analyze_spectrum_for_panel(ev)
+                    kernel_lines.append(fmt(d, prefix=f"{tag:<7s} {blk_name:<3s}"))
+
+            bump_on  = float(b[:n_on_actual].mean()) if n_on_actual > 0 else float("nan")
+            bump_off = float(b[n_on_actual:].mean()) if n_off_actual > 0 else float("nan")
+
+            # --- Compose the panel HTML ---
+            lap_line = fmt(lap_summary, prefix="Laplacian (full)")
+            params_line = (
+                f"params: ν={nu}  ℓ={lengthscale:g}  modes={num_modes}  "
+                f"bw={graphbandwidth:g}  bump_scale={bump_scale:g}  bump_decay={bump_decay:g}"
+            )
+            floor_line = (
+                f"matern floor = -2ν/ℓ² = {floor_now:>10.3g}  "
+                f"n_below_floor={n_below:>5d}  "
+                + ("<span style='color:#c44'>(spectral density flips sign — kernel non-PSD)</span>"
+                   if n_below > 0 else "<span style='color:#2a8'>(all eigvals above floor)</span>")
+            )
+            bump_line = (
+                f"bump: on_mean={bump_on:.4f}  off_mean={bump_off:.4f}  "
+                f"n_on={n_on_actual}  n_off={n_off_actual}"
+                + ("  <span style='color:#888'>(bump ≈ 1 everywhere ⇒ K_bm ≈ K_m, K_full ≈ K_m)</span>"
+                   if bump_off > 0.95 else "")
+            )
+
+            html = (
+                "<pre>"
+                + lap_line + "\n"
+                + floor_line + "\n"
+                + "\n"
+                + params_line + "\n"
+                + bump_line + "\n"
+                + "\n"
+                + "Kernel Gram on test sample (in-sample = training nodes; out-of-sample = sub-threshold voxels):\n"
+                + "\n".join(kernel_lines)
+                + "\n"
+                + "\n"
+                + "<span style='color:#888'>legend: ratio = λ_min/λ_max.  green=clean (≥-1e-10), grey=Lanczos jitter (-1e-6..-1e-10), red=real violation (<-1e-6).  n_neg = total/significant.</span>"
+                + "</pre>"
+            )
+            text.setHtml(html)
+        except Exception as e:
+            import traceback
+            text.setHtml(f"<pre>refresh failed: {type(e).__name__}: {e}\n{traceback.format_exc()}</pre>")
+
+    return widget, refresh, sample_dict
+
+
 def fmt_info_sequential(vmin, vmax, sat, gamma, cmap):
     return f"range=[{vmin:>+10.3g}, {vmax:>+10.3g}]  sat={sat:>+10.3g}  γ={gamma:>4.2f}  cmap={cmap}"
 
@@ -693,6 +966,18 @@ def main():
     info_panel, set_info, refresh_info = make_layer_info_panel()
     if info_panel is not None:
         viewer.window.add_dock_widget(info_panel, name="layer info", area="bottom")
+
+    # PSD diagnostic panel — Laplacian eigenvalue stats (fixed) + kernel-Gram
+    # PSD on a small in-sample / out-of-sample test sample (refreshes when
+    # the user changes nu, lengthscale, num_modes, bump_scale, bump_decay).
+    psd_panel, refresh_psd, _psd_sample = make_psd_info_panel(
+        ctx,
+        n_on=int(args.get("psd_n_on", 100)),
+        n_off=int(args.get("psd_n_off", 100)),
+        seed=int(args.get("psd_seed", 42)),
+    )
+    if psd_panel is not None:
+        viewer.window.add_dock_widget(psd_panel, name="PSD diagnostics", area="bottom")
 
     rng_render = np.random.default_rng(args["source_seed"])
     
@@ -932,6 +1217,15 @@ def main():
     _update_sparse_image_layer(h_layer,   deg_vals,      "H D_i",     "H",  cmap_name="cividis", mode="sequential")
     refresh_per_source(); refresh_C(); refresh_D(); refresh_E(); refresh_F(); refresh_G()
 
+    # Initial PSD panel populate — without this it shows nothing until the
+    # user wiggles a slider. Uses the same state values the kernel was built
+    # from, so the panel reflects the actual deployed configuration.
+    if refresh_psd is not None:
+        refresh_psd(
+            state["nu"], state["lengthscale"], state["num_modes"],
+            state["bump_scale"], state["bump_decay"],
+        )
+
     bump_widget, update_bump_plot = make_bump_widget(ctx["bw"], state["bump_scale"], state["bump_decay"])
     if bump_widget is not None: viewer.window.add_dock_widget(bump_widget, name="bump function", area="left")
 
@@ -976,6 +1270,13 @@ def main():
         if chg_src or chg_rs or chg_bs or chg_bd or chg_gamma or chg_alpha: refresh_D_dense()
         if chg_sigma or chg_rs or chg_bs or chg_bd or chg_gamma or chg_alpha: refresh_K_dense()
         if chg_bs or chg_bd: update_bump_plot(bump_scale, bump_decay)
+        # PSD diagnostic panel refreshes whenever kernel hyperparams change.
+        # The matern_kernel object on ctx is rebuilt by the surrounding code
+        # for changes to num_modes/nu/lengthscale, so by the time refresh_psd
+        # runs it sees the new features() behaviour. bump_scale/bump_decay
+        # are passed in directly since the kernel object reads them per-call.
+        if refresh_psd is not None and (chg_K or chg_nu or chg_ls or chg_bs or chg_bd):
+            refresh_psd(nu, lengthscale, num_modes, bump_scale, bump_decay)
 
     viewer.window.add_dock_widget(controls, name="kernel controls", area="right")
 
