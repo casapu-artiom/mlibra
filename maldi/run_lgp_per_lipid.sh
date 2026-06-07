@@ -46,13 +46,13 @@
 : "${NUM_MODES:=1300}"
 : "${STRIDE:=4}"
 : "${KNN_K:=120}"
-: "${KNN_METHOD:=faiss_atlas_weighted}"
-: "${CROSS_REGION_INFLATION:=10.0}"
+: "${KNN_METHOD:=anatomical_atlas}"
+: "${CROSS_REGION_INFLATION:=1.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
 : "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${GRAPHBANDWIDTH:=0.1}"
-: "${THRESHOLD:=40}"
+: "${THRESHOLD:=5}"
 
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -78,9 +78,9 @@ run_one() {
 
     local TAG
     if [ "$FAMILY" = "manifold" ]; then
-        TAG="manifold-nu${NU_}-K${NMODES_}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="manifold-nu${NU_}-K${NMODES_}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     else
-        TAG="euclidean-${KERNEL}-nu${NU_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="euclidean-${KERNEL}-nu${NU_}-ind${INDU_}-{$THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
     local EXP_NAME="${TAG}"
 

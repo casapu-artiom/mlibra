@@ -58,6 +58,36 @@ def get_inducing_points(exp_path, dataset_path, num_inducing):
 
     return inducing_points, coord_mean, coord_std
 
+def coord_norm_from_reference(reference_image, voxel_per_mm: float = 40.0):
+    """Single source of truth for the standardized coordinate space.
+ 
+    Computes the global whole-brain normalization PURELY from the reference
+    image — no exp_path, no caching, no dependency on a training run having
+    happened anywhere. Training, visualization, and diagnostics should all call
+    this so they share an identical metric regardless of where they run.
+ 
+    Convention (do not change without re-solving every cached graph):
+      * coordinates are tissue voxels (reference_image > 0) converted to mm
+        via voxel / voxel_per_mm (40 vox/mm = 25 um),
+      * coord_mean is PER-AXIS (3,)  — a translation, geometrically irrelevant,
+      * coord_std is a SINGLE SCALAR  — isotropic scaling, so the metric stays
+        a true (un-warped) Euclidean metric up to a global scale.
+ 
+    Accepts either a loaded array or a path to reference_image.npy.
+ 
+    Returns
+    -------
+    coord_mean : torch.Tensor (3,)
+    coord_std  : torch.Tensor (scalar)
+    """
+    if isinstance(reference_image, (str, Path)):
+        reference_image = np.load(reference_image)
+    idx = np.array(np.where(reference_image > 0)).T
+    ref_mm = idx / float(voxel_per_mm)
+    coord_mean = torch.tensor(ref_mm.mean(axis=0), dtype=torch.float32)
+    coord_std = torch.tensor(ref_mm.std(), dtype=torch.float32)   # scalar -> isotropic
+    return coord_mean, coord_std
+
 
 def get_symmetric_points(reference_image, exp_path, num_inducing, x_median, labels_file):
     """
@@ -174,18 +204,17 @@ def _load_or_compute_coord_norm(exp_path: Path, dataset_path: Path):
     Load global (whole-brain) coord_mean / coord_std, or compute and cache
     them from the reference image. Shared across whole-brain and bbox
     inducing-point routines so the standardized coordinate space matches.
+ 
+    The computation itself lives in `coord_norm_from_reference` (the single
+    source of truth); this wrapper only adds the per-experiment cache.
     """
     colmean_file = exp_path / "colmean.pth"
     colstd_file = exp_path / "colstd.pth"
     if colmean_file.exists() and colstd_file.exists():
         return torch.load(colmean_file), torch.load(colstd_file)
-
+ 
     logging.info("Computing global coord_mean / coord_std from reference_image.npy")
-    reference_image = np.load(dataset_path / "reference_image.npy")
-    reference_image_index = np.array(np.where(reference_image > 0)).T
-    reference_mm = reference_image_index / 40
-    coord_mean = torch.tensor(reference_mm.mean(axis=0), dtype=torch.float32)
-    coord_std = torch.tensor(reference_mm.std(), dtype=torch.float32)
+    coord_mean, coord_std = coord_norm_from_reference(dataset_path / "reference_image.npy")
     torch.save(coord_mean, colmean_file)
     torch.save(coord_std, colstd_file)
     return coord_mean, coord_std
