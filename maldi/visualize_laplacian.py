@@ -38,7 +38,7 @@ from manifold_gp.utils.compute_eigenvectors import (
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
 )
-from utils import crop_or_stride_volume, reference_ccf_from_subvolume
+from utils import crop_or_stride_volume, reference_ccf_from_subvolume, coord_norm_from_reference
 
 try:
     from manifold_gp.utils import bump_function as _lib_bump_function
@@ -122,6 +122,21 @@ def parse_args() -> dict:
     p.add_argument("--render-stride", type=int, default=1)
     p.add_argument("--bump-scale", type=float, default=3.0)
     p.add_argument("--bump-decay", type=float, default=0.05)
+    p.add_argument("--bump-glow-edge-sample", type=int, default=6000,
+                   help="How many sampled fabric edges to seed the bump glow from.")
+    p.add_argument("--bump-glow-steps", type=int, default=3,
+                   help="Interpolation points per edge interior for the bump glow.")
+    p.add_argument("--bump-glow-opacity", type=float, default=0.35,
+                   help="Per-point base opacity of the bump glow (additive).")
+    p.add_argument("--bump-glow-min-size", type=float, default=3.0,
+                   help="Minimum glow disc diameter (voxels) so small bump "
+                        "scales stay visible instead of collapsing to nothing.")
+    p.add_argument("--bump-glow-max-size", type=float, default=10.0,
+                   help="Maximum glow disc diameter (voxels). Caps the DRAWN "
+                        "radius so large bump scales don't balloon past the "
+                        "manifold's own features; the true support radius is "
+                        "still reported in the info panel. Set very large to "
+                        "draw the true (uncapped) support extent.")
     p.add_argument("--density-smooth-sigma", type=float, default=0.0)
     p.add_argument("--nystrom-batch-size", type=int, default=20_000)
     p.add_argument("--dense-max-render-points", type=int, default=2000000)
@@ -150,8 +165,11 @@ def setup(args: dict, log: logging.Logger):
         sub_volume, voxel_offset, voxel_scale_mm, args["threshold"],
     )
     reference_nodes_mm = torch.tensor(reference_ccf, dtype=torch.float32)
-    coord_mean = reference_nodes_mm.mean(dim=0)
-    coord_std = reference_nodes_mm.std(dim=0).clamp(min=1e-6)
+    # Single source of truth shared with training (utils.coord_norm_from_reference):
+    # per-axis mean + scalar (isotropic) std from reference_image > 0. Computed
+    # straight from the reference image the visualizer already loaded, so it
+    # never depends on a training run having happened in this environment.
+    coord_mean, coord_std = coord_norm_from_reference(template_full)
     reference_nodes = ((reference_nodes_mm - coord_mean) / coord_std).to(device)
 
     node_voxel_idx = np.argwhere(sub_volume > args["threshold"]).astype(np.int32)
@@ -335,6 +353,71 @@ def interpolate_function_to_dense_grid(
 
     return f_q_all, voxel_idx
 
+
+def bump_field_on_dense_grid(
+    ctx: dict, laplacian_op: GraphLaplacianOperator, render_stride: int,
+    bump_scale: float, bump_decay: float, batch_size: int = 50_000,
+    max_points: int = 2_000_000,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """The bump *support cloud* around the manifold.
+
+    Returns, for a strided grid of voxels NEAR the graph nodes (not just the
+    above-threshold manifold voxels — we want the surrounding halo), the value
+    b(p) = bump_function(dist(p, nearest node), alpha, beta) in [0, 1], where
+    alpha = bump_scale * graphbandwidth. b = 1 on the manifold, fades to 0 at
+    the support radius, and is exactly 0 (omitted) beyond it. This is the field
+    that multiplies the out-of-sample features in RiemannKernel.features().
+
+    The grid is bounded to the node bounding box dilated by alpha and, if that
+    still exceeds `max_points`, the cloud stride is increased so the layer stays
+    cheap. Returns (b_within, voxel_idx_within, cloud_stride)."""
+    from scipy.spatial import cKDTree
+    tmpl = ctx["template_full"]
+    shape = np.asarray(tmpl.shape)
+    bw = float(laplacian_op.graphbandwidth.squeeze())
+    bump_radius = bw * float(bump_scale)  # in z-scored coordinate units
+
+    coord_std = ctx["coord_std"].cpu().numpy().astype(np.float64)
+    # full-resolution voxel positions of the graph nodes
+    node_full = (ctx["node_voxel_idx"].astype(np.float64)
+                 * ctx["sv_scale"] + ctx["sv_translate"])
+    # alpha expressed in voxels, per axis: dz/dvoxel = 0.025 / coord_std
+    alpha_vox = bump_radius * coord_std / 0.025
+
+    lo = np.maximum(np.floor(node_full.min(0) - alpha_vox).astype(int), 0)
+    hi = np.minimum(np.ceil(node_full.max(0) + alpha_vox).astype(int), shape - 1)
+
+    # pick a cloud stride that keeps the candidate count under max_points
+    cloud_stride = int(render_stride)
+    def n_candidates(s):
+        return int(np.prod(np.maximum((hi - lo) // s + 1, 1)))
+    while n_candidates(cloud_stride) > max_points:
+        cloud_stride += 1
+
+    zs = np.arange(lo[0], hi[0] + 1, cloud_stride)
+    ys = np.arange(lo[1], hi[1] + 1, cloud_stride)
+    xs = np.arange(lo[2], hi[2] + 1, cloud_stride)
+    grid = np.stack(np.meshgrid(zs, ys, xs, indexing="ij"), -1).reshape(-1, 3).astype(np.int32)
+
+    if "_query_kdt" not in ctx:
+        ctx["_query_kdt"] = cKDTree(ctx["reference_nodes"].cpu().numpy())
+    kdt = ctx["_query_kdt"]
+
+    coords_z = _full_voxel_to_normalized(grid, ctx).numpy()
+    keep_idx, keep_b = [], []
+    for s in range(0, grid.shape[0], batch_size):
+        e = min(s + batch_size, grid.shape[0])
+        d, _ = kdt.query(coords_z[s:e], k=1, workers=-1)   # euclidean distance (z units)
+        d = d.astype(np.float32)
+        within = d < bump_radius
+        if within.any():
+            b = bump_function(torch.from_numpy(d[within]),
+                              bump_radius, float(bump_decay)).cpu().numpy()
+            keep_idx.append(grid[s:e][within])
+            keep_b.append(b)
+    if keep_b:
+        return (np.concatenate(keep_b), np.concatenate(keep_idx), cloud_stride)
+    return np.empty(0, np.float32), np.empty((0, 3), np.int32), cloud_stride
 
 def laplacian_diag(laplacian_op: GraphLaplacianOperator) -> np.ndarray:
     return laplacian_op.laplacian_diag.detach().cpu().numpy()
@@ -951,6 +1034,11 @@ def main():
     g_dense_layer = viewer.add_image(placeholder_vol, name=f"G_dense: eigenvector φ_k dense @ full-stride", visible=False, **_img_kw)
     d_dense_layer = viewer.add_image(placeholder_vol, name=f"D_dense: L · δ_src dense @ full-stride", visible=False, **_img_kw)
     k_dense_layer = viewer.add_image(placeholder_vol, name=f"K_dense: L · density dense @ full-stride", visible=False, **_img_kw)
+    bump_cloud_layer = viewer.add_points(
+        np.empty((0, 3), dtype=np.float32), name="C0: bump glow (around sampled fabric)",
+        size=1.0, face_color="cyan", border_width=0.0, symbol="disc",
+        blending="additive", opacity=1.0, visible=False, out_of_slice_display=True,
+    )
 
     src_points = ctx["node_voxel_idx"][src_idxs].astype(np.float32) * ctx["sv_scale"] + ctx["sv_translate"]
     viewer.add_points(src_points, name="source nodes", size=float(args["source_marker_size"]), face_color="red", border_color="white", symbol="o", opacity=0.95)
@@ -1135,6 +1223,89 @@ def main():
         K_q, voxel_idx = euclidean_kernel_at_dense_grid(s, ctx, state["nu"], state["lengthscale"], state["render_stride"])
         _update_dense_image_layer(l_layer, K_q, voxel_idx, "L Eucl Kernel", "L")
 
+    def refresh_bump_cloud():
+        if not bump_cloud_layer.visible: return
+        from scipy.spatial import cKDTree
+        laplacian_op = ctx["laplacian_op"]
+        # Seed ONCE from the same sampled fabric edges shown in layer A2.
+        # Separate the graph NODES (which are on the manifold → bump == 1 by
+        # definition, so always drawn) from the edge-interior points (off the
+        # nodes → their bump is computed and they appear only once the support
+        # is wide enough to reach them).
+        if "_bump_glow_seed" not in ctx:
+            pairs = fabric_pairs
+            if pairs.shape[0] > int(args["bump_glow_edge_sample"]):
+                sel = np.random.default_rng(0).choice(
+                    pairs.shape[0], int(args["bump_glow_edge_sample"]), replace=False)
+                pairs = pairs[sel]
+            node_ids = np.unique(pairs.reshape(-1))
+            node_pts = all_node_positions[node_ids].astype(np.float32)
+            steps = max(0, int(args["bump_glow_steps"]))
+            if steps > 0:
+                a = all_node_positions[pairs[:, 0]]; b = all_node_positions[pairs[:, 1]]
+                ts = np.linspace(0.0, 1.0, steps + 2)[1:-1][None, :, None]  # interior only
+                edge_pts = (a[:, None, :] * (1 - ts) + b[:, None, :] * ts).reshape(-1, 3).astype(np.float32)
+            else:
+                edge_pts = np.empty((0, 3), dtype=np.float32)
+            ctx["_bump_glow_node_pts"] = node_pts
+            ctx["_bump_glow_edge_pts"] = edge_pts
+            ctx["_bump_glow_edge_z"] = (_full_voxel_to_normalized(edge_pts, ctx).numpy()
+                                        if edge_pts.shape[0] else np.empty((0, 3), np.float32))
+            ctx["_bump_glow_n_edges"] = int(pairs.shape[0])
+            ctx["_bump_glow_seed"] = True
+        if "_query_kdt" not in ctx:
+            ctx["_query_kdt"] = cKDTree(ctx["reference_nodes"].cpu().numpy())
+
+        node_pts = ctx["_bump_glow_node_pts"]
+        edge_pts = ctx["_bump_glow_edge_pts"]; edge_z = ctx["_bump_glow_edge_z"]
+        alpha_z = float(state["bump_scale"]) * float(laplacian_op.graphbandwidth.squeeze())
+
+        # nodes: on the manifold, bump == 1 (drawn at every bump scale)
+        pts_list = [node_pts]
+        b_list = [np.ones(node_pts.shape[0], dtype=np.float32)]
+        # edge interior: keep only those the support actually reaches
+        if edge_pts.shape[0]:
+            d, _ = ctx["_query_kdt"].query(edge_z, k=1, workers=-1)
+            d = d.astype(np.float32)
+            eb = np.zeros(d.shape[0], dtype=np.float32)
+            w = d < alpha_z
+            if w.any():
+                eb[w] = bump_function(torch.from_numpy(d[w]), alpha_z,
+                                      float(state["bump_decay"])).cpu().numpy()
+            ek = eb > 1e-3
+            pts_list.append(edge_pts[ek]); b_list.append(eb[ek])
+
+        pts = np.concatenate(pts_list, axis=0)
+        bv = np.concatenate(b_list, axis=0)
+        # True support diameter in voxels (coords are 0.025 mm/voxel)...
+        true_diam = 2.0 * alpha_z * float(ctx["coord_std"].mean().item()) / 0.025
+        # ...but the DRAWN disc is clamped so a large support doesn't balloon
+        # past the manifold's own features. The true extent is reported below.
+        size_vox = float(np.clip(true_diam,
+                                 float(args["bump_glow_min_size"]),
+                                 float(args["bump_glow_max_size"])))
+        capped = true_diam > float(args["bump_glow_max_size"]) + 1e-6
+        rgba = np.zeros((pts.shape[0], 4), dtype=np.float32)
+        rgba[:, 0], rgba[:, 1], rgba[:, 2] = 0.45, 0.80, 1.0   # cyan
+        rgba[:, 3] = np.clip(bv * float(args["bump_glow_opacity"]), 0.0, 1.0)
+        n_pts = pts.shape[0]
+        bump_cloud_layer.data = pts
+        # Assigning an (N,4) array switches the layer to direct face-color mode
+        # on its own; setting face_color_mode explicitly is unnecessary and
+        # raises on some napari versions. Size as a per-point array is always
+        # accepted, whereas a bare scalar can raise after a data-length change.
+        bump_cloud_layer.face_color = rgba
+        bump_cloud_layer.size = np.full(n_pts, size_vox, dtype=np.float32)
+        radius_mm = alpha_z * float(ctx["coord_std"].mean().item())
+        set_info("C0",
+                 f"bump glow: {node_pts.shape[0]:,} node anchors + "
+                 f"{pts.shape[0] - node_pts.shape[0]:,} edge pts  "
+                 f"drawn⌀={size_vox:.0f} vox{' (CAPPED)' if capped else ''}  "
+                 f"true support α={state['bump_scale']:g}×bw={alpha_z:.3g} z "
+                 f"≈ {radius_mm:.2f} mm (⌀≈{true_diam:.0f} vox)")
+        print(f"[C0 glow] refreshed: {pts.shape[0]:,} pts, drawn⌀={size_vox:.0f} vox, "
+              f"alpha_max={float(rgba[:, 3].max()) if pts.shape[0] else 0:.2f}", flush=True)
+
     def refresh_per_source():
         s = current_src()
         data = build_lines_for_source(s, ctx, state["lengthscale"], state["gamma"], args["k_show"], args["n_targets"], args["target_strategy"], args["source_seed"], state["nu"], args["knn_color_by"])
@@ -1269,6 +1440,7 @@ def main():
         if chg_eig or chg_rs or chg_bs or chg_bd or chg_gamma or chg_alpha: refresh_G_dense()
         if chg_src or chg_rs or chg_bs or chg_bd or chg_gamma or chg_alpha: refresh_D_dense()
         if chg_sigma or chg_rs or chg_bs or chg_bd or chg_gamma or chg_alpha: refresh_K_dense()
+        if chg_bs or chg_bd or chg_rs or chg_alpha: refresh_bump_cloud()
         if chg_bs or chg_bd: update_bump_plot(bump_scale, bump_decay)
         # PSD diagnostic panel refreshes whenever kernel hyperparams change.
         # The matern_kernel object on ctx is rebuilt by the surrounding code
@@ -1286,6 +1458,7 @@ def main():
     g_dense_layer.events.visible.connect(lambda e: refresh_G_dense() if g_dense_layer.visible else None)
     d_dense_layer.events.visible.connect(lambda e: refresh_D_dense() if d_dense_layer.visible else None)
     k_dense_layer.events.visible.connect(lambda e: refresh_K_dense() if k_dense_layer.visible else None)
+    bump_cloud_layer.events.visible.connect(lambda e: refresh_bump_cloud() if bump_cloud_layer.visible else None)
 
     def force_refresh_on_dim_switch(event):
         # B1 and H are static-input but their colormap alpha curve depends
@@ -1303,6 +1476,7 @@ def main():
         if g_dense_layer.visible: refresh_G_dense()
         if d_dense_layer.visible: refresh_D_dense()
         if k_dense_layer.visible: refresh_K_dense()
+        if bump_cloud_layer.visible: refresh_bump_cloud()
         if j_layer is not None and j_layer.visible: refresh_J()
         if l_layer is not None and l_layer.visible: refresh_L()
         refresh_per_source()

@@ -37,7 +37,8 @@ import numpy as np
 from scipy.integrate import cumulative_trapezoid
 
 def make_folded_manifold(n=6000, n_turns=3.5, gap=0.25, r0=1.0, height=6.0,
-                         cycles_per_turn=1.5, thickness=0.0, seed=0):
+                         cycles_per_turn=1.5, thickness=0.0, seed=0,
+                         signal_kind="geodesic", wavelength_gaps=3.0):
     """Tight swiss roll. Smaller `gap` => tighter fold => geodesic >> euclidean
     between adjacent layers.
  
@@ -67,14 +68,40 @@ def make_folded_manifold(n=6000, n_turns=3.5, gap=0.25, r0=1.0, height=6.0,
     s = np.interp(t, tg, sg)                       # geodesic coordinate
     intrinsic = np.c_[s, h]                         # intrinsic == geodesic metric
     total_s = float(sg[-1])
-    # turn-locked signal: smooth along the geodesic, antiphase across layers
-    signal = np.sin(cycles_per_turn * t)
+
+    # ---- signal: what the target field is a function of --------------------
+    # 'geodesic'   : f(arclength t)         -> smooth ALONG the sheet  => manifold wins
+    # 'ambient_*'  : f(3D ambient position) -> smooth in space         => euclidean wins
+    # 'radial'     : f(distance from roll axis)                         => euclidean wins
+    # Pair an ambient/radial signal with the DENSE regime (thickness >= gap) for
+    # the clearest euclidean-favourable case. Note the coordinate layout:
+    # X[:,1] is HEIGHT; the spiral plane is (X[:,0], X[:,2]); the radius from the
+    # roll axis is hypot(X[:,0], X[:,2]).
+    if signal_kind == "euclidean":          # backward-compat alias
+        signal_kind = "ambient_grid"
+    px, pz = X[:, 0], X[:, 2]
+    lam = wavelength_gaps * gap             # wavelength a few gaps wide: smooth across a
+                                            # layer but oscillating across the structure
+    if signal_kind == "geodesic":
+        # turn-locked: smooth along the geodesic, antiphase across adjacent layers
+        signal = np.sin(cycles_per_turn * t)
+    elif signal_kind == "ambient_x":
+        signal = np.sin(2 * np.pi * px / lam)
+    elif signal_kind == "ambient_grid":
+        signal = np.sin(2 * np.pi * px / lam) + np.cos(2 * np.pi * pz / lam)
+    elif signal_kind == "radial":
+        signal = np.sin(2 * np.pi * np.hypot(px, pz) / lam)
+    else:
+        raise ValueError(
+            f"unknown signal_kind {signal_kind!r}; choose "
+            f"geodesic | ambient_x | ambient_grid | radial (or 'euclidean' alias)")
  
     return dict(
         X=X, intrinsic=intrinsic, s=s, signal=signal, t=t, r=r,
         total_arclength=total_s,
         params=dict(n=n, n_turns=n_turns, gap=gap, r0=r0, height=height,
-                    cycles_per_turn=cycles_per_turn, thickness=thickness, seed=seed),
+                    cycles_per_turn=cycles_per_turn, thickness=thickness, seed=seed,
+                    signal_kind=signal_kind, wavelength_gaps=wavelength_gaps),
     )
 
 

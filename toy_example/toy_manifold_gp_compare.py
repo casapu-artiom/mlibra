@@ -237,13 +237,25 @@ def _ell_of(kernel):
 
 def main():
     ap = argparse.ArgumentParser()
+    # --- folded-manifold generation (all generator params exposed) ---------
     ap.add_argument("--n", type=int, default=60000)
-    ap.add_argument("--gap", type=float, default=25.0)
+    ap.add_argument("--n-turns", type=float, default=3.5)
+    ap.add_argument("--gap", type=float, default=10.0)
+    ap.add_argument("--r0", type=float, default=1.0)
     ap.add_argument("--height", type=float, default=20.0)
-    ap.add_argument("--cycles-per-turn", type=float, default=1.5)
-    ap.add_argument("--signal", choices=["geodesic", "euclidean"], default="geodesic")
-    ap.add_argument("--thickness", type=float, default=2.0)
-    ap.add_argument("--shell-cycles", type=float, default=4.0)
+    ap.add_argument("--thickness", type=float, default=1.5,
+                    help="sheet thickness; thickness>=gap merges layers into a dense "
+                         "volume (euclidean-favourable), thickness<<gap is a thin sheet")
+    ap.add_argument("--cycles-per-turn", type=float, default=1.5,
+                    help="geodesic-signal frequency per turn; half-integer => adjacent "
+                         "layers antiphase")
+    ap.add_argument("--signal",
+                    choices=["geodesic", "ambient_x", "ambient_grid", "radial", "euclidean"],
+                    default="ambient_x",
+                    help="geodesic=f(arclength) -> manifold wins; ambient_*/radial="
+                         "f(3D position) -> euclidean wins; 'euclidean' aliases ambient_grid")
+    ap.add_argument("--wavelength-gaps", type=float, default=3.0,
+                    help="ambient-signal wavelength in units of --gap (a few works best)")
     ap.add_argument("--knn-k", type=int, default=15)
     ap.add_argument("--num-modes", type=int, default=300)
     ap.add_argument("--nu", type=int, default=2)
@@ -259,6 +271,9 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--dump-predictions", default=None,
                     help="path to save an .npz of full-field predictions for napari")
+    ap.add_argument("--dump-eig-modes", type=int, default=96,
+                    help="# manifold eigenmodes stored in the dump for napari "
+                         "kernel/eigenvector layers (bounds file size)")
     ap.add_argument("--variational", action="store_true",
                     help="use a sparse variational GP (inducing points) instead of "
                          "exact GP -- mirrors the real LatentRiemannGP setup")
@@ -273,9 +288,10 @@ def main():
         print(f"WARNING: --num-modes={args.num_modes} is very small. The manifold "
               f"kernel is EXACTLY rank num_modes; use ~250-300 unless studying rank.")
 
-    data = gen_manifold(signal=args.signal, n=args.n, gap=args.gap, height=args.height,
+    data = gen_manifold(signal=args.signal, n=args.n, n_turns=args.n_turns,
+                        gap=args.gap, r0=args.r0, height=args.height,
                         cycles_per_turn=args.cycles_per_turn,
-                        shell_cycles=args.shell_cycles,
+                        wavelength_gaps=args.wavelength_gaps,
                         thickness=args.thickness, seed=args.seed)
     X, intr, y = data["X"], data["intrinsic"], data["signal"]
     labels = layer_labels(data)
@@ -361,15 +377,32 @@ def main():
 
     if args.dump_predictions:
         names = list(pred_full.keys())
+        ne = min(args.dump_eig_modes, args.num_modes)
+
+        def eig_pack(kernel):
+            ev = kernel.eigvec.detach().cpu().numpy()[:, :ne].astype(np.float32)
+            ea = kernel.eigval.detach().cpu().numpy()[:ne].astype(np.float32)
+            return ev, ea, float(_ell_of(kernel))
+        ev_p, ea_p, ell_p = eig_pack(k_plain)
+        ev_a, ea_a, ell_a = eig_pack(k_atlas)
+
         np.savez(
             args.dump_predictions,
             X=X.astype(np.float32), y_true=y.astype(np.float32),
+            intrinsic=intr.astype(np.float32), t=data["t"].astype(np.float32),
+            labels=labels.astype(np.int64),
             train_idx=tr.astype(np.int64), test_idx=te.astype(np.int64),
             names=np.array(names),
             preds=np.stack([pred_full[n] for n in names]).astype(np.float32),
             signal_kind=np.array(args.signal),
+            # real manifold eigenbases (top ne modes) for kernel / eigenvector layers
+            eig_names=np.array(["plain", "atlas"]),
+            eig_vec=np.stack([ev_p, ev_a]),          # (2, N, ne)
+            eig_val=np.stack([ea_p, ea_a]),          # (2, ne)
+            eig_ell=np.array([ell_p, ell_a], np.float32),
+            eig_nu=np.array(args.nu),
         )
-        print(f"\nsaved full-field predictions -> {args.dump_predictions}\n"
+        print(f"\nsaved full-field predictions + eigenbases -> {args.dump_predictions}\n"
               f"  render with: python toy_manifold_pred_napari.py {args.dump_predictions}")
 
 

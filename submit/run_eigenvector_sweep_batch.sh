@@ -40,32 +40,34 @@ IMAGE=${IMAGE:-artiomartiom/sdsc:maldi_manifold_latest}
 # -------------------------------------------------------------------------
 # Paths (S3 mounts on the cluster)
 # -------------------------------------------------------------------------
-S3_EIGENVECTOR_DIR="${S3_EIGENVECTOR_DIR:-/s3/mlibra/mlibra-data/eigenvectors}"
+S3_EIGENVECTOR_DIR="${S3_EIGENVECTOR_DIR:-/s3/mlibra/mlibra-data/artiom/eigenvectors}"
 S3_OUTPUT_DIR="${S3_OUTPUT_DIR:-/s3/mlibra/mlibra-data/artiom/psd_sweep}"
 S3_TEMPLATE_NAME="${S3_TEMPLATE_NAME:-reference}"
 S3_REFERENCE_FILE="${S3_REFERENCE_FILE:-/s3/mlibra/mlibra-data/reference_image.npy}"
 S3_ANNOTATION_FILE="${S3_ANNOTATION_FILE:-/s3/mlibra/mlibra-data/level_15annot.npy}"
+S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
+S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
 SRC_PATH="${SRC_PATH:-/myhome/mlibra}"
 
 # -------------------------------------------------------------------------
 # Sweep grid. Override any list from the env (space-separated).
 #   KNN_METHODS="faiss anatomical_atlas" ./run_eigenvector_sweep_batch.sh
 # -------------------------------------------------------------------------
-KNN_METHODS=${KNN_METHODS:-"faiss anatomical_atlas faiss_atlas_weighted"}
-NORMS=${NORMS:-"symmetric randomwalk"}
-THRESHOLDS=${THRESHOLDS:-"5 20 40 150"}
-KNN_KS=${KNN_KS:-"15 60 120 180"}
-BANDWIDTHS=${BANDWIDTHS:-"0.05 0.1 0.5 1.0"}
+KNN_METHODS=${KNN_METHODS:-"faiss faiss_atlas_weighted"}
+NORMS=${NORMS:-"randomwalk"}
+THRESHOLDS=${THRESHOLDS:-"5 40 150"}
+KNN_KS=${KNN_KS:-"15 180"}
+BANDWIDTHS=${BANDWIDTHS:-"0.1"}
 # Inflation only applies to faiss_atlas_weighted; iterated only for it below.
-INFLATIONS=${INFLATIONS:-"1 5 10 100"}
+INFLATIONS=${INFLATIONS:-"10 50 100"}
 # Non-swept defaults (set in env to override globally for this batch)
-NUM_MODES=${NUM_MODES:-1300}
+NUM_MODES=${NUM_MODES:-6000}
 NU=${NU:-2}
 LENGTHSCALE=${LENGTHSCALE:-1.0}
-BUMP_SCALE=${BUMP_SCALE:-3.0}
-BUMP_DECAY=${BUMP_DECAY:-0.05}
-N_TEST_ON=${N_TEST_ON:-200}
-N_TEST_OFF=${N_TEST_OFF:-200}
+BUMP_SCALE=${BUMP_SCALE:-1.0}
+BUMP_DECAY=${BUMP_DECAY:-0.01}
+N_TEST_ON=${N_TEST_ON:-500}
+N_TEST_OFF=${N_TEST_OFF:-500}
 TEST_SEED=${TEST_SEED:-42}
 
 EXP_SUFFIX="${EXP_SUFFIX:-$(date +'%y%m%d-%H%M')}"
@@ -111,6 +113,9 @@ submit_one() {
         -e TEMPLATE_NAME="$S3_TEMPLATE_NAME" \
         -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
         -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
+        -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
+        -e SLICES_DATASET_FILE="$S3_SLICES_DATASET_FILE" \
+        -e LIPIDS_FILE="$SRC_PATH/maldi/data/lipid_subset.txt" \
         -e SRC_PATH="$SRC_PATH" \
         -e OUT_CSV="$out_csv" \
         -e KNN_METHOD="$method" \
@@ -127,7 +132,7 @@ submit_one() {
         -e N_TEST_ON="$N_TEST_ON" \
         -e N_TEST_OFF="$N_TEST_OFF" \
         -e TEST_SEED="$TEST_SEED" \
-        -- ./maldi/run_laplacian_test.sh
+        -- ./maldi/laplacian_test.sh
 }
 
 # -------------------------------------------------------------------------

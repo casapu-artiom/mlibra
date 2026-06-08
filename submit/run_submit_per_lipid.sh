@@ -60,8 +60,8 @@ LIPIDS_FILE="/myhome/mlibra/maldi/data/lipid_subset.txt"
 
 # ---- S3-mounted paths inside the container --------------------------------
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_batch_2"
+S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_batch_4"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"

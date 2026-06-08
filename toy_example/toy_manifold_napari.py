@@ -110,11 +110,21 @@ def colormap_rgba(vals, cmap="viridis", vmin=None, vmax=None):
     return cmap_obj(v)
 
 
-def _no_border(layer):
-    """Remove point outlines across napari versions (border_* new, edge_* old)."""
+def _no_border(layer, blending=None):
+    """Remove point outlines across napari versions (border_* new, edge_* old),
+    kill antialiasing and (optionally) set blending so a dense cloud stays crisp."""
     for attr in ("border_width", "edge_width"):
         try:
             setattr(layer, attr, 0.0)
+        except Exception:
+            pass
+    try:
+        layer.antialiasing = 0.0
+    except Exception:
+        pass
+    if blending is not None:
+        try:
+            layer.blending = blending
         except Exception:
             pass
 
@@ -147,7 +157,13 @@ def main():
                          "(eigvals in [0,2]); ~16 gives a smooth geodesic-tracking "
                          "kernel, ~1 gives a near-delta kernel")
     ap.add_argument("--euc-lengthscale", type=float, default=1.0)
-    ap.add_argument("--point-size", type=float, default=0.08)
+    ap.add_argument("--point-size", type=float, default=0.0,
+                    help="point diameter in DATA units; 0 => auto (~1.3x median NN "
+                         "spacing). Fixed small sizes look gray when zoomed out on "
+                         "large-extent geometries (big --gap/--height).")
+    ap.add_argument("--blending", default="opaque",
+                    choices=["opaque", "translucent", "additive"],
+                    help="opaque keeps a dense cloud from blending to gray")
     args = ap.parse_args()
 
     import napari
@@ -166,6 +182,12 @@ def main():
     X, intr, sig = data["X"], data["intrinsic"], data["signal"]
     # napari expects (z, y, x)-ish; we just feed the 3 columns as-is.
     pts = X[:, [1, 0, 2]]  # put height first for a nicer default camera; cosmetic
+
+    if args.point_size <= 0:
+        from sklearn.neighbors import NearestNeighbors
+        _dd, _ = NearestNeighbors(n_neighbors=2).fit(X).kneighbors(X)
+        args.point_size = 1.3 * float(np.median(_dd[:, 1]))
+        print(f"point size = {args.point_size:.4g} data units (auto; override --point-size)")
 
     # graph is built on EUCLIDEAN coords (what you have on real data); the atlas
     # prior (cross-layer inflation) is what makes the kernel respect the fold.
@@ -214,7 +236,7 @@ def main():
 
     data_layers = [lay_sig, lay_mk, lay_ek, lay_ed, lay_gd, lay_src]
     for l in data_layers:
-        _no_border(l)                                  # clean filled dots, no gray rings
+        _no_border(l, blending=args.blending)          # clean filled dots, no gray rings
 
     def refresh():
         i = state["src"]
@@ -224,7 +246,7 @@ def main():
         lay_gd.face_color = colormap_rgba(geodesic_from(intr, i), "magma")
         lay_src.data = pts[i][None]
         for l in (lay_mk, lay_ek, lay_ed, lay_gd, lay_src):
-            _no_border(l); l.refresh()
+            _no_border(l, blending=args.blending); l.refresh()
 
     def make_click(layer):
         def _on_click(layer, event):

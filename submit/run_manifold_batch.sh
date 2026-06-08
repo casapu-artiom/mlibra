@@ -74,7 +74,7 @@ submit() {
         -e NUM_INDUCING_POINTS=1000 \
         -e NUM_MODES=6000 \
         -e THRESHOLD="$threshold" \
-        -e STRIDE=4 \
+        -e STRIDE=8 \
         -e CROSS_REGION_INFLATION="$infl" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
@@ -93,17 +93,17 @@ submit() {
 # BUMP_DECAYS=(0.1 1.0)
 
 FOLDS=("fold-3")           # lowercase, dashed
-KNN_K=(15 120)
+KNN_K=(15 120 180)
 MAN_KNN_METHODS=("faiss" "faiss_atlas_weighted")
 MAN_INFLATIONS=(10)   # only used when knn_method=faiss_atlas_weighted
-LAPLACIAN_NORMS=("randomwalk")
+LAPLACIAN_NORMS=("symmetric" "randomwalk")
 GRAPH_BANDWIDTHS=(0.1)
-BUMP_SCALES=(0.25)
+BUMP_SCALES=(1.0)
 BUMP_DECAYS=(0.01)
 # BUMP_SCALES=(1 20 80)
-# BUMP_DECAYS=(0.1 1.0)
+# BUMP_DECAYS=(0.1 1.0
 NU=(2)
-THRESHOLDS=(5 40 150 250)
+THRESHOLDS=(5 40 150)
 
 # Fixed across the whole sweep
 TEMPLATE="reference"

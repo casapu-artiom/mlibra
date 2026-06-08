@@ -34,7 +34,7 @@ set -eu
 : "${KNN_K:=120}"
 : "${GRAPHBANDWIDTH:=0.1}"
 : "${CROSS_REGION_INFLATION:=10.0}"
-: "${NUM_MODES:=10000}"
+: "${NUM_MODES:=6000}"
 : "${STRIDE:=8}"
 : "${N_LIST:=1}"
 : "${NU:=2}"
