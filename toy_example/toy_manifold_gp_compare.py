@@ -238,11 +238,11 @@ def _ell_of(kernel):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=60000)
-    ap.add_argument("--gap", type=float, default=4.0)
+    ap.add_argument("--gap", type=float, default=25.0)
     ap.add_argument("--height", type=float, default=20.0)
     ap.add_argument("--cycles-per-turn", type=float, default=1.5)
     ap.add_argument("--signal", choices=["geodesic", "euclidean"], default="geodesic")
-    ap.add_argument("--thickness", type=float, default=1.0)
+    ap.add_argument("--thickness", type=float, default=2.0)
     ap.add_argument("--shell-cycles", type=float, default=4.0)
     ap.add_argument("--knn-k", type=int, default=15)
     ap.add_argument("--num-modes", type=int, default=300)
