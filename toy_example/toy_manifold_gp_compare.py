@@ -5,24 +5,12 @@ toy_manifold_gp_compare.py
 ==========================
 
 Predict the toy-manifold signal with a Euclidean GP and a manifold GP and compare
-held-out RMSE + correlation. The manifold path uses the real manifold_gp stack:
+held-out RMSE + correlation. The manifold path uses the real manifold_gp stack
+(NearestNeighbors -> inflate_cross_region_edges -> GraphLaplacianOperator ->
+LaplacianEigensolver -> RiemannMaternKernel), wrapped in either an exact GP or a
+sparse variational GP (--variational, mirroring LatentRiemannGP).
 
-    manifold_gp.utils.nearest_neighbors.NearestNeighbors        (faiss kNN graph)
-    manifold_gp.utils.anatomical_knn.inflate_cross_region_edges (atlas prior)
-    manifold_gp.operators.graph_laplacian_operator.GraphLaplacianOperator
-    manifold_gp.utils.compute_eigenvectors.LaplacianEigensolver
-    manifold_gp.kernels.riemann_matern_kernel.RiemannMaternKernel
-
-wired as in lgp_manifold_experiment.py, wrapped in a single-output gpytorch
-ExactGP (we only need the kernel for this comparison, not LatentRiemannGP /
-ManifoldLGP).
-
-The toy analog of an atlas region is the ROLL LAYER (turn index). The
-"faiss_atlas_weighted" run inflates cross-layer edges via inflate_cross_region_edges,
-which is what lets the manifold kernel beat Euclidean on the folded sheet.
-
-This script REQUIRES manifold_gp (and its deps: cupy on GPU / faiss / torch_sparse).
-It is meant to run on the GPU box, not the CPU sandbox.
+Requires manifold_gp (cupy/faiss/torch_sparse): runs on the GPU box, not the CPU sandbox.
 
 Compared runs:
   euclidean (3D Matern)                  gpytorch Matern on raw coords
@@ -31,9 +19,9 @@ Compared runs:
   geodesic ORACLE (intrinsic Matern)     Matern on true (s,h) -- the ceiling
 
 Usage:
-  python toy_manifold_gp_compare.py --signal geodesic --inflation 50 \
-      --dump-predictions preds_geodesic.npz
-  python toy_manifold_pred_napari.py preds_geodesic.npz      # render predictions
+  python toy_manifold_gp_compare.py --num-modes 250 --inflation 50
+  python toy_manifold_gp_compare.py --num-modes 250 --inflation 50 --variational --num-inducing 200
+  python toy_manifold_gp_compare.py ... --dump-predictions preds.npz
 """
 from __future__ import annotations
 import argparse
@@ -45,6 +33,14 @@ import gpytorch
 from scipy.stats import pearsonr, spearmanr
 
 from toy_manifold import make_folded_manifold
+
+from manifold_gp.utils.nearest_neighbors import NearestNeighbors
+from manifold_gp.utils.anatomical_knn import inflate_cross_region_edges
+from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
+from manifold_gp.utils.compute_eigenvectors import LaplacianEigensolver
+from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
+
+torch.set_default_dtype(torch.float32)            # matches the manifold_gp pipeline
 
 
 def gen_manifold(signal="geodesic", **kw):
@@ -60,14 +56,6 @@ def gen_manifold(signal="geodesic", **kw):
                          "--signal euclidean.")
     return make_folded_manifold(**{k: v for k, v in kw.items() if k in params})
 
-from manifold_gp.utils.nearest_neighbors import NearestNeighbors
-from manifold_gp.utils.anatomical_knn import inflate_cross_region_edges
-from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
-from manifold_gp.utils.compute_eigenvectors import LaplacianEigensolver
-from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
-
-torch.set_default_dtype(torch.float32)            # matches the manifold_gp pipeline
-
 
 def layer_labels(data):
     """Toy 'atlas region' = roll layer (turn index)."""
@@ -75,8 +63,7 @@ def layer_labels(data):
 
 
 # =============================================================================
-# Build a RiemannMaternKernel from coords (+ optional atlas-style cross-layer
-# inflation), exactly as the brain pipeline does.
+# Build a RiemannMaternKernel from coords (+ optional atlas cross-layer inflation)
 # =============================================================================
 def build_riemann_kernel(coords_np, labels, inflation, k, n_modes, nu,
                          lap_norm, graphbandwidth, device):
@@ -124,24 +111,25 @@ def build_riemann_kernel(coords_np, labels, inflation, k, n_modes, nu,
             p.requires_grad_(False)
 
     # --- diagnostics for the OOS-misrouting failure mode -------------------
-    # (1) Are our nodes actually detected as on-graph? features() uses
-    #     faiss_sqdist < 1e-8, but float32 faiss self-distances are ~1e-6, so
-    #     nodes can be misrouted to the OOS Nystrom path.
+    # features() routes a query on-graph only if faiss_sqdist < 1e-8; float32 faiss
+    # self-distances are ~1e-6, so nodes can be misrouted to the OOS path, whose
+    # (1 - bw^2*lambda)^2 denominator blows up as bw^2*lambda_max -> 1.
     with torch.no_grad():
         self_d, _ = knn.search(coords, 1)
         self_d0 = self_d[:, 0]
         frac_on = float((self_d0 < 1e-8).double().mean())
-    # (2) The OOS path divides by (1 - bw^2*lambda)^2; if bw^2*lambda_max -> 1 it blows up.
     bw2lam_max = float((bw ** 2) * eigval.max())
     print(f"  [diag] node self-dist^2: max={float(self_d0.max()):.2e} "
-          f"median={float(self_d0.median()):.2e}  frac<1e-8 (on-graph)={frac_on:.1%}"
+          f"median={float(self_d0.median()):.2e}  frac<1e-8(on-graph)={frac_on:.1%}"
           + ("  <-- nodes MISROUTED to OOS path!" if frac_on < 0.999 else ""))
     print(f"  [diag] bw={bw:.4g}  bw^2*lambda_max={bw2lam_max:.3g}"
-          + ("  <-- OOS denom (1-bw^2 lam)^2 near-singular; predictions can explode"
+          + ("  <-- OOS denom near-singular; predictions can explode"
              if bw2lam_max > 0.8 else ""))
     return kernel, coords
 
 
+# =============================================================================
+# Exact GP
 # =============================================================================
 class ExactGP(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, base_kernel):
@@ -158,14 +146,11 @@ def fit_gp(base_kernel, train_x, train_y, iters=80, lr=0.01, noise=1e-2):
     dev = train_x.device
     lik = gpytorch.likelihoods.GaussianLikelihood().to(dev)
     lik.noise = noise
-    # ExactGP adds a ConstantMean + ScaleKernel whose params default to CPU; move
-    # the whole assembled model to the data's device so mean/covar/targets agree.
     model = ExactGP(train_x, train_y, lik, base_kernel).to(dev)
     model.train(); lik.train()
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(lik, model)
-    # The manifold kernel is exactly low-rank (rank = num_modes); CG conditions
-    # poorly on it. At toy scale force exact Cholesky (set high enough to cover N).
+    # manifold kernel is exactly low-rank; CG conditions poorly -> force Cholesky.
     with gpytorch.settings.max_cholesky_size(1_000_000):
         for _ in range(iters):
             opt.zero_grad()
@@ -181,6 +166,47 @@ def predict_gp(model, lik, x):
         return lik(model(x)).mean
 
 
+# =============================================================================
+# Sparse variational GP (mirrors LatentRiemannGP). For the manifold kernel the
+# inducing points must be GRAPH NODES and NOT learned, or they drift off-graph
+# into the unstable OOS path; and num_inducing <= num_modes or Kuu is singular.
+# =============================================================================
+class SVGP(gpytorch.models.ApproximateGP):
+    def __init__(self, inducing_points, base_kernel, learn_inducing):
+        vd = gpytorch.variational.CholeskyVariationalDistribution(inducing_points.size(0))
+        vs = gpytorch.variational.VariationalStrategy(
+            self, inducing_points, vd, learn_inducing_locations=learn_inducing)
+        super().__init__(vs)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
+
+    def forward(self, x):
+        return gpytorch.distributions.MultivariateNormal(
+            self.mean_module(x), self.covar_module(x))
+
+
+def fit_svgp(base_kernel, train_x, train_y, num_inducing, learn_inducing,
+             iters=80, lr=0.1, noise=1e-2):
+    dev = train_x.device
+    m = min(num_inducing, train_x.size(0))
+    sel = torch.randperm(train_x.size(0), device=dev)[:m]
+    inducing = train_x[sel].clone()                  # subset of training nodes
+    lik = gpytorch.likelihoods.GaussianLikelihood().to(dev)
+    lik.noise = noise
+    model = SVGP(inducing, base_kernel, learn_inducing).to(dev)
+    model.train(); lik.train()
+    opt = torch.optim.Adam(list(model.parameters()) + list(lik.parameters()), lr=lr)
+    mll = gpytorch.mlls.VariationalELBO(lik, model, num_data=train_y.size(0))
+    with gpytorch.settings.max_cholesky_size(1_000_000):
+        for _ in range(iters):
+            opt.zero_grad()
+            loss = -mll(model(train_x), train_y)
+            loss.backward(); opt.step()
+    model.eval(); lik.eval()
+    return model, lik
+
+
+# =============================================================================
 def metrics(pred, true):
     p = pred.detach().cpu().numpy(); t = true.detach().cpu().numpy()
     rmse = float(np.sqrt(np.mean((p - t) ** 2)))
@@ -190,12 +216,12 @@ def metrics(pred, true):
 
 
 def suggest_lengthscale(eigval, eigvec, y_centered, nu, q=0.9):
-    """Spectral-matching lengthscale: put the prior's corner lam* = 2nu/ell^2 at the
-    eigenvalue where the signal reaches q of its spectral energy. This is the
-    PRINCIPLED init -- gpytorch's default ell is on the wrong scale for a Laplacian
-    whose eigenvalues run to ~1/bw^2, which over-smooths the prior to the mean."""
-    c = eigvec.t() @ y_centered                 # (M,) signal coeffs in eigenbasis
-    E = (c ** 2)
+    """Spectral-matching lengthscale: put the prior corner lam*=2nu/ell^2 at the
+    eigenvalue where the signal reaches q of its spectral energy. Principled init --
+    gpytorch's default ell is on the wrong scale for a Laplacian whose eigenvalues
+    run to ~1/bw^2, which over-smooths the prior to the mean."""
+    c = eigvec.t() @ y_centered
+    E = c ** 2
     cum = torch.cumsum(E, 0) / E.sum().clamp(min=1e-30)
     idx = int((cum < q).sum().clamp(max=eigval.numel() - 1))
     lam_q = float(eigval[idx].clamp(min=1e-6))
@@ -211,12 +237,12 @@ def _ell_of(kernel):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=5000)
+    ap.add_argument("--n", type=int, default=60000)
     ap.add_argument("--gap", type=float, default=4.0)
-    ap.add_argument("--cycles-per-turn", type=float, default=1.5)
     ap.add_argument("--height", type=float, default=20.0)
+    ap.add_argument("--cycles-per-turn", type=float, default=1.5)
     ap.add_argument("--signal", choices=["geodesic", "euclidean"], default="geodesic")
-    ap.add_argument("--thickness", type=float, default=1.5)
+    ap.add_argument("--thickness", type=float, default=1.0)
     ap.add_argument("--shell-cycles", type=float, default=4.0)
     ap.add_argument("--knn-k", type=int, default=15)
     ap.add_argument("--num-modes", type=int, default=300)
@@ -225,7 +251,7 @@ def main():
                     help="cross-layer edge inflation for faiss_atlas_weighted")
     ap.add_argument("--laplacian-norm", choices=["symmetric", "randomwalk"],
                     default="randomwalk")
-    ap.add_argument("--graphbandwidth", type=float, default=0,
+    ap.add_argument("--graphbandwidth", type=float, default=0.0,
                     help="0 => auto (median edge distance)")
     ap.add_argument("--train-frac", type=float, default=0.5)
     ap.add_argument("--iters", type=int, default=200)
@@ -233,15 +259,19 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--dump-predictions", default=None,
                     help="path to save an .npz of full-field predictions for napari")
+    ap.add_argument("--variational", action="store_true",
+                    help="use a sparse variational GP (inducing points) instead of "
+                         "exact GP -- mirrors the real LatentRiemannGP setup")
+    ap.add_argument("--num-inducing", type=int, default=256,
+                    help="inducing points for --variational (clamped to <= num_modes "
+                         "for the manifold kernel, else Kuu is rank-deficient)")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
     if args.num_modes < 50:
         print(f"WARNING: --num-modes={args.num_modes} is very small. The manifold "
-              f"kernel is EXACTLY rank num_modes, so it can't represent a signal that "
-              f"needs more modes; the manifold rows will look artificially bad. Use "
-              f"~250-300 unless you specifically want a rank study.")
+              f"kernel is EXACTLY rank num_modes; use ~250-300 unless studying rank.")
 
     data = gen_manifold(signal=args.signal, n=args.n, gap=args.gap, height=args.height,
                         cycles_per_turn=args.cycles_per_turn,
@@ -257,21 +287,28 @@ def main():
     perm = rng.permutation(args.n)
     ntr = int(args.train_frac * args.n)
     tr, te = perm[:ntr], perm[ntr:]
-    tr_t, te_t = torch.as_tensor(tr, device=device), torch.as_tensor(te, device=device)
+    tr_t = torch.as_tensor(tr, device=device)
+    te_t = torch.as_tensor(te, device=device)
     Xs_t = torch.as_tensor(Xs, device=device)
     Is_t = torch.as_tensor(Is, device=device)
 
+    mode = f"variational(M={args.num_inducing})" if args.variational else "exact"
     print(f"N={args.n} train={ntr} test={len(te)} modes={args.num_modes} "
           f"k={args.knn_k} nu={args.nu} signal={args.signal} inflation={args.inflation} "
           f"gap={args.gap} cycles_per_turn={args.cycles_per_turn} "
-          f"thickness={args.thickness} lap_norm={args.laplacian_norm}")
+          f"thickness={args.thickness} lap_norm={args.laplacian_norm} infer={mode}")
 
-    results = {}          # name -> (rmse, pearson, spearman)
-    pred_full = {}        # name -> full-field prediction (N,) np  (for dump)
+    results = {}
+    pred_full = {}
     yc = (yt - yt.mean())
 
-    def evaluate(name, kernel, full_inputs, train_inputs):
-        model, lik = fit_gp(kernel, train_inputs[tr_t], yt[tr_t], iters=args.iters)
+    def evaluate(name, kernel, full_inputs, train_inputs, is_manifold=False):
+        if args.variational:
+            m_ind = min(args.num_inducing, args.num_modes) if is_manifold else args.num_inducing
+            model, lik = fit_svgp(kernel, train_inputs[tr_t], yt[tr_t], m_ind,
+                                  learn_inducing=(not is_manifold), iters=args.iters)
+        else:
+            model, lik = fit_gp(kernel, train_inputs[tr_t], yt[tr_t], iters=args.iters)
         tr_rmse = float(((predict_gp(model, lik, train_inputs[tr_t]) - yt[tr_t]) ** 2)
                         .mean().sqrt())
         results[name] = metrics(predict_gp(model, lik, train_inputs[te_t]), yt[te_t])
@@ -281,13 +318,11 @@ def main():
             pred_full[name] = predict_gp(model, lik, full_inputs).detach().cpu().numpy()
 
     def init_manifold_ell(kernel, tag):
-        """Set the manifold kernel's lengthscale to the spectral-matching value
-        (a principled init in the right regime for this Laplacian's eigenvalues)."""
         ell0, lam_q = suggest_lengthscale(kernel.eigval, kernel.eigvec, yc, args.nu)
         lo, hi = float(kernel.eigval.min()), float(kernel.eigval.max())
         print(f"  [{tag}] eigval range [{lo:.4g}, {hi:.4g}]  signal lam90={lam_q:.4g}  "
               f"-> spectral-match ell*={ell0:.3g} (init)")
-        #kernel.lengthscale = ell0
+        kernel.lengthscale = ell0
         return kernel
 
     # 1. EUCLIDEAN Matern on 3D coords
@@ -298,14 +333,15 @@ def main():
     k_plain, coords = build_riemann_kernel(Xs, labels, 1.0, args.knn_k, args.num_modes,
                                            args.nu, args.laplacian_norm,
                                            args.graphbandwidth, device)
-    evaluate("manifold (plain faiss)", init_manifold_ell(k_plain, "plain"), coords, coords)
+    evaluate("manifold (plain faiss)", init_manifold_ell(k_plain, "plain"),
+             coords, coords, is_manifold=True)
 
     # 3. MANIFOLD, faiss_atlas_weighted (inflate cross-layer edges)
     k_atlas, coords = build_riemann_kernel(Xs, labels, args.inflation, args.knn_k,
                                            args.num_modes, args.nu, args.laplacian_norm,
                                            args.graphbandwidth, device)
     evaluate(f"manifold (faiss_atlas_weighted x{args.inflation:g})",
-             init_manifold_ell(k_atlas, "atlas"), coords, coords)
+             init_manifold_ell(k_atlas, "atlas"), coords, coords, is_manifold=True)
 
     # 4. GEODESIC oracle: Matern on true intrinsic coords
     evaluate("geodesic ORACLE (intrinsic Matern)",
