@@ -39,7 +39,8 @@ class NearestNeighbors():
         return self
 
     def search(self, x, k, nprobe=1):
-        self.index.nprobe = nprobe
+        if hasattr(self.index, 'nprobe'):
+            self.index.nprobe = nprobe
         
         # Faiss-CPU expects numpy arrays, while GPU can take tensors
         return self.index.search(x, k)
