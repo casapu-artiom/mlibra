@@ -1,0 +1,2 @@
+Hard: gap: 4.0, cycles: 1.5, turns: 3.5, r0 1.0, height: 20.0, thickness: 1.0
+Simple: gap: 0.25, cycles: 1.5, turns: 3.5, r0 1.0, height: 6.0, thickness: 0.0
