@@ -47,6 +47,8 @@ S3_REFERENCE_FILE="${S3_REFERENCE_FILE:-/s3/mlibra/mlibra-data/reference_image.n
 S3_ANNOTATION_FILE="${S3_ANNOTATION_FILE:-/s3/mlibra/mlibra-data/level_15annot.npy}"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
 S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
+S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
+S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 SRC_PATH="${SRC_PATH:-/myhome/mlibra}"
 
 # -------------------------------------------------------------------------
@@ -115,6 +117,8 @@ submit_one() {
         -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
         -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
         -e SLICES_DATASET_FILE="$S3_SLICES_DATASET_FILE" \
+        -e MALDI_FILE="$MALDI_FILE" \
+        -e DATA_PATH="$DATA_PATH" \
         -e LIPIDS_FILE="$SRC_PATH/maldi/data/lipid_subset.txt" \
         -e SRC_PATH="$SRC_PATH" \
         -e OUT_CSV="$out_csv" \
