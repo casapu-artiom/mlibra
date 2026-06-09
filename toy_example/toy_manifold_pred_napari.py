@@ -139,7 +139,7 @@ def main():
                     help="opaque keeps a dense cloud from blending to gray")
     ap.add_argument("--euc-lengthscale", type=float, default=0.0,
                     help="euclidean-kernel lengthscale; 0 => auto (a few kNN spacings)")
-    ap.add_argument("--n-eig", type=int, default=8, help="# eigenvector layers to add")
+    ap.add_argument("--n-eig", type=int, default=8, help="# eigenvectors to cycle through with prev/next buttons")
     ap.add_argument("--kernel", default="atlas",
                     help="which dumped eigenbasis to use for the eigvec layers")
     # fallback eigenbasis recompute (only used if the dump lacks eig_vec)
@@ -237,16 +237,21 @@ def main():
     dyn = list(mk_layers.values()) + [lay_ek, lay_ed] + ([lay_gd] if lay_gd is not None else [])
     layers += dyn + [lay_src]
 
-    # ---- static eigenvector layers (signed -> symmetric diverging cmap) ---
-    ev_show = eig[args.kernel][0] if args.kernel in eig else next(iter(eig.values()))[0]
-    n_eig = min(args.n_eig, ev_show.shape[1])
-    for q in range(n_eig):
+    # ---- single eigenvector layer (prev/next buttons cycle through eigvecs) --
+    key = args.kernel if args.kernel in eig else next(iter(eig))
+    ev_show = eig[key][0]
+    n_eig_avail = min(args.n_eig, ev_show.shape[1])
+    eig_nav = {"idx": 0}
+
+    def _eig_rgba(q):
         a = float(np.nanpercentile(np.abs(ev_show[:, q]), 99)) or 1.0
-        le = viewer.add_points(pts, name=f"eigvec {q} ({args.kernel})", size=args.point_size,
-                               visible=False,
-                               face_color=colormap_rgba(ev_show[:, q], "coolwarm", -a, a),
-                               shading="none")
-        layers.append(le)
+        return colormap_rgba(ev_show[:, q], "coolwarm", -a, a)
+
+    lay_eig = viewer.add_points(
+        pts, name=f"eigvec 0 / {n_eig_avail - 1} ({key})",
+        size=args.point_size, visible=False,
+        face_color=_eig_rgba(0), shading="none")
+    layers.append(lay_eig)
 
     for l in layers:
         _no_border(l, blending=args.blending)
@@ -276,9 +281,58 @@ def main():
             l.mouse_drag_callbacks.append(make_click(l))
 
     refresh()
-    print("Click any layer to move the kernel source. Toggle 'manifold kernel: atlas' vs "
-          "'euclidean kernel' to watch the euclidean one leak across the fold; the "
-          "'eigvec N' layers show the graph-Laplacian modes the kernel is built from.")
+
+    # ---- navigation widgets (magicgui) -------------------------------------
+    from magicgui.widgets import Container, PushButton, Label as MLabel
+
+    # eigenvector prev / next
+    eig_lbl = MLabel(value=f"0 / {n_eig_avail - 1}  [{key}]")
+    prev_e  = PushButton(text="◄ prev eigvec")
+    next_e  = PushButton(text="next eigvec ►")
+
+    def _go_eig(delta):
+        eig_nav["idx"] = (eig_nav["idx"] + delta) % n_eig_avail
+        q = eig_nav["idx"]
+        lay_eig.face_color = _eig_rgba(q)
+        lay_eig.name = f"eigvec {q} / {n_eig_avail - 1} ({key})"
+        _no_border(lay_eig, blending=args.blending)
+        lay_eig.refresh()
+        eig_lbl.value = f"{q} / {n_eig_avail - 1}  [{key}]"
+
+    prev_e.clicked.connect(lambda: _go_eig(-1))
+    next_e.clicked.connect(lambda: _go_eig(+1))
+    viewer.window.add_dock_widget(
+        Container(widgets=[prev_e, eig_lbl, next_e], layout="horizontal"),
+        name="Eigenvectors", area="left")
+
+    # source node prev / next  (~100 pre-selected random nodes)
+    _rng_src  = np.random.default_rng(42)
+    src_nodes = _rng_src.choice(len(X), size=min(100, len(X)), replace=False)
+    src_nav   = {"idx": 0}
+    state["src"] = int(src_nodes[0])
+    refresh()  # re-render with the first nav source
+
+    src_lbl = MLabel(value=f"0 / {len(src_nodes) - 1}  [node {src_nodes[0]}]")
+    prev_s  = PushButton(text="◄ prev source")
+    next_s  = PushButton(text="next source ►")
+
+    def _go_src(delta):
+        src_nav["idx"] = (src_nav["idx"] + delta) % len(src_nodes)
+        state["src"] = int(src_nodes[src_nav["idx"]])
+        refresh()
+        src_lbl.value = (f"{src_nav['idx']} / {len(src_nodes) - 1}"
+                         f"  [node {state['src']}]")
+
+    prev_s.clicked.connect(lambda: _go_src(-1))
+    next_s.clicked.connect(lambda: _go_src(+1))
+    viewer.window.add_dock_widget(
+        Container(widgets=[prev_s, src_lbl, next_s], layout="horizontal"),
+        name="Source node", area="left")
+
+    print("Use buttons (left dock) or click any layer to set the kernel source.\n"
+          "Eigvec buttons cycle through graph-Laplacian eigenmodes (◄/► Eigenvectors).\n"
+          "Source buttons step through 100 pre-selected random nodes (◄/► Source node).\n"
+          "Toggle 'manifold kernel: atlas' vs 'euclidean kernel' to see the fold effect.")
     napari.run()
 
 
