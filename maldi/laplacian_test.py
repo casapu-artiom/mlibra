@@ -1837,6 +1837,12 @@ def write_csv(path: Path, rows: list[dict]):
         "diag_maldi_match_spearman_manifold", "diag_maldi_match_spearman_euclidean",
         "diag_maldi_cross_signal_jump", "diag_maldi_intra_signal_jump",
         "diag_maldi_cross_intra_ratio",
+        # Q4 signal variogram (covariance vs distance), global + local
+        "diag_maldi_vario_man_r2", "diag_maldi_vario_man_r2_local",
+        "diag_maldi_vario_euc_r2", "diag_maldi_vario_euc_r2_local",
+        "diag_maldi_vario_man_nugget_sill", "diag_maldi_vario_man_nugget_sill_local",
+        "diag_maldi_vario_euc_nugget_sill", "diag_maldi_vario_euc_nugget_sill_local",
+        "diag_maldi_vario_n_anchors", "diag_maldi_vario_reachable_frac",
         "diag_maldi_n_lipids",
         # Q4 fold-specific (only when --run-dir is used)
         "diag_fold_name", "diag_fold_n_lipids", "diag_fold_n_test",
