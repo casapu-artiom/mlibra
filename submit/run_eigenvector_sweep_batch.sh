@@ -117,8 +117,8 @@ submit_one() {
         -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
         -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
         -e SLICES_DATASET_FILE="$S3_SLICES_DATASET_FILE" \
-        -e MALDI_FILE="$MALDI_FILE" \
-        -e DATA_PATH="$DATA_PATH" \
+        -e MALDI_FILE="$S3_MALDI_FILE" \
+        -e DATA_PATH="$S3_DATA_PATH" \
         -e LIPIDS_FILE="$SRC_PATH/maldi/data/lipid_subset.txt" \
         -e SRC_PATH="$SRC_PATH" \
         -e OUT_CSV="$out_csv" \

@@ -418,6 +418,19 @@ def main():
 
             ev_p, ea_p, ell_p = _eig_pack(k_plain)
             ev_a, ea_a, ell_a = _eig_pack(k_atlas)
+
+            # pack the kNN graph used for the Laplacian eigenbasis
+            _ei       = k_plain.edge_index.detach().cpu().numpy()  # (2, E)
+            _sq_dist  = k_plain.edge_value.detach().cpu().numpy()  # (E,) squared Euclidean dists
+            _uniq     = _ei[0] < _ei[1]                            # unique undirected pairs
+            g_i       = _ei[0][_uniq].astype(np.int32)
+            g_j       = _ei[1][_uniq].astype(np.int32)
+            g_sq_dist = _sq_dist[_uniq].astype(np.float32)
+            g_cross   = np.zeros(len(g_i), dtype=bool)
+            if data["labels"] is not None:
+                _lbl    = data["labels"].astype(np.int64)
+                g_cross = _lbl[g_i] != _lbl[g_j]
+
             names = list(pred_full.keys())
             np.savez(
                 out_path,
@@ -437,6 +450,10 @@ def main():
                 eig_val=np.stack([ea_p, ea_a]),
                 eig_ell=np.array([ell_p, ell_a], dtype=np.float32),
                 eig_nu=np.array(args.nu),
+                graph_i=g_i,
+                graph_j=g_j,
+                graph_sq_dist=g_sq_dist,
+                graph_cross=g_cross,
             )
             print(f"\n  saved predictions + eigenbases -> {out_path}"
                   f"\n  render with: python toy_box_cylinder_pred_napari.py {out_path}")

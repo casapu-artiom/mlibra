@@ -1,2 +1,15 @@
-Hard: gap: 4.0, cycles: 1.5, turns: 3.5, r0 1.0, height: 20.0, thickness: 1.0
-Simple: gap: 0.25, cycles: 1.5, turns: 3.5, r0 1.0, height: 6.0, thickness: 0.0
+Euclidean easily wins:
+    ap.add_argument("--n", type=int, default=60000)
+    ap.add_argument("--n-turns", type=float, default=3.5)
+    ap.add_argument("--gap", type=float, default=4.0)
+    ap.add_argument("--r0", type=float, default=1.0)
+    ap.add_argument("--height", type=float, default=20.0)
+    ap.add_argument("--thickness", type=float, default=10.00)
+
+Manifold easily wins: 
+    ap.add_argument("--n", type=int, default=60000)
+    ap.add_argument("--n-turns", type=float, default=3.5)
+    ap.add_argument("--gap", type=float, default=0.5)
+    ap.add_argument("--r0", type=float, default=1.0)
+    ap.add_argument("--height", type=float, default=20.0)
+    ap.add_argument("--thickness", type=float, default=0.01)

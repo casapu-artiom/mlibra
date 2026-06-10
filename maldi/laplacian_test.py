@@ -224,6 +224,7 @@ def sample_test_points(
 
 def sample_test_points_uniform_distance(
     reference_nodes: torch.Tensor,
+    knn,
     n_on: int, n_off: int,
     dist_max: float, n_bins: int,
     rng: np.random.Generator,
@@ -236,19 +237,17 @@ def sample_test_points_uniform_distance(
 
     The first `n_on_actual` rows are exact manifold nodes (distance 0). The rest
     are points `node + t * unit_direction` whose *actual* nearest-node distance
-    (measured with an exact cKDTree on reference_nodes -- identical to faiss
-    nlist=1) is binned into `n_bins` equal-width bins on (0, dist_max] and
-    subsampled to ~equal counts per bin, giving roughly uniform coverage of the
-    distance axis instead of the naturally clustered distribution. Random
+    (measured by reusing the graph's `knn` 1-NN search, exactly the same snap
+    the kernel uses) is binned into `n_bins` equal-width bins on (0, dist_max]
+    and subsampled to ~equal counts per bin, giving roughly uniform coverage of
+    the distance axis instead of the naturally clustered distribution. Random
     directions + measured distance avoids needing the manifold normal: offsets
     running along the manifold land in low bins, offsets that exit the tissue
     fill the high bins. dist_max / dist bins are in standardized z-units.
     """
-    from scipy.spatial import cKDTree
     device = reference_nodes.device
     nodes = reference_nodes.detach().cpu().numpy().astype(np.float64)
     N = nodes.shape[0]
-    kdt = cKDTree(nodes)
 
     n_on = min(n_on, N)
     on_idx = rng.choice(N, size=n_on, replace=False)
@@ -261,7 +260,9 @@ def sample_test_points_uniform_distance(
     dirs /= (np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12)
     t = rng.uniform(0.0, float(dist_max) * 1.5, size=M)
     cand = nodes[seed] + dirs * t[:, None]
-    d_cand, _ = kdt.query(cand, k=1, workers=-1)
+    cand_t = torch.tensor(cand, dtype=torch.float32, device=device).contiguous()
+    val, _ = knn.search(cand_t, 1)
+    d_cand = val.squeeze(-1).clamp(min=0).sqrt().detach().cpu().numpy().astype(np.float64)
 
     edges = np.linspace(0.0, float(dist_max), int(n_bins) + 1)
     per_bin = max(1, int(n_off) // int(n_bins))
@@ -641,6 +642,78 @@ def geodesic_distance_diagnostics(
     return out
 
 
+def _signal_variogram_metrics(dist: np.ndarray, dissim_abs: np.ndarray,
+                              n_bins: int = 24) -> dict:
+    """Empirical (semi)variogram of a signal against ONE distance metric, over
+    flat pair arrays. Pairs are split into n_bins equal-count (quantile) bins of
+    `dist`; per bin we form the semivariance gamma = 0.5*mean(dissim^2). Returns:
+      r2          fraction of squared-dissimilarity variance explained by binned
+                  distance (higher => distance organizes the signal better)
+      nugget_sill nugget/sill = gamma in the nearest bin / plateau (mean of the
+                  top-quartile bins). Low => the metric explains the near field;
+                  high => a signal jump at distance~0 the metric is blind to (a
+                  fold: distance-near but signal-far pairs pile up at small h)
+      spearman    monotonicity of |dissim| vs distance"""
+    d = np.asarray(dist, float).ravel()
+    a = np.asarray(dissim_abs, float).ravel()
+    y = a ** 2
+    if d.size < 3 * n_bins:
+        n_bins = max(3, d.size // 3)
+    edges = np.unique(np.quantile(d, np.linspace(0.0, 1.0, n_bins + 1)))
+    if edges.size < 3:
+        return dict(r2=float("nan"), nugget_sill=float("nan"), spearman=float("nan"))
+    edges[-1] = np.inf
+    pred = np.full_like(y, y.mean())
+    gammas = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        sel = (d >= lo) & (d < hi)
+        if sel.any():
+            g_k = float(y[sel].mean())
+            pred[sel] = g_k
+            gammas.append(0.5 * g_k)                         # ascending-distance order
+    ss_res = float(np.sum((y - pred) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    gammas = np.asarray(gammas, float)
+    nugget = float(gammas[0])
+    k = max(1, len(gammas) // 4)
+    sill = float(np.mean(np.sort(gammas)[-k:]))              # plateau ~ top quartile
+    return dict(
+        r2=float(1.0 - ss_res / max(ss_tot, 1e-30)),
+        nugget_sill=float(nugget / max(sill, 1e-30)),
+        spearman=float(_spearmanr(d, a).statistic),
+    )
+
+
+def _signal_variogram_compare(dists: dict, dissim_abs: np.ndarray,
+                              mask: np.ndarray, n_bins: int = 24,
+                              local_quantile: float = 0.15) -> dict:
+    """Compare candidate distance fields (name -> (A,H) array) by how cleanly the
+    signal's variogram decays along each, over the masked pairs. For each metric
+    we report the variogram over ALL pairs (global) AND over only that metric's
+    nearest `local_quantile` fraction of pairs (local). The local read matters
+    for oscillatory/antiphase signals: globally the semivariance is non-monotone
+    (so R2 is tiny for every metric), but within the near-field the signal IS
+    monotone in dissimilarity, so the fold pollution -- distance-near but
+    signal-far cross-region pairs -- shows up sharply as a high local nugget.
+    Returns name -> {r2, nugget_sill, spearman, *_local, local_cutoff}."""
+    y_all = dissim_abs[mask]
+    nan3 = dict(r2=float("nan"), nugget_sill=float("nan"), spearman=float("nan"))
+    out = {}
+    for name, dm in dists.items():
+        x_all = dm[mask]
+        g = _signal_variogram_metrics(x_all, y_all, n_bins)
+        cutoff = float(np.quantile(x_all, local_quantile))   # this metric's near-field
+        sel = x_all <= cutoff
+        loc = (_signal_variogram_metrics(x_all[sel], y_all[sel], n_bins)
+               if sel.sum() >= 3 else nan3)
+        out[name] = dict(
+            r2=g["r2"], nugget_sill=g["nugget_sill"], spearman=g["spearman"],
+            r2_local=loc["r2"], nugget_sill_local=loc["nugget_sill"],
+            spearman_local=loc["spearman"], local_cutoff=cutoff,
+        )
+    return out
+
+
 def _kernel_vs_data_core(
     Xs: np.ndarray, Y: np.ndarray,
     knn, reference_nodes: torch.Tensor,
@@ -648,6 +721,9 @@ def _kernel_vs_data_core(
     nu: float, lengthscale: float, graphbandwidth: float, bump_scale: float,
     seed: int = 0, n_pairs: int = 40000,
     plot_dir: Path | None = None, plot_tag: str = "",
+    node_labels=None, edge_index=None,
+    edge_value=None, vario_local_quantile: float = 0.15,
+    vario_anchors: int = 200, vario_max_targets: int = 4000,
 ) -> dict:
     """Shared analysis: given standardized coords Xs (N,3) and z-scored lipid
     values Y (N,K) — already in the GRAPH's coordinate space — report:
@@ -679,6 +755,25 @@ def _kernel_vs_data_core(
     s_node = np.zeros(N)
     s_node[hit] = node_sum[hit] / node_cnt[hit]
     out["diag_maldi_node_coverage"] = float(hit.mean())
+
+    if node_labels is not None and edge_index is not None:
+        nl = (node_labels.detach().cpu().numpy()
+              if torch.is_tensor(node_labels) else np.asarray(node_labels))
+        ei = (edge_index.detach().cpu().numpy()
+              if torch.is_tensor(edge_index) else np.asarray(edge_index))
+        # keep only the upper triangle to avoid double-counting
+        upper = ei[0] < ei[1]
+        ei = ei[:, upper]; nl_i, nl_j = nl[ei[0]], nl[ei[1]]
+        cross_e = nl_i != nl_j
+        valid_e = hit[ei[0]] & hit[ei[1]]
+        diff_e  = np.abs(s_node[ei[0][valid_e]] - s_node[ei[1][valid_e]])
+        cv = cross_e[valid_e]
+        if cv.sum() > 0 and (~cv).sum() > 0:
+            cj = float(diff_e[cv].mean())
+            ij = float(diff_e[~cv].mean())
+            out["diag_maldi_cross_signal_jump"] = cj
+            out["diag_maldi_intra_signal_jump"] = ij
+            out["diag_maldi_cross_intra_ratio"] = cj / (ij + 1e-10)
 
     evec_np = eigvec.detach().cpu().numpy()
     ev_np = eigval.detach().cpu().numpy()
@@ -719,6 +814,48 @@ def _kernel_vs_data_core(
         out["diag_maldi_match_spearman_euclidean"] = float(_spearmanr(Keuc, -dissim).statistic)
         if plot_dir is not None:
             _try_plot_maldi(plot_dir, plot_tag, cum, cumS, dd, dissim)
+
+    # signal variogram (covariance vs distance): does the lipid signal decay
+    # along the manifold (graph-geodesic) metric or the euclidean one? Model-free
+    # (no kernel/eigenbasis), so immune to the truncated-feature and far-pair
+    # dilution that can flip the match_spearman read. Distances are taken only
+    # between HIT nodes (where signal exists); the geodesic uses inflated edge
+    # lengths (sqrt(edge_value)) when given, else euclidean lengths from coords.
+    hit_idx = np.flatnonzero(hit)
+    if edge_index is not None and hit_idx.size >= 50:
+        ei_v = (edge_index.detach().cpu().numpy() if torch.is_tensor(edge_index)
+                else np.asarray(edge_index))
+        coords_all = reference_nodes.detach().cpu().numpy().astype(np.float64)
+        if edge_value is not None:
+            ev_v = (edge_value.detach().cpu().numpy() if torch.is_tensor(edge_value)
+                    else np.asarray(edge_value)).astype(np.float64)
+            lengths = np.sqrt(np.maximum(ev_v, 0.0))
+        else:
+            lengths = np.linalg.norm(
+                coords_all[ei_v[0]] - coords_all[ei_v[1]], axis=1)
+        rngv = np.random.default_rng(seed + 1)
+        n_anc = min(int(vario_anchors), hit_idx.size)
+        anchors_v = rngv.choice(hit_idx, size=n_anc, replace=False)
+        tgt = (rngv.choice(hit_idx, size=int(vario_max_targets), replace=False)
+               if hit_idx.size > int(vario_max_targets) else hit_idx)
+        Wlen = _sp.coo_matrix((lengths, (ei_v[0], ei_v[1])), shape=(N, N)).tocsr()
+        Dgeo = _csg.dijkstra(Wlen, directed=False, indices=anchors_v)[:, tgt]  # (A,T)
+        diff = coords_all[anchors_v][:, None, :] - coords_all[tgt][None, :, :]
+        Deuc = np.sqrt((diff ** 2).sum(-1))                                   # (A,T)
+        dissim_v = np.abs(s_node[anchors_v][:, None] - s_node[tgt][None, :])  # (A,T)
+        finite = np.isfinite(Dgeo) & (Dgeo > 0)
+        if finite.sum() >= 3 * 24:
+            vg = _signal_variogram_compare(
+                {"manifold_geodesic": Dgeo, "euclidean": Deuc}, dissim_v, finite,
+                local_quantile=vario_local_quantile)
+            for mname, key in (("manifold_geodesic", "man"), ("euclidean", "euc")):
+                v = vg[mname]
+                out[f"diag_maldi_vario_{key}_r2"] = v["r2"]
+                out[f"diag_maldi_vario_{key}_r2_local"] = v["r2_local"]
+                out[f"diag_maldi_vario_{key}_nugget_sill"] = v["nugget_sill"]
+                out[f"diag_maldi_vario_{key}_nugget_sill_local"] = v["nugget_sill_local"]
+            out["diag_maldi_vario_n_anchors"] = int(n_anc)
+            out["diag_maldi_vario_reachable_frac"] = float(finite.mean())
     return out
 
 
@@ -762,6 +899,8 @@ def maldi_data_diagnostics(
     max_rows: int = 400000, n_pairs: int = 40000, seed: int = 0,
     plot_dir: Path | None = None, plot_tag: str = "",
     coord_mean=None, coord_std=None,
+    node_labels=None, edge_index=None,
+    edge_value=None, vario_local_quantile: float = 0.15,
 ) -> dict:
     """Q4 — does the kernel match the MALDI lipid structure on a given FOLD?
 
@@ -824,6 +963,8 @@ def maldi_data_diagnostics(
         Xs, Y, knn, reference_nodes, eigval, eigvec,
         nu, lengthscale, graphbandwidth, bump_scale,
         seed=seed, n_pairs=n_pairs, plot_dir=plot_dir, plot_tag=plot_tag,
+        node_labels=node_labels, edge_index=edge_index,
+        edge_value=edge_value, vario_local_quantile=vario_local_quantile,
     )
     out["diag_maldi_n_lipids"] = int(Y.shape[1])
     return out
@@ -909,6 +1050,8 @@ def fold_data_diagnostics(
     nu: float, lengthscale: float, graphbandwidth: float, bump_scale: float,
     n_pairs: int = 40000, seed: int = 0,
     plot_dir: Path | None = None, plot_tag: str = "",
+    node_labels=None, edge_index=None,
+    edge_value=None, vario_local_quantile: float = 0.15,
 ) -> dict:
     """Q4 (run-dir / fold front-end). Loads the exact held-out test fold from a
     trained run dir, standardizes coords with that run's coord_mean/std (from
@@ -922,6 +1065,8 @@ def fold_data_diagnostics(
         Xs, fold["Y"], knn, reference_nodes, eigval, eigvec,
         nu, lengthscale, graphbandwidth, bump_scale,
         seed=seed, n_pairs=n_pairs, plot_dir=plot_dir, plot_tag=plot_tag,
+        node_labels=node_labels, edge_index=edge_index,
+        edge_value=edge_value, vario_local_quantile=vario_local_quantile,
     )
     out["diag_fold_name"] = Path(run_dir).name
     out["diag_fold_n_lipids"] = int(fold["Y"].shape[1])
@@ -1152,6 +1297,8 @@ def build_graph_and_laplacian(
         graph_key_parts["conn"]  = 3
     graph_key = make_graph_key(graph_key_parts)
 
+    node_labels = None
+
     if knn_method == "faiss":
         knn, edge_index, edge_value = graphs_cache.train_or_load(
             key=graph_key, method="faiss", coords=reference_nodes,
@@ -1205,6 +1352,7 @@ def build_graph_and_laplacian(
         "knn":             knn,
         "edge_index":      edge_index,
         "edge_value":      edge_value,
+        "node_labels":     node_labels,
         "reference_nodes": reference_nodes,
         "sub_volume":      sub_volume,
         "voxel_offset":    voxel_offset,
@@ -1295,6 +1443,10 @@ def parse_args():
                          "from this many anchor nodes. 0 = skip (it is the slow "
                          "part on large graphs). 150-300 is plenty."))
     p.add_argument("--geodesic-seed", type=int, default=0)
+    p.add_argument("--vario-local-quantile", type=float, default=0.15,
+                   help=("Q4 signal variogram: the local (near-field) variogram "
+                         "uses each metric's nearest fraction of pairs. Sharper "
+                         "manifold-vs-euclidean read for oscillatory signals."))
     p.add_argument("--run-dir", type=Path, default=None,
                    help=("Q4 (optional): a trained per-lipid run dir, if you "
                          "happen to have one — uses its exact held-out fold + "
@@ -1448,6 +1600,7 @@ def main():
             if args["test_sampling"] == "uniform_distance":
                 test_pts, n_on, _test_dist = sample_test_points_uniform_distance(
                     reference_nodes=built["reference_nodes"],
+                    knn=built["knn"],
                     n_on=args["n_test_on"], n_off=args["n_test_off"],
                     dist_max=args["test_dist_max"], n_bins=args["test_dist_bins"],
                     rng=rng,
@@ -1525,6 +1678,9 @@ def main():
                 nu=args["nu"], lengthscale=args["lengthscale"],
                 graphbandwidth=bw, bump_scale=args["bump_scale"],
                 plot_dir=args["diag_plot_dir"], plot_tag=plot_tag,
+                node_labels=built["node_labels"], edge_index=built["edge_index"],
+                edge_value=built["edge_value"],
+                vario_local_quantile=args["vario_local_quantile"],
             ))
         elif args["maldi_file"] and (args["slices_dataset_file"]
                                       or args["lipids"] or args["lipids_file"]):
@@ -1550,6 +1706,9 @@ def main():
                 max_rows=args["maldi_max_rows"],
                 plot_dir=args["diag_plot_dir"], plot_tag=plot_tag,
                 coord_mean=built["coord_mean"], coord_std=built["coord_std"],
+                node_labels=built["node_labels"], edge_index=built["edge_index"],
+                edge_value=built["edge_value"],
+                vario_local_quantile=args["vario_local_quantile"],
             ))
 
         row["status"]   = "OK"
@@ -1676,6 +1835,8 @@ def write_csv(path: Path, rows: list[dict]):
         "diag_maldi_e90_mode_frac", "diag_maldi_prior_e90_mode",
         "diag_maldi_tail_energy_beyond_modes",
         "diag_maldi_match_spearman_manifold", "diag_maldi_match_spearman_euclidean",
+        "diag_maldi_cross_signal_jump", "diag_maldi_intra_signal_jump",
+        "diag_maldi_cross_intra_ratio",
         "diag_maldi_n_lipids",
         # Q4 fold-specific (only when --run-dir is used)
         "diag_fold_name", "diag_fold_n_lipids", "diag_fold_n_test",

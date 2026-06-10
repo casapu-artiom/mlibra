@@ -298,6 +298,106 @@ def main():
 
     refresh()
 
+    # ---- graph-Laplacian layers ----------------------------------------------
+    # Reconstruct L ≈ V Λ Vᵀ from the stored eigenbasis.
+    # L @ f gives the graph curvature of any signal f (≈0 = smooth, large = rough).
+    _ev_L, _ea_L = eig[key][0], eig[key][1]   # (N, M), (M,)
+    _Vla = _ev_L * _ea_L                        # V scaled by λ
+
+    def _Lrow(i):
+        return _Vla[i] @ _ev_L.T               # L[i, :] approximate  (N,)
+
+    Ly_true = _Vla @ (_ev_L.T @ y)
+    _a_Ly   = float(np.nanpercentile(np.abs(Ly_true), 99)) or 1.0
+    lay_Ly  = viewer.add_points(
+        pts, name=f"L @ y_true ({key})", size=psize, visible=False,
+        face_color=colormap_rgba(Ly_true, "RdBu_r", -_a_Ly, _a_Ly),
+        shading="none")
+    _no_border(lay_Ly, blending=args.blending)
+    lay_Ly.mouse_drag_callbacks.append(make_click(lay_Ly))
+
+    lay_Lr = viewer.add_points(
+        pts, name="L row (src)", size=psize, visible=False, shading="none")
+    _no_border(lay_Lr, blending=args.blending)
+    lay_Lr.mouse_drag_callbacks.append(make_click(lay_Lr))
+
+    _orig_refresh = refresh
+
+    def refresh():  # noqa: F811
+        _orig_refresh()
+        lrow = _Lrow(state["src"])
+        _a   = float(np.nanpercentile(np.abs(lrow), 99)) or 1.0
+        lay_Lr.face_color = colormap_rgba(lrow, "RdBu_r", -_a, _a)
+        _no_border(lay_Lr, blending=args.blending)
+        lay_Lr.refresh()
+
+    refresh()
+
+    # ---- graph edges layers -------------------------------------------------
+    if "graph_i" in d.files:
+        g_i     = d["graph_i"].astype(np.int64)
+        g_j     = d["graph_j"].astype(np.int64)
+        g_cross = (d["graph_cross"].astype(bool)
+                   if "graph_cross" in d.files
+                   else np.zeros(len(g_i), dtype=bool))
+
+        EDGE_WITHIN = np.array([0.0, 0.8, 0.8, 0.40])
+        EDGE_CROSS  = np.array([1.0, 0.2, 0.1, 0.85])
+        e_rgba = np.where(g_cross[:, None], EDGE_CROSS, EDGE_WITHIN)
+
+        MAX_E = 20_000
+        if len(g_i) > MAX_E:
+            _rng_e = np.random.default_rng(0)
+            _sel   = _rng_e.choice(len(g_i), MAX_E, replace=False)
+            _ei_d, _ej_d, _ec_d = g_i[_sel], g_j[_sel], e_rgba[_sel]
+            print(f"  graph: {MAX_E} / {len(g_i)} edges shown (subsampled)")
+        else:
+            _ei_d, _ej_d, _ec_d = g_i, g_j, e_rgba
+
+        lay_ge_all = viewer.add_shapes(
+            [np.array([pts[_ei_d[q]], pts[_ej_d[q]]]) for q in range(len(_ei_d))],
+            shape_type='line',
+            edge_color=list(_ec_d),
+            edge_width=0.8,
+            name='graph edges (all)  teal=within  red=cross',
+            visible=False)
+
+        from collections import defaultdict
+        _nbrs_g = defaultdict(list)
+        for _a, _b, _ex in zip(g_i.tolist(), g_j.tolist(), g_cross.tolist()):
+            _nbrs_g[_a].append((_b, _ex))
+            _nbrs_g[_b].append((_a, _ex))
+
+        def _ge_segs(i):
+            ns = _nbrs_g.get(i, [])
+            return ([np.array([pts[i], pts[nb]]) for nb, _ in ns]
+                    or [np.zeros((2, 3))])
+
+        def _ge_cols(i):
+            ns = _nbrs_g.get(i, [])
+            if not ns:
+                return [[0.5, 0.5, 0.5, 0.5]]
+            return [(EDGE_CROSS.tolist() if ex else EDGE_WITHIN.tolist()) for _, ex in ns]
+
+        lay_ge_src = viewer.add_shapes(
+            _ge_segs(state["src"]),
+            shape_type='line',
+            edge_color=_ge_cols(state["src"]),
+            edge_width=2.0,
+            name='graph edges (src)',
+            visible=False)
+
+        _prev_refresh_ge = refresh
+
+        def refresh():   # noqa: F811
+            _prev_refresh_ge()
+            i = state["src"]
+            lay_ge_src.data       = _ge_segs(i)
+            lay_ge_src.edge_color = _ge_cols(i)
+            lay_ge_src.refresh()
+
+        refresh()
+
     # ---- navigation widgets (magicgui) -------------------------------------
     from magicgui.widgets import Container, PushButton, Label as MLabel
 
