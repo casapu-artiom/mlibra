@@ -48,6 +48,7 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         graphbandwidth_init: float = 1.0,
         graphbandwidth_prior: Optional[Prior] = None,
         graphbandwidth_constraint: Optional[Interval] = None,
+        learn_graphbandwidth: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -117,6 +118,14 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         # ---- Apply the initial bandwidth value (must match what was used
         #      for the eigensolve, since the eigvecs are tied to that value).
         self._set_graphbandwidth(torch.tensor(float(graphbandwidth_init)))
+
+        # ---- Freeze the bandwidth by default. The eigval/eigvec passed in are
+        #      the spectrum of the Laplacian at `graphbandwidth_init` and are
+        #      never recomputed here, so letting the optimizer move the
+        #      bandwidth would desync it from the spectrum it defines. Opt in
+        #      with learn_graphbandwidth=True only if you recompute eigenpairs.
+        if not learn_graphbandwidth:
+            self.raw_graphbandwidth.requires_grad_(False)
  
     # ----------------------------------------------------------------------
     # Bandwidth plumbing
