@@ -173,10 +173,10 @@ class MaldiExperiment:
         logging.info(f"Training data shape: {self.train_data.shape}")
 
         logging.info("normalizing training data")
-        if (self.config.exp_path / "lipid_means.pth").exists() and (self.config.exp_path / "lipid_std.pth").exists():
+        if (self.config.exp_path / "lipid_means.pth").exists() and (self.config.exp_path / "lipid_stds.pth").exists():
             logging.info("Loading column mean and std from files")
             col_means = torch.load(self.config.exp_path / "lipid_means.pth")
-            col_std = torch.load(self.config.exp_path / "lipid_std.pth")
+            col_stds = torch.load(self.config.exp_path / "lipid_stds.pth")
         else:
             logging.info("computing channels means and stds")
             col_means = self.train_data.mean(dim=0)
@@ -233,16 +233,27 @@ class MaldiExperiment:
         logging.info(f"Test data shape: {self.test_data.shape}")
 
         logging.info("normalizing test data")
-        if (self.config.exp_path / "lipid_means.pth").exists() and (self.config.exp_path / "lipid_std.pth").exists():
+        if (self.config.exp_path / "lipid_means.pth").exists() and (self.config.exp_path / "lipid_stds.pth").exists():
             logging.info("Loading column mean and std from files")
             col_means = torch.load(self.config.exp_path / "lipid_means.pth")
-            col_stds = torch.load(self.config.exp_path / "lipid_std.pth")
+            col_stds = torch.load(self.config.exp_path / "lipid_stds.pth")
         else:
             logging.info("computing channels means and stds")
             col_means = self.train_data.mean(dim=0)
             col_stds = self.train_data.std(dim=0)
             torch.save(col_means, self.config.exp_path / "lipid_means.pth")
             torch.save(col_stds, self.config.exp_path / "lipid_stds.pth")
+        assert not torch.isnan(col_means).any(), "there are nans in col_means"
+        assert not torch.isnan(col_stds).any(), "there are nans in col_stds"
+        # Use the SAME (training) stats the model was trained with, and actually
+        # apply them. Mirrors load_train_data: predict_original_scale undoes this
+        # exact z-score (* col_stds + col_means) to recover the original scale, so
+        # without it the saved test true_values are doubly-transformed garbage.
+        self.col_means = col_means
+        self.col_stds = col_stds
+        self.test_data = (self.test_data - col_means) / col_stds
+        n_nans = torch.isnan(self.test_data).sum()
+        assert not torch.isnan(self.test_data).any(), f"Test data contains NaNs after normalization: {n_nans} NaNs found after normalization"
 
     def _load_coords(self, train=True):
         """Shared loader for {train,test}_coordinates: read xccf/yccf/zccf,
