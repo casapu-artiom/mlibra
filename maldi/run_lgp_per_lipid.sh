@@ -23,11 +23,25 @@
 # ---- GP hyperparameters ----
 : "${NU:=2}"
 : "${NUM_INDUCING:=1000}"
+: "${INDUCING_SOURCE:=reference}"
 : "${LIPID_BATCH_SIZE:=10}"
 : "${EPOCHS:=10}"
 : "${LEARNING_RATE:=0.005}"
 : "${BATCH_SIZE:=2048}"
 : "${SEED:=42}"
+
+# ---- Variational family -----------------------------------------------------
+# Default is the analytic multitask SVGP (the original behaviour). Flip
+# VARIATIONAL=nngp to use the Variational Nearest-Neighbour GP (single-lipid,
+# Euclidean kernel, no O(M^3) Cholesky). The NN_* knobs below only take effect
+# when VARIATIONAL=nngp.
+#   VARIATIONAL=nngp ./run_lgp_per_lipid.sh                       # euclidean-NN VNNGP
+#   VARIATIONAL=nngp NN_METRIC=geodesic ./run_lgp_per_lipid.sh    # shortest-path NN
+: "${VARIATIONAL:=analytic}"         # analytic | nngp
+: "${NN_K:=256}"                     # (nngp) conditioning neighbours per point
+: "${NNGP_NUM_INDUCING:=0}"          # (nngp) 0 = all training voxels; else cap
+: "${NN_METRIC:=euclidean}"          # (nngp) euclidean | geodesic
+: "${GEODESIC_GRAPH_K:=16}"          # (nngp, geodesic) faiss kNN graph degree
 
 # ---- subset for fast iteration / debugging -------------------------------
 # LIMIT=N           → fit only the first N lipids (after other filtering)
@@ -45,14 +59,14 @@
 # ---- Manifold-only ----
 : "${NUM_MODES:=1300}"
 : "${STRIDE:=4}"
-: "${KNN_K:=120}"
-: "${KNN_METHOD:=anatomical_atlas}"
-: "${CROSS_REGION_INFLATION:=1.0}"
+: "${KNN_K:=15}"
+: "${KNN_METHOD:=faiss_atlas_weighted}"
+: "${CROSS_REGION_INFLATION:=10.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
-: "${BUMP_SCALE:=20.0}"
+: "${BUMP_SCALE:=1.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${GRAPHBANDWIDTH:=0.1}"
-: "${THRESHOLD:=5}"
+: "${THRESHOLD:=50}"
 
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -78,9 +92,14 @@ run_one() {
 
     local TAG
     if [ "$FAMILY" = "manifold" ]; then
-        TAG="manifold-nu${NU_}-K${NMODES_}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="manifold15-nu${NU_}-K${NMODES_}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     else
-        TAG="euclidean-${KERNEL}-nu${NU_}-ind${INDU_}-{$THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="euclidean-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+    fi
+    # VNNGP runs get their own tag suffix so they don't clobber the analytic ones.
+    if [ "$VARIATIONAL" = "nngp" ]; then
+        TAG="${TAG}-vnngp-${NN_METRIC}-nnk${NN_K}-ni${NNGP_NUM_INDUCING}"
+        [ "$NN_METRIC" = "geodesic" ] && TAG="${TAG}-gk${GEODESIC_GRAPH_K}"
     fi
     local EXP_NAME="${TAG}"
 
@@ -102,6 +121,17 @@ run_one() {
             --graphbandwidth-init $BW_ \
             --num-modes $NMODES_ \
             --threshold $THRESHOLD"
+    fi
+
+    # Variational-family args. --variational is always passed (defaults to
+    # 'analytic'); the NN_* knobs are only appended for the nngp path.
+    local vnngp_args="--variational $VARIATIONAL"
+    if [ "$VARIATIONAL" = "nngp" ]; then
+        vnngp_args="$vnngp_args \
+            --nn-k $NN_K \
+            --nngp-num-inducing $NNGP_NUM_INDUCING \
+            --nn-metric $NN_METRIC \
+            --geodesic-graph-k $GEODESIC_GRAPH_K"
     fi
 
     # Subset args from env vars. Use --limit OR --lipids OR --lipids-file
@@ -133,11 +163,13 @@ run_one() {
         --kernel "$KERNEL" \
         --nu "$NU_" \
         --num-inducing "$INDU_" \
+        --inducing-source "$INDUCING_SOURCE" \
         --lipid-batch-size "$LBS_" \
         --epochs "$EPS_" \
         --learning-rate "$LR_" \
         --batch-size "$BS_" \
         --seed "$SEED" \
+        $vnngp_args \
         $manifold_args \
         $subset_args \
         "${@:15}"
