@@ -10,8 +10,7 @@ from config import MaldiConfig
 from argparse import ArgumentParser
 from utils import (
     get_inducing_points,
-    get_bbox_inducing_points,
-    apply_region_to_config,
+    get_data_inducing_points,
 )
 import logging
 
@@ -30,6 +29,16 @@ def parse_args():
     parser.add_argument("--reference-file", dest="reference_file", type=str, required=True, help="The reference image npy.")
     parser.add_argument("--annotations-file", dest="annotations_file", type=str, help="The annotations if needed.")
     parser.add_argument("--num-inducing", dest="num_inducing", type=int, default=100, help="Number of inducing points.")
+    parser.add_argument("--inducing-source", dest="inducing_source", default="reference",
+                        choices=["reference", "data"],
+                        help="'reference' (default): k-means over the reference tissue "
+                             "image. 'data': draw inducing points from ACTUAL measured "
+                             "MALDI voxels (sparse-data aware).")
+    parser.add_argument("--inducing-method", dest="inducing_method", default="kmeans_snap",
+                        choices=["kmeans_snap", "fps", "random"],
+                        help="(--inducing-source data) how to pick on-data inducing "
+                             "points: 'kmeans_snap' (density-aware, default), 'fps' "
+                             "(farthest-point, max coverage), 'random'.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
     parser.add_argument("--latent-dim", dest="latent_dim", type=int, default=10, help="Dimensionality of the latent space.")
@@ -50,39 +59,22 @@ def parse_args():
         help="Restrict reconstruction to these lipids. Accepts indices (0 5 10) "
             "or names ('PA 36:4' 'PE 40:7'). Default: all lipids.",
     )
-
-    # ---- region restriction ----
-    parser.add_argument(
-        "--region-bbox", dest="region_bbox", type=int, nargs=6, default=None,
-        metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"),
-        help=("Optional bbox in voxel coords of the full-res 25um atlas. "
-              "If set: inducing points are placed inside the bbox via k-means, "
-              "and MALDI train/test points are filtered to the same bbox in mm. "
-              "The standardized coordinate space (coord_mean / coord_std) is "
-              "kept global, so the region maps to the same standardized space "
-              "as a whole-brain run."),
-    )
     return vars(parser.parse_args())
 
 def setup_experiment(args):
     config = MaldiConfig.from_args(args)
     logging.info("Configuration created successfully")
 
-    region_bbox = args.get("region_bbox", None)
-
-    # 1. Patch the config's MALDI parquet filters so train/test only sees
-    #    points inside the bbox. No-op when region_bbox is None.
-    apply_region_to_config(config, region_bbox)
-
-    # 2. Inducing points: bbox-restricted k-means when a bbox is set, else
-    #    the original whole-brain symmetric k-means. Both routines return
-    #    coord_mean / coord_std using the *global* normalization.
+    # Inducing points. 'data' draws from the actual measured training voxels
+    # (sparse-data aware); 'reference' is the original k-means over the tissue
+    # image. Both return coord_mean / coord_std in the global standardized space.
     logging.info("Getting inducing points")
-    if region_bbox is not None:
-        inducing_points, coord_mean, coord_std = get_bbox_inducing_points(
-            config.exp_path, config.dataset_path, config.num_inducing, region_bbox,
+    if args.get("inducing_source", "reference") == "data":
+        inducing_points, coord_mean, coord_std = get_data_inducing_points(
+            config.maldi_file, config.section_filter, config.num_inducing,
+            config.reference_file, method=args.get("inducing_method", "kmeans_snap"),
+            exp_path=config.exp_path, seed=args["seed"],
         )
-        # Keep config in sync if k-means was clamped to fewer voxels.
         config.num_inducing = inducing_points.shape[0]
     else:
         inducing_points, coord_mean, coord_std = get_inducing_points(
@@ -117,14 +109,14 @@ def setup_experiment(args):
         device=config.device,
         use_rsample=use_rsample,
     )
-    return MaldiExperiment(config, lgp_model, coord_mean, coord_std), region_bbox
+    return MaldiExperiment(config, lgp_model, coord_mean, coord_std)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     logging.info("Starting MALDI experiment (Euclidean Matern baseline)")
     args = parse_args()
     logging.info(f"Parsed arguments: {args}")
-    experiment, region_bbox = setup_experiment(args)
+    experiment = setup_experiment(args)
     experiment.run()
     if experiment.config.do_brain_reconstruction:
         if experiment.config.reconstruction_lipids_by_index:
@@ -133,9 +125,4 @@ if __name__ == "__main__":
         else:
             lipid_names = experiment.config.reconstruction_lipids
             lipid_indices = None
-        if region_bbox is not None:
-            # Skip whole-brain reconstruction in region mode -- a GP trained
-            # only on points inside the bbox will extrapolate poorly outside it.
-            experiment.region_reconstruction(region_bbox, lipid_indices=lipid_indices, lipid_names=lipid_names)
-        else:
-            experiment.whole_brain_reconstruction(lipid_indices=lipid_indices, lipid_names=lipid_names)
+        experiment.whole_brain_reconstruction(lipid_indices=lipid_indices, lipid_names=lipid_names)

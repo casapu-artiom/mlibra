@@ -65,8 +65,7 @@ from l3di.lgp import IndependentMultitaskGPModel
 from l3di.lgp_manifold import LatentRiemannGP
 from utils import (
     get_inducing_points,
-    get_bbox_inducing_points,
-    apply_region_to_config,
+    get_data_inducing_points,
     crop_or_stride_volume,
     reference_ccf_from_subvolume,
 )
@@ -125,6 +124,18 @@ def parse_args() -> dict:
                    help="Inducing points per GP (per lipid). "
                         "For the Euclidean kernel these are learned; "
                         "for the manifold kernel they are anchored.")
+    p.add_argument("--inducing-source", default="reference",
+                   choices=["reference", "data"],
+                   help="'reference' (default): k-means over the reference "
+                        "tissue image. 'data': draw inducing points from "
+                        "ACTUAL measured MALDI voxels (sparse-data aware). "
+                        "For the manifold kernel they are then snapped to "
+                        "graph nodes as usual.")
+    p.add_argument("--inducing-method", default="kmeans_snap",
+                   choices=["kmeans_snap", "fps", "random"],
+                   help="(--inducing-source data) on-data selection: "
+                        "'kmeans_snap' (default), 'fps' (max coverage), "
+                        "'random'.")
     p.add_argument("--lipid-batch-size", type=int, default=10,
                    help="Number of lipids to fit simultaneously (= "
                         "num_tasks of the multitask GP). Increase this "
@@ -142,6 +153,55 @@ def parse_args() -> dict:
     p.add_argument("--batch-size", type=int, default=4096,
                    help="Mini-batch size for variational SGD over MaLDI "
                         "points.")
+
+    # ---- variational family ----
+    p.add_argument("--variational", choices=["analytic", "nngp"],
+                   default="analytic",
+                   help=("'analytic' (default): the batched multitask "
+                         "SVGP with the analytic expected-log-likelihood "
+                         "ELBO (IndependentMultitaskGPModel / "
+                         "LatentRiemannGP). 'nngp': Variational Nearest "
+                         "Neighbor GP (Wu et al. 2022) — inducing points "
+                         "= a dense subset of the TRAINING voxels, and "
+                         "each point only couples to its --nn-k nearest "
+                         "inducing neighbours, so there is no O(M^3) "
+                         "Cholesky and M can be huge (kills the "
+                         "'inducing points too scattered' problem). "
+                         "EUCLIDEAN ONLY — the manifold spectral kernel "
+                         "does not compose with the NN factorisation. "
+                         "Fits one lipid at a time (VNNGP is O(k^3) per "
+                         "step, so this is cheap)."))
+    p.add_argument("--nn-k", type=int, default=256,
+                   help=("(--variational nngp) Number of nearest "
+                         "inducing neighbours each point conditions on. "
+                         "Typical 64-256. Larger = closer to exact, more "
+                         "compute per step (O(k^3))."))
+    p.add_argument("--nngp-num-inducing", type=int, default=0,
+                   help=("(--variational nngp) Number of training voxels "
+                         "to use as inducing points. 0 = use ALL training "
+                         "voxels (the VNNGP default; recommended). Set a "
+                         "positive number to cap via a random subsample "
+                         "if memory is tight (the mean-field q has one "
+                         "mean+var per inducing point)."))
+    p.add_argument("--nn-metric", choices=["euclidean", "geodesic"],
+                   default="euclidean",
+                   help=("(--variational nngp) Metric for choosing each "
+                         "point's VNNGP conditioning neighbours. 'euclidean' "
+                         "(default): gpytorch's built-in faiss L2 kNN. "
+                         "'geodesic': build a faiss kNN graph over the "
+                         "inducing voxels and rank neighbours by SHORTEST-"
+                         "PATH distance on it (so neighbours respect tissue "
+                         "shape — they route around gaps/ventricles instead "
+                         "of jumping across). Kernel stays Euclidean Matern "
+                         "(PSD-safe). The shortest-path kNN is precomputed "
+                         "once and cached to the output dir."))
+    p.add_argument("--geodesic-graph-k", type=int, default=16,
+                   help=("(--nn-metric geodesic) Degree of the faiss kNN "
+                         "graph whose shortest paths define the geodesic "
+                         "metric. The graph only needs to be locally "
+                         "connected (small k); multi-hop Dijkstra reaches "
+                         "the --nn-k farther neighbours. 16 is a good "
+                         "default."))
 
     # ---- Euclidean-only knob ----
     p.add_argument("--kernel", default="matern",
@@ -268,8 +328,6 @@ def parse_args() -> dict:
                          "long run that may never converge. The "
                          "counter resets on the first fully-clean "
                          "step, so a single recovery clears it."))
-    p.add_argument("--region-bbox", type=int, nargs=6, default=None,
-                   metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"))
 
     # ---- compatibility scarecrows: accepted but unused ----
     # The l3di MaldiConfig may demand these. We provide harmless defaults
@@ -402,14 +460,12 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     """Build the RiemannMaternKernel exactly as ``lgp_manifold_experiment``
     does. Returns the kernel ready to plug into LatentRiemannGP.
     """
-    region_bbox = args.get("region_bbox")
     template_volume = np.load(args["reference_file"])
     annotations_volume = (np.load(args["annotations_file"])
                           if args.get("annotations_file") else None)
 
     sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
-        template_volume, annotations_volume,
-        args["stride"], region_bbox,
+        template_volume, annotations_volume, args["stride"],
     )
     reference_ccf = reference_ccf_from_subvolume(
         sub_volume, voxel_offset, voxel_scale_mm, args["threshold"],
@@ -426,12 +482,12 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     graphs = KnnGraphCache(cache_dir=graph_cache_dir, verbose=True)
     graph_key_parts = {
         "template": args["template_name"],
-        "stride": args["stride"] if region_bbox is None else 1,
+        "stride": args["stride"],
         "thresh": args["threshold"],
         "method": args["knn_method"],
         "k": args["knn_k"],
         "nlist": args["n_list"],
-        "bbox": tuple(region_bbox) if region_bbox is not None else None,
+        "bbox": None,   # kept (always None) so existing graph/eig cache keys match
     }
     if args["knn_method"] == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
@@ -1287,6 +1343,231 @@ def predict_batched(model, log_var_n, x: torch.Tensor, n_tasks: int,
 
 
 # =============================================================================
+# Variational Nearest-Neighbour GP (VNNGP, Wu et al. 2022) — isolated path
+# -----------------------------------------------------------------------------
+# Single-output, Euclidean Matern. Inducing points = (a dense subset of) the
+# TRAINING voxels, so "closer points per test point" is built in: each query
+# conditions on its --nn-k nearest inducing neighbours. No O(M^3) Cholesky, so
+# M can be the whole training set — this is the fix for "inducing points too
+# scattered". Kept completely separate from the hardened analytic multitask
+# path; it writes the SAME on-disk layout so analysis / the viewer are agnostic.
+# =============================================================================
+class VNNGPModel(gpytorch.models.ApproximateGP):
+    """Single-task VNNGP with a Euclidean Matern kernel.
+
+    Uses gpytorch's NNVariationalStrategy + MeanFieldVariationalDistribution.
+    Inducing points are the training inputs themselves (or a large subset);
+    the variational posterior only couples each inducing point to its k
+    nearest inducing neighbours (Vecchia ordering), giving O(k^3) per-step
+    cost independent of M.
+    """
+
+    def __init__(self, inducing_points, k=256, training_batch_size=256,
+                 nu=2.5):
+        m, d = inducing_points.shape
+        self.m = m
+        self.k = k
+        variational_distribution = gpytorch.variational.MeanFieldVariationalDistribution(m)
+        variational_strategy = gpytorch.variational.NNVariationalStrategy(
+            self, inducing_points, variational_distribution,
+            k=k, training_batch_size=training_batch_size,
+        )
+        super().__init__(variational_strategy)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.MaternKernel(nu=nu, ard_num_dims=d),
+        )
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    def __call__(self, x, prior=False, **kwargs):
+        # x=None during training (NNVariationalStrategy minibatches over the
+        # inducing points internally); x=test points at prediction time.
+        if x is not None and x.dim() == 1:
+            x = x.unsqueeze(-1)
+        return self.variational_strategy(x=x, prior=prior, **kwargs)
+
+
+def train_one_lipid_vnngp(*, inducing_z, y_train_col, args, device, log, desc,
+                          geo_nn=None):
+    """Fit one VNNGP for a single lipid. ``inducing_z`` is (M, 3) z-scored
+    training coords (== the inducing set); ``y_train_col`` is (M,) z-scored
+    targets ALIGNED to ``inducing_z`` row order (required — VNNGP indexes y by
+    the inducing-point minibatch it draws). ``geo_nn``, if given, is the
+    precomputed (seq_nn, node_knn) shortest-path structure: when present the
+    Euclidean NNUtil is swapped for GraphGeodesicNNUtil so neighbours are
+    chosen by graph shortest-path distance. Returns (model, likelihood)."""
+    inducing_z = inducing_z.to(device).contiguous()
+    y = y_train_col.to(device).contiguous()
+    M = inducing_z.shape[0]
+    k = min(int(args["nn_k"]), M - 1)
+    tbs = min(int(args["batch_size"]), M)
+
+    model = VNNGPModel(inducing_z, k=k, training_batch_size=tbs,
+                       nu=float(args["nu"])).to(device)
+    if geo_nn is not None:
+        # Replace gpytorch's Euclidean Vecchia structure with the precomputed
+        # shortest-path one, then recompute the strategy's cached NN indices.
+        seq_nn, node_knn = geo_nn
+        model.variational_strategy.nn_util = GraphGeodesicNNUtil(
+            k=k, dim=inducing_z.shape[1], seq_nn=seq_nn, node_knn=node_knn,
+            inducing_coords=inducing_z, device=device,
+        )
+        model.variational_strategy._compute_nn()
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model.train(); likelihood.train()
+
+    optimizer = torch.optim.Adam(
+        [{"params": model.parameters()},
+         {"params": likelihood.parameters()}],
+        lr=float(args["learning_rate"]),
+    )
+    # num_data = M: the ELBO's KL is over all inducing points; recon is the
+    # minibatch the strategy drew. VariationalELBO rescales internally.
+    mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=M)
+
+    iters_per_epoch = max(1, M // tbs)
+    n_iters = int(args["epochs"]) * iters_per_epoch
+    log_every = max(1, n_iters // 20)
+    log.info(f"  [{desc}] VNNGP fit: M={M:,} k={k} tbs={tbs} "
+             f"iters_per_epoch={iters_per_epoch} total_iters={n_iters}")
+
+    t0 = time.time()
+    for it in range(n_iters):
+        optimizer.zero_grad()
+        output = model(x=None)
+        # The inducing-point minibatch the strategy just drew; index y by it.
+        idx = model.variational_strategy.current_training_indices
+        y_batch = y[idx].to(output.mean.device)
+        loss = -mll(output, y_batch)
+        loss.backward()
+        optimizer.step()
+        if it % log_every == 0 or it == n_iters - 1:
+            elapsed = time.time() - t0
+            rate = (it + 1) / max(elapsed, 1e-9)
+            log.info(f"  [{desc}] it {it+1:>6d}/{n_iters} "
+                     f"loss={loss.item():.4g} {rate:.1f} it/s "
+                     f"elapsed={elapsed:.0f}s")
+    model.eval(); likelihood.eval()
+    return model, likelihood
+
+
+def predict_vnngp(model, likelihood, x, chunk=20_000):
+    """Chunked predictive (mean, var of y) for a single-task VNNGP."""
+    means, vars_y = [], []
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        for s in range(0, x.shape[0], chunk):
+            e = min(s + chunk, x.shape[0])
+            pred = likelihood(model(x[s:e]))
+            means.append(pred.mean.detach().cpu())
+            vars_y.append(pred.variance.clamp(min=0).detach().cpu())
+    return torch.cat(means).numpy(), torch.cat(vars_y).numpy()
+
+
+# =============================================================================
+# Geodesic neighbour selection for VNNGP
+# -----------------------------------------------------------------------------
+# Instead of gpytorch's built-in Euclidean kNN, rank each point's conditioning
+# neighbours by SHORTEST-PATH distance on a kNN graph over the inducing voxels.
+# We precompute the Vecchia structure (each point's k nearest among PRECEDING
+# points) and a per-node geodesic kNN (for snapping out-of-sample queries), then
+# inject them via a drop-in that mimics gpytorch's NNUtil 3-method interface.
+# The kernel stays a Euclidean Matern, so the GP is PSD-safe.
+# =============================================================================
+def _faiss_knn_graph(coords_np: np.ndarray, k: int):
+    """Build a symmetric k-NN graph over coords (M,D) with faiss (exact L2).
+    Returns (edge_index (2,E) int64, edge_value (E,) float = squared L2)."""
+    import faiss
+    M, D = coords_np.shape
+    coords_np = np.ascontiguousarray(coords_np, dtype=np.float32)
+    index = faiss.IndexFlatL2(D)
+    index.add(coords_np)
+    dist, idx = index.search(coords_np, k + 1)        # +1: first hit is self
+    rows = np.repeat(np.arange(M, dtype=np.int64), k)
+    cols = idx[:, 1:].reshape(-1).astype(np.int64)
+    vals = dist[:, 1:].reshape(-1).astype(np.float64)  # squared L2
+    return np.stack([rows, cols]), vals
+
+
+def _build_geodesic_nn(M: int, edge_index: np.ndarray, edge_value: np.ndarray,
+                       k: int, log, batch: int = 256):
+    """Shortest-path kNN on the graph. Returns:
+      seq  (M-k, k) int64 — for point i in [k,M), its k geodesically-nearest
+                            among the PRECEDING points 0..i-1 (Vecchia order).
+      node (M, k)   int64 — each point's k geodesically-nearest overall (used
+                            to give snapped out-of-sample queries their
+                            neighbours).
+    Unreachable pairs (disconnected components) are treated as +inf so the
+    selection prefers reachable nodes and only falls back to far ones if it
+    must."""
+    import scipy.sparse as sp
+    import scipy.sparse.csgraph as csg
+
+    lengths = np.sqrt(np.maximum(edge_value, 0.0))
+    G = sp.csr_matrix((lengths, (edge_index[0], edge_index[1])), shape=(M, M))
+    G = G.maximum(G.T)                                  # undirected
+    seq = np.empty((M - k, k), dtype=np.int64)
+    node = np.empty((M, k), dtype=np.int64)
+    BIG = np.float64(1e12)
+    t0 = time.time()
+    for s in range(0, M, batch):
+        e = min(s + batch, M)
+        D = csg.dijkstra(G, directed=False, indices=np.arange(s, e))  # (b, M)
+        D[~np.isfinite(D)] = BIG
+        for r, i in enumerate(range(s, e)):
+            row = D[r]
+            row[i] = BIG                                # exclude self
+            sel = np.argpartition(row, k)[:k]
+            node[i] = sel[np.argsort(row[sel])]
+            if i >= k:
+                rowp = row.copy()
+                rowp[i:] = BIG                          # only j < i allowed
+                selp = np.argpartition(rowp, k)[:k]
+                seq[i - k] = selp[np.argsort(rowp[selp])]
+        if (s // batch) % 20 == 0:
+            log.info(f"    geodesic kNN: {e:,}/{M:,} nodes "
+                     f"({time.time()-t0:.0f}s)")
+    return seq, node
+
+
+class GraphGeodesicNNUtil(torch.nn.Module):
+    """Drop-in for gpytorch's NNUtil that serves PRECOMPUTED shortest-path
+    neighbours. Single-task only (inducing batch shape must be empty)."""
+
+    def __init__(self, k, dim, seq_nn, node_knn, inducing_coords, device="cpu"):
+        super().__init__()
+        self.k = int(k)
+        self.dim = int(dim)
+        self.batch_shape = torch.Size([])
+        self.train_n = int(inducing_coords.shape[0])
+        self.register_buffer("_seq", seq_nn.to(torch.long))        # (M-k, k)
+        self.register_buffer("_node", node_knn.to(torch.long))     # (M, k)
+        ind_np = inducing_coords.detach().cpu().numpy().astype(np.float32)
+        import faiss
+        self._snap = faiss.IndexFlatL2(ind_np.shape[1])
+        self._snap.add(np.ascontiguousarray(ind_np))
+        self.to(device)
+
+    def set_nn_idx(self, train_x):  # structure is precomputed; just record n
+        self.train_n = train_x.shape[-2]
+
+    def build_sequential_nn_idx(self, x):
+        # match NNUtil's (batch_numel, M-k, k) leading-dim convention
+        return self._seq.unsqueeze(0)
+
+    def find_nn_idx(self, test_x, k=None):
+        kk = self.k if k is None else int(k)
+        q = test_x.reshape(-1, self.dim).detach().cpu().numpy().astype(np.float32)
+        _, idx = self._snap.search(np.ascontiguousarray(q), 1)   # snap to nearest node
+        snapped = torch.from_numpy(idx[:, 0]).long().to(self._node.device)
+        nn = self._node[snapped][:, :kk]
+        return nn.to(test_x.device)
+
+
+# =============================================================================
 # Main pipeline
 # =============================================================================
 def main():
@@ -1345,14 +1626,12 @@ def main():
     log.info("=" * 72)
 
     # ---- config / inducing points (same as lgp_*_experiment.py) ----
-    region_bbox = args.get("region_bbox")
-    apply_region_to_config(config, region_bbox)
-
     log.info("Computing inducing points + coord normalization …")
-    if region_bbox is not None:
-        inducing_points, coord_mean, coord_std = get_bbox_inducing_points(
-            config.exp_path, config.dataset_path,
-            config.num_inducing, region_bbox,
+    if args.get("inducing_source", "reference") == "data":
+        inducing_points, coord_mean, coord_std = get_data_inducing_points(
+            config.maldi_file, config.section_filter, config.num_inducing,
+            config.reference_file, method=args.get("inducing_method", "kmeans_snap"),
+            exp_path=config.exp_path, seed=args["seed"],
         )
         config.num_inducing = inducing_points.shape[0]
     else:
@@ -1503,6 +1782,168 @@ def main():
         log.info(f"  brain grid: {brain_nodes_z.shape[0]:,} voxels")
     else:
         brain_nodes_z = manifold_ctx["reference_nodes"]
+
+    # =====================================================================
+    # VNNGP path (isolated). Euclidean only; fits one lipid at a time and
+    # writes the SAME predictions/<slug>/*.npy + metrics.csv layout, then
+    # returns before the analytic multitask loop below.
+    # =====================================================================
+    if args.get("variational") == "nngp":
+        if manifold_ctx is not None:
+            log.error(
+                "--variational nngp is EUCLIDEAN ONLY (the manifold "
+                "spectral kernel does not compose with the nearest-"
+                "neighbour factorisation). Re-run with "
+                "--kernel-family euclidean."
+            )
+            sys.exit(2)
+
+        device = args["device"]
+        predictions_root = out_root / "predictions"
+        # Inducing set = (subset of) training voxels, shared across lipids
+        # (all lipids live on the same voxels). y is indexed by the SAME
+        # rows so inducing<->target alignment holds.
+        N_tr = coords_tr_z.shape[0]
+        cap = int(args.get("nngp_num_inducing", 0) or 0)
+        if 0 < cap < N_tr:
+            g = torch.Generator().manual_seed(int(args["seed"]))
+            ind_rows = torch.randperm(N_tr, generator=g)[:cap]
+        else:
+            ind_rows = torch.arange(N_tr)
+        inducing_z = coords_tr_z[ind_rows].to(device)
+        log.info(f"VNNGP: {inducing_z.shape[0]:,} inducing voxels "
+                 f"(of {N_tr:,} training), nn_metric={args.get('nn_metric','euclidean')}, "
+                 f"k={args['nn_k']}, fitting {len(lipid_idx_to_fit)} lipids "
+                 f"one at a time.")
+
+        # ---- geodesic neighbour structure (shared across lipids; cached) ----
+        geo_nn = None
+        if args.get("nn_metric", "euclidean") == "geodesic":
+            M = inducing_z.shape[0]
+            k_geo = min(int(args["nn_k"]), M - 1)
+            gk = int(args.get("geodesic_graph_k", 16))
+            cache_f = out_root / f"geodesic_nn_M{M}_k{k_geo}_gk{gk}.npz"
+            if cache_f.exists():
+                log.info(f"VNNGP geodesic: loading cached NN structure "
+                         f"{cache_f.name}")
+                z = np.load(cache_f)
+                seq_np, node_np = z["seq"], z["node"]
+            else:
+                ind_np = inducing_z.detach().cpu().numpy().astype(np.float32)
+                log.info(f"VNNGP geodesic: faiss kNN graph (gk={gk}) over "
+                         f"{M:,} inducing voxels + shortest-path kNN "
+                         f"(k={k_geo}) …")
+                ei, ev = _faiss_knn_graph(ind_np, gk)
+                seq_np, node_np = _build_geodesic_nn(M, ei, ev, k_geo, log)
+                savez_safe(cache_f, seq=seq_np, node=node_np)
+                log.info(f"VNNGP geodesic: cached → {cache_f.name}")
+            geo_nn = (torch.from_numpy(np.ascontiguousarray(seq_np)).long(),
+                      torch.from_numpy(np.ascontiguousarray(node_np)).long())
+
+        resume_mode = args.get("resume", "auto")
+        metrics_rows = []
+        if resume_mode == "auto" and (out_root / "metrics.csv").exists():
+            try:
+                prev = pd.read_csv(out_root / "metrics.csv")
+                if "slug" in prev.columns:
+                    metrics_rows = [
+                        r for r in prev.to_dict("records")
+                        if lipid_is_complete(predictions_root, str(r["slug"]))
+                    ]
+                    log.info(f"VNNGP resume: restored {len(metrics_rows)} "
+                             f"metric row(s) from metrics.csv")
+            except Exception as ex:
+                log.warning(f"VNNGP resume: couldn't read metrics.csv: {ex}")
+
+        grand_t0 = time.time()
+        for j, g_idx in enumerate(lipid_idx_to_fit):
+            name = lipid_names_all[g_idx]
+            slug = safe_filename(name)
+            desc = f"lipid {j+1}/{len(lipid_idx_to_fit)} {name}"
+            if resume_mode == "auto" and lipid_is_complete(predictions_root, slug):
+                log.info(f"[{desc}] SKIPPED — complete on disk (resume=auto)")
+                continue
+            log.info(f"[{desc}] training VNNGP")
+
+            y_col = y_tr_z[ind_rows, j].contiguous()
+            t0 = time.time()
+            model, likelihood = train_one_lipid_vnngp(
+                inducing_z=inducing_z, y_train_col=y_col,
+                args=args, device=device, log=log, desc=desc,
+                geo_nn=geo_nn,
+            )
+            fit_sec = time.time() - t0
+
+            t0 = time.time()
+            test_mean, test_var = predict_vnngp(model, likelihood, coords_te_z)
+            brain_mean, brain_var = predict_vnngp(model, likelihood, brain_nodes_z)
+            pred_sec = time.time() - t0
+            log.info(f"  [{desc}] fit={fit_sec:.1f}s pred={pred_sec:.1f}s")
+
+            mean_t = test_mean.astype(np.float32)
+            std_t = np.sqrt(test_var).astype(np.float32)
+            true_t = y_te_z[:, j].numpy().astype(np.float32)
+            mean_b = brain_mean.astype(np.float32)
+            std_b = np.sqrt(brain_var).astype(np.float32)
+
+            cm = float(col_means[j].item())
+            cs = float(col_stds[j].item())
+            lip_dir = predictions_root / slug
+            lip_dir.mkdir(parents=True, exist_ok=True)
+            np.save(lip_dir / "test_coords_mm.npy",
+                    coords_te_mm.numpy().astype(np.float32))
+            np.save(lip_dir / "test_pred_z.npy", mean_t)
+            np.save(lip_dir / "test_pred_raw.npy", mean_t * cs + cm)
+            np.save(lip_dir / "test_std_z.npy", std_t)
+            np.save(lip_dir / "test_true_z.npy", true_t)
+            np.save(lip_dir / "graph_pred_z.npy", mean_b)
+            np.save(lip_dir / "graph_pred_raw.npy", mean_b * cs + cm)
+            np.save(lip_dir / "graph_std_z.npy", std_b)
+
+            err = true_t - mean_t
+            rmse = float(np.sqrt(np.mean(err ** 2)))
+            if np.std(mean_t) < 1e-10 or np.std(true_t) < 1e-10:
+                corr = float("nan")
+            else:
+                corr = float(np.corrcoef(true_t, mean_t)[0, 1])
+            ss_res = float(np.sum(err ** 2))
+            ss_tot = float(np.sum((true_t - true_t.mean()) ** 2)) or 1.0
+            metrics_rows.append({
+                "lipid_global_idx": int(g_idx),
+                "lipid_name": name, "slug": slug, "batch": int(j),
+                "test_rmse_z": rmse, "test_corr": corr,
+                "test_r2": 1.0 - ss_res / ss_tot,
+                "mean_pred_std_z": float(std_t.mean()),
+                "fit_sec": fit_sec,
+            })
+            pd.DataFrame(metrics_rows).to_csv(out_root / "metrics.csv", index=False)
+
+            del model, likelihood
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+        grand_t = time.time() - grand_t0
+        log.info("=" * 72)
+        log.info(f"VNNGP: all {len(lipid_idx_to_fit)} lipids done in "
+                 f"{grand_t:.1f}s")
+        if metrics_rows:
+            df = pd.DataFrame(metrics_rows)
+            with open(out_root / "summary.json", "w") as f:
+                json.dump({
+                    "n_lipids": int(len(df)),
+                    "variational": "nngp",
+                    "kernel_family": "euclidean",
+                    "nn_k": int(args["nn_k"]),
+                    "n_inducing": int(inducing_z.shape[0]),
+                    "wall_time_sec": float(grand_t),
+                    "test_corr_median": float(df["test_corr"].median(skipna=True)),
+                    "test_r2_median": float(df["test_r2"].median()),
+                }, f, indent=2)
+            log.info(f"VNNGP summary: corr median="
+                     f"{df['test_corr'].median(skipna=True):+.4f}  "
+                     f"R2 median={df['test_r2'].median():+.4f}")
+        log.info(f"Outputs in: {out_root}")
+        return
 
     # ---- batched training loop ----
     metrics_rows = []
