@@ -62,7 +62,7 @@ class LatentRiemannGP(ApproximateGP):
         variational_strategy = IndependentMultitaskVariationalStrategy(
             VariationalStrategy(
                 self, inducing_points, variational_distribution, 
-                learn_inducing_locations=True  
+                learn_inducing_locations=False
             ),
             num_tasks=num_tasks,
         )
