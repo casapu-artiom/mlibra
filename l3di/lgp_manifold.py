@@ -90,7 +90,8 @@ class LatentRiemannGP(ApproximateGP):
     of T kernels (one per task, via ``PerTaskRiemannWrapper``) for per-task
     lengthscales.
     """
-    def __init__(self, inducing_points, num_tasks, manifold_kernel):
+    def __init__(self, inducing_points, num_tasks, manifold_kernel,
+                 product_ard_matern=False, product_ard_nu=2.5):
         # Ensure inducing points are correctly batched for multi-task
         if inducing_points.dim() == 2:
             inducing_points = inducing_points.unsqueeze(0).repeat(num_tasks, 1, 1)
@@ -125,6 +126,21 @@ class LatentRiemannGP(ApproximateGP):
             base = PerTaskRiemannWrapper(manifold_kernel)
         else:
             base = BatchedRiemannWrapper(manifold_kernel)
+
+        # Optional Route-B expansion: multiply the (isotropic, geodesic) Riemann
+        # kernel by an ARD Euclidean Matern so the model regains the per-axis
+        # ambient anisotropy the Riemann kernel structurally lacks, while the
+        # geodesic factor still suppresses covariance across manifold gaps:
+        #   k(a,b) = k_geo(a,b) * k_eucl-ARD(a,b).
+        # The Matern carries per-task (batched) ARD lengthscales, so each task
+        # gets its own 3 per-axis scales.
+        if product_ard_matern:
+            euclid_ard = MaternKernel(
+                nu=product_ard_nu, ard_num_dims=3,
+                batch_shape=torch.Size([num_tasks]),
+            )
+            base = ProductKernel(base, euclid_ard)
+
         self.covar_module = ScaleKernel(base, batch_shape=torch.Size([num_tasks]))
 
     def forward(self, x):

@@ -96,6 +96,13 @@ def parse_args():
                         help="Give each latent dimension its OWN learnable lengthscale "
                              "(one RiemannMaternKernel per task, sharing the eigenpairs/graph) "
                              "instead of a single lengthscale shared across all latents.")
+    parser.add_argument("--product-ard-matern", dest="product_ard_matern", action='store_true',
+                        help="Multiply the Riemann kernel by an ARD Euclidean Matern (per-axis "
+                             "lengthscales) to regain ambient anisotropy while keeping geodesic "
+                             "routing: k = k_geo * k_eucl-ARD.")
+    parser.add_argument("--product-ard-nu", dest="product_ard_nu", type=float, default=2.5,
+                        help="Matern smoothness (nu) for the ARD Euclidean factor of "
+                             "--product-ard-matern.")
     parser.add_argument("--lengthscale-init", dest="lengthscale_init", type=float, default=None,
                         help="Initial kernel lengthscale (z-units). Default: gpytorch default (~0.69). "
                              "Smaller favours more local covariance.")
@@ -357,6 +364,8 @@ def setup_experiment(args):
         inducing_points=inducing_points,
         num_tasks=config.latent_dim,
         manifold_kernel=manifold_kernel,
+        product_ard_matern=args.get("product_ard_matern", False),
+        product_ard_nu=float(args.get("product_ard_nu", 2.5)),
     ).to(config.device)
 
     use_rsample = not args.get("no_rsample", False)

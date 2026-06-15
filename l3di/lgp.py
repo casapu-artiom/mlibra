@@ -97,17 +97,27 @@ class IndependentMultitaskGPModel(ApproximateGP):
             print("Using RBF kernel")
             self.covar_module = ScaleKernel(
                 RBFKernel(batch_shape=torch.Size([num_tasks]),
-                          ard_num_dims=3),
+                          ard_num_dims=None),
                 batch_shape=torch.Size([num_tasks])
             )
         else:
             if kernel_type == "matern":
                 print(f"Using Matern kernel with nu={self.nu}")
+                ard_num_dims = None  # None/1 → isotropic; set to 3 for per-axis ARD
+                # The constraint must match the lengthscale shape: a per-axis vector
+                # only for ARD, a scalar otherwise. A vector constraint broadcasts the
+                # lengthscale to size-3, and the non-ARD MaternCovariance path then
+                # rejects it ("cannot handle multiple lengthscales").
+                if ard_num_dims and ard_num_dims > 1:
+                    lengthscale_constraint = gpytorch.constraints.GreaterThan(
+                        torch.tensor([minimal_length_scale, 0, 0], dtype=torch.float32))
+                else:
+                    lengthscale_constraint = gpytorch.constraints.GreaterThan(minimal_length_scale)
                 self.covar_module = ScaleKernel(
                     MaternKernel(batch_shape=torch.Size([num_tasks]),
                                  nu=self.nu,
-                                 ard_num_dims=3,
-                                 lengthscale_constraint=gpytorch.constraints.GreaterThan(torch.tensor([minimal_length_scale,0,0], dtype=torch.float32))),
+                                 ard_num_dims=ard_num_dims,
+                                 lengthscale_constraint=lengthscale_constraint),
                     batch_shape=torch.Size([num_tasks])
                 )
             elif kernel_type == "symmetric":

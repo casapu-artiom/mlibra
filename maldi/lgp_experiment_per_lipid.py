@@ -153,6 +153,16 @@ def parse_args() -> dict:
                    help="(manifold kernel) give each lipid in the batch its OWN "
                         "learnable lengthscale instead of one shared across the "
                         "batch. Each task reuses the same eigenpairs/graph.")
+    p.add_argument("--product-ard-matern", dest="product_ard_matern",
+                   action="store_true",
+                   help="(manifold kernel) multiply the Riemann kernel by an ARD "
+                        "Euclidean Matern (per-axis lengthscales) so the model "
+                        "regains ambient anisotropy while keeping geodesic routing: "
+                        "k = k_geo * k_eucl-ARD.")
+    p.add_argument("--product-ard-nu", dest="product_ard_nu", type=float,
+                   default=2.5,
+                   help="Matern smoothness (nu) for the ARD Euclidean factor of "
+                        "--product-ard-matern.")
     p.add_argument("--lengthscale-init", dest="lengthscale_init", type=float,
                    default=None,
                    help="Initial kernel lengthscale (z-units). Default: gpytorch "
@@ -793,6 +803,8 @@ def train_lipid_batch(
             inducing_points=inducing_points,
             num_tasks=n_tasks,
             manifold_kernel=manifold_arg,
+            product_ard_matern=args.get("product_ard_matern", False),
+            product_ard_nu=float(args.get("product_ard_nu", 2.5)),
         ).to(device)
 
     # Optional lengthscale initialisation (manifold path).
