@@ -61,7 +61,7 @@ LIPIDS_FILE="/myhome/mlibra/maldi/data/lipid_subset.txt"
 # ---- S3-mounted paths inside the container --------------------------------
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_batch_4"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_batch_5"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -141,7 +141,7 @@ submit() {
 # permutation that the value would otherwise duplicate over.
 # =============================================================================
 
-FOLDS=("fold-3")
+FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")
 
 # ---- Euclidean sweep ------------------------------------------------------
 # Euclidean Matern only has nu as a meaningful hyperparameter — the GP
@@ -153,11 +153,11 @@ RUN_EUCLIDEAN=1   # 0 = skip the euclidean loop entirely
 # ---- Manifold sweep -------------------------------------------------------
 MAN_NU=(2)
 MAN_THRESHOLDS=(5 40)
-MAN_LAPLACIAN_NORMS=("randomwalk" "symmetric")
+MAN_LAPLACIAN_NORMS=("randomwalk")
 MAN_GRAPH_BANDWIDTHS=(0.1)
-MAN_KNN_K=(15 120)
-MAN_KNN_METHODS=("faiss" "anatomical_atlas" "faiss_atlas_weighted")
-MAN_INFLATIONS=(10 100)   # only used when knn_method=faiss_atlas_weighted
+MAN_KNN_K=(15)
+MAN_KNN_METHODS=("faiss" "faiss_atlas_weighted")
+MAN_INFLATIONS=(50)   # only used when knn_method=faiss_atlas_weighted
 RUN_MANIFOLD=1
 
 exp_num=1
