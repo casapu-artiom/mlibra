@@ -63,6 +63,9 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --slices-dataset-file $SLICES_DATASET_FILE \
     --num-inducing $NUM_INDUCING_POINTS \
     --inducing-source "$INDUCING_SOURCE" \
+    --per-task-lengthscale \
+    --lengthscale-init 1.0 \
+    --lengthscale-no-decay \
     --num-modes $NUM_MODES \
     --kernel "$KERNEL" \
     --laplacian-norm "$LAPLACIAN_NORM" \

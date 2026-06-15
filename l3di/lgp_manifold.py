@@ -18,7 +18,8 @@ from gpytorch.constraints import GreaterThan
 from torch import nn
 from tqdm import tqdm
 import wandb
-from linear_operator.operators import DiagLinearOperator
+from linear_operator.operators import (DiagLinearOperator, RootLinearOperator,
+                                        LowRankRootLinearOperator, MatmulLinearOperator)
 
 class BatchedRiemannWrapper(gpytorch.kernels.Kernel):
     def __init__(self, base_kernel):
@@ -44,9 +45,50 @@ class BatchedRiemannWrapper(gpytorch.kernels.Kernel):
             
         return res
 
+class PerTaskRiemannWrapper(gpytorch.kernels.Kernel):
+    """Like ``BatchedRiemannWrapper`` but each task has its OWN
+    ``RiemannMaternKernel`` (sharing the eigenpairs / graph tensors, with an
+    independent learnable lengthscale). Produces a batched covariance
+    ``(T, n1, n2)`` by stacking per-task feature maps from the validated
+    ``RiemannKernel.features()`` — so per-task lengthscale comes for free without
+    touching the kernel internals.
+
+    ``kernels`` is a length-T iterable of ``RiemannMaternKernel`` whose
+    ``eigval``/``eigvec``/``knn``/edges are the same tensor objects (only the
+    lengthscale parameter differs per task).
+    """
+    def __init__(self, kernels):
+        super().__init__()
+        self.kernels = nn.ModuleList(kernels)
+
+    def _features(self, x):
+        # x: (T, n, d) — same points per task is fine — or (n, d)
+        if x.dim() == 3:
+            return torch.stack([k.features(x[i]) for i, k in enumerate(self.kernels)], 0)
+        return torch.stack([k.features(x) for k in self.kernels], 0)        # (T, n, M)
+
+    def forward(self, x1, x2, diag=False, last_dim_is_batch=False, **params):
+        if last_dim_is_batch:
+            raise NotImplementedError("PerTaskRiemannWrapper: last_dim_is_batch unsupported")
+        z1 = self._features(x1)
+        z2 = z1 if torch.equal(x1, x2) else self._features(x2)
+        if diag:
+            return (z1 * z2).sum(-1)                                        # (T, n)
+        if torch.equal(x1, x2):
+            if z1.size(-1) < z1.size(-2):
+                return LowRankRootLinearOperator(z1)
+            return RootLinearOperator(z1)
+        return MatmulLinearOperator(z1, z2.transpose(-1, -2))
+
+
 class LatentRiemannGP(ApproximateGP):
     """
     Gaussian Process model for the latent space, anchored to a Riemann Manifold graph.
+
+    ``manifold_kernel`` may be a single ``RiemannMaternKernel`` (one lengthscale
+    shared across all tasks, via ``BatchedRiemannWrapper``) or a list/ModuleList
+    of T kernels (one per task, via ``PerTaskRiemannWrapper``) for per-task
+    lengthscales.
     """
     def __init__(self, inducing_points, num_tasks, manifold_kernel):
         # Ensure inducing points are correctly batched for multi-task
@@ -73,12 +115,17 @@ class LatentRiemannGP(ApproximateGP):
         #self.mean_module = ConstantMean(batch_shape=torch.Size([num_tasks]))
         self.mean_module = LinearMean(input_size=3, batch_shape=torch.Size([num_tasks]))
         
-        # Wrap the initialized RiemannMaternKernel so each latent dimension 
-        # can learn its own amplitude (outputscale)
-        self.covar_module = ScaleKernel(
-            BatchedRiemannWrapper(manifold_kernel),
-            batch_shape=torch.Size([num_tasks])
-        )
+        # Wrap the RiemannMaternKernel(s) so each task gets its own amplitude
+        # (outputscale via ScaleKernel). A list/ModuleList of kernels additionally
+        # gives each task its own lengthscale (PerTaskRiemannWrapper); a single
+        # kernel shares one lengthscale across tasks (BatchedRiemannWrapper).
+        if isinstance(manifold_kernel, (list, tuple, nn.ModuleList)):
+            assert len(manifold_kernel) == num_tasks, (
+                f"per-task kernels ({len(manifold_kernel)}) != num_tasks ({num_tasks})")
+            base = PerTaskRiemannWrapper(manifold_kernel)
+        else:
+            base = BatchedRiemannWrapper(manifold_kernel)
+        self.covar_module = ScaleKernel(base, batch_shape=torch.Size([num_tasks]))
 
     def forward(self, x):
         mean_x = self.mean_module(x)

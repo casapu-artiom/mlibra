@@ -148,6 +148,20 @@ def parse_args() -> dict:
     p.add_argument("--device", default="cuda")
     p.add_argument("--log-transform", action="store_true")
     p.add_argument("--nu", type=float, default=2.0)
+    p.add_argument("--per-task-lengthscale", dest="per_task_lengthscale",
+                   action="store_true",
+                   help="(manifold kernel) give each lipid in the batch its OWN "
+                        "learnable lengthscale instead of one shared across the "
+                        "batch. Each task reuses the same eigenpairs/graph.")
+    p.add_argument("--lengthscale-init", dest="lengthscale_init", type=float,
+                   default=None,
+                   help="Initial kernel lengthscale (z-units). Default: gpytorch "
+                        "default (~0.69). Smaller favours more local covariance.")
+    p.add_argument("--lengthscale-no-decay", dest="lengthscale_no_decay",
+                   action="store_true",
+                   help="Exclude raw_lengthscale / raw_graphbandwidth from AdamW "
+                        "weight_decay (decay otherwise nudges the lengthscale toward "
+                        "its init regardless of the data).")
     p.add_argument("--n-pixels", type=int, default=10)
     p.add_argument("--learning-rate", type=float, default=0.005)
     p.add_argument("--batch-size", type=int, default=4096,
@@ -757,21 +771,61 @@ def train_lipid_batch(
             input_dim=3,
         ).to(device)
     else:
+        if args.get("per_task_lengthscale", False):
+            # One RiemannMaternKernel per task, *sharing* the eigenpairs/graph
+            # tensors (passed by reference) but with an independent lengthscale.
+            mk = manifold_kernel
+            manifold_arg = [
+                RiemannMaternKernel(
+                    nu=mk.nu, knn=mk.knn, edge_index=mk.edge_index,
+                    edge_value=mk.edge_value, eigval=mk.eigval, eigvec=mk.eigvec,
+                    nearest_neighbors=mk.nearest_neighbors, num_modes=mk.num_modes,
+                    bump_scale=mk.bump_scale, bump_decay=mk.bump_decay,
+                    laplacian_normalization=mk.laplacian_normalization,
+                    graphbandwidth_init=float(mk.graphbandwidth),
+                ).to(device)
+                for _ in range(n_tasks)
+            ]
+            log.info(f"  per-task lengthscale: {n_tasks} kernels (shared eigenpairs)")
+        else:
+            manifold_arg = manifold_kernel
         model = LatentRiemannGP(
             inducing_points=inducing_points,
             num_tasks=n_tasks,
-            manifold_kernel=manifold_kernel,
+            manifold_kernel=manifold_arg,
         ).to(device)
+
+    # Optional lengthscale initialisation (manifold path).
+    ls_init = args.get("lengthscale_init", None)
+    if manifold_kernel is not None and ls_init is not None:
+        for m in model.modules():
+            if isinstance(m, RiemannMaternKernel):
+                m.lengthscale = torch.tensor(float(ls_init))
+        log.info(f"  lengthscale init = {ls_init}")
 
     # Per-task learnable log-variance — exactly LGP.log_var_n with p = n_tasks.
     # Initialised to zero (variance = 1) to match LGP's nn.Parameter(torch.zeros(p)).
     log_var_n = torch.nn.Parameter(torch.zeros(n_tasks, device=device))
 
     model.train()
-    optimizer = torch.optim.AdamW(
-        list(model.parameters()) + [log_var_n],
-        lr=config.learning_rate, weight_decay=1e-3,
-    )
+    if args.get("lengthscale_no_decay", False):
+        # keep raw_lengthscale / raw_graphbandwidth out of weight_decay so AdamW
+        # doesn't pull the (log-)scale toward its init independent of the data.
+        no_decay, decay = [], []
+        for pname, p_ in model.named_parameters():
+            (no_decay if ("raw_lengthscale" in pname or "raw_graphbandwidth" in pname)
+             else decay).append(p_)
+        optimizer = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": 1e-3},
+             {"params": no_decay, "weight_decay": 0.0},
+             {"params": [log_var_n], "weight_decay": 0.0}],
+            lr=config.learning_rate,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            list(model.parameters()) + [log_var_n],
+            lr=config.learning_rate, weight_decay=1e-3,
+        )
 
     bs = min(int(config.batch_size), n_train)
     # iters_per_epoch matches DataLoader(drop_last=True) — partial final

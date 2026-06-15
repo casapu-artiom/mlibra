@@ -92,6 +92,13 @@ def parse_args():
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
+    parser.add_argument("--per-task-lengthscale", dest="per_task_lengthscale", action='store_true',
+                        help="Give each latent dimension its OWN learnable lengthscale "
+                             "(one RiemannMaternKernel per task, sharing the eigenpairs/graph) "
+                             "instead of a single lengthscale shared across all latents.")
+    parser.add_argument("--lengthscale-init", dest="lengthscale_init", type=float, default=None,
+                        help="Initial kernel lengthscale (z-units). Default: gpytorch default (~0.69). "
+                             "Smaller favours more local covariance.")
     parser.add_argument("--no-rsample", dest="no_rsample", action='store_false', help="Use rsample instead of mean.")
     parser.add_argument("--do-brain-reconstruction", dest="do_brain_reconstruction", action='store_true', help="Perform whole brain prediction")
     parser.add_argument(
@@ -313,23 +320,36 @@ def setup_experiment(args):
     diffs = eigval[1:] - eigval[:-1]
     print(f"min eigval gap (should be >= 0): {diffs.min().item():.4g}")
 
-    # 6. Riemann Matern kernel, fully formed at construction.
+    # 6. Riemann Matern kernel(s), fully formed at construction.
     logging.info("Building Riemann Kernel (knn + edges + eigenpairs at construction)...")
-    manifold_kernel = RiemannMaternKernel(
-        nu=config.nu,
-        knn=knn,
-        edge_index=edge_index,
-        edge_value=edge_value,
-        eigval=eigval,
-        eigvec=eigvec,
-        nearest_neighbors=knn_k,
-        num_modes=num_modes,
-        bump_scale=bump_scale,
-        bump_decay=bump_decay,
-        laplacian_normalization=laplacian_norm,
-        graphbandwidth_init=graphbandwidth_init,
-    ).to(config.device)
-    manifold_kernel.eval()
+    def _build_kernel():
+        k = RiemannMaternKernel(
+            nu=config.nu,
+            knn=knn,
+            edge_index=edge_index,
+            edge_value=edge_value,
+            eigval=eigval,
+            eigvec=eigvec,
+            nearest_neighbors=knn_k,
+            num_modes=num_modes,
+            bump_scale=bump_scale,
+            bump_decay=bump_decay,
+            laplacian_normalization=laplacian_norm,
+            graphbandwidth_init=graphbandwidth_init,
+        ).to(config.device)
+        ls_init = args.get("lengthscale_init", None)
+        if ls_init is not None:
+            k.lengthscale = torch.tensor(float(ls_init))
+        k.eval()
+        return k
+
+    if args.get("per_task_lengthscale", False):
+        # one kernel per latent dimension, sharing eigenpairs/graph tensors but
+        # with an independent lengthscale (multi-scale latent basis).
+        manifold_kernel = [_build_kernel() for _ in range(config.latent_dim)]
+        logging.info(f"Per-task lengthscale: {config.latent_dim} kernels (shared eigenpairs)")
+    else:
+        manifold_kernel = _build_kernel()
 
     # 7. Latent Riemann GP, then end-to-end Manifold LGP.
     logging.info(f"Locking {inducing_points.shape[0]} anchor nodes on the graph...")
