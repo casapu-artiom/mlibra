@@ -21,7 +21,7 @@
 : "${KERNEL:=matern}"                   # only used for euclidean
 
 # ---- GP hyperparameters ----
-: "${NU:=2}"
+: "${NU:=2.5}"
 : "${NUM_INDUCING:=1000}"
 : "${INDUCING_SOURCE:=reference}"
 : "${LIPID_BATCH_SIZE:=10}"
@@ -57,8 +57,8 @@
 : "${LIPIDS_FILE:=/home/casap/mlibra_git/maldi/data/lipid_subset.txt}"
 
 # ---- Manifold-only ----
-: "${NUM_MODES:=1300}"
-: "${STRIDE:=4}"
+: "${NUM_MODES:=6000}"
+: "${STRIDE:=8}"
 : "${KNN_K:=15}"
 : "${KNN_METHOD:=faiss_atlas_weighted}"
 : "${CROSS_REGION_INFLATION:=10.0}"
@@ -92,9 +92,9 @@ run_one() {
 
     local TAG
     if [ "$FAMILY" = "manifold" ]; then
-        TAG="manifold15-nu${NU_}-K${NMODES_}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="manifold-product-nu${NU_}-K${NMODES_}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     else
-        TAG="euclidean-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="euclidean-no-ard-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
     # VNNGP runs get their own tag suffix so they don't clobber the analytic ones.
     if [ "$VARIATIONAL" = "nngp" ]; then
@@ -120,7 +120,9 @@ run_one() {
             --bump-decay $BDECAY_ \
             --graphbandwidth-init $BW_ \
             --num-modes $NMODES_ \
-            --threshold $THRESHOLD"
+            --threshold "$THRESHOLD" \
+            --lengthscale-init 8.0 \
+            --lengthscale-no-decay"
     fi
 
     # Variational-family args. --variational is always passed (defaults to
