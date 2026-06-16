@@ -79,6 +79,7 @@
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${TEMPLATE_NAME:=reference}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
+: "${EXP_PREFIX:=FOLD-3}"
 
 #cd $SRC_PATH
 
@@ -101,7 +102,7 @@ run_one() {
         TAG="${TAG}-vnngp-${NN_METRIC}-nnk${NN_K}-ni${NNGP_NUM_INDUCING}"
         [ "$NN_METRIC" = "geodesic" ] && TAG="${TAG}-gk${GEODESIC_GRAPH_K}"
     fi
-    local EXP_NAME="${TAG}"
+    local EXP_NAME="${EXP_PREFIX}-${TAG}"
 
     echo ""
     echo "================================================================"
