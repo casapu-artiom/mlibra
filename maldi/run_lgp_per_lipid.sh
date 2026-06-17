@@ -68,6 +68,17 @@
 : "${GRAPHBANDWIDTH:=0.1}"
 : "${THRESHOLD:=50}"
 
+# ---- Lengthscale mode (manifold kernel) ----------------------------------
+# Two modes, selected via FIXED_LENGTHSCALE:
+#   1 (default) → "fixed" mode: pass --lengthscale-init $LENGTHSCALE_INIT and
+#                 --lengthscale-no-decay so the kernel lengthscale is pinned.
+#   0           → "learned" mode: pass neither flag, letting the GP train the
+#                 lengthscale from its own default init.
+# The chosen mode is encoded in the run TAG (fixls<val> | learnls) so the two
+# modes never clobber each other's output dir.
+: "${FIXED_LENGTHSCALE:=1}"
+: "${LENGTHSCALE_INIT:=8.0}"
+
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
@@ -91,9 +102,17 @@ run_one() {
     local NMODES_=$8; local BSCALE_=$9; local BDECAY_=${10}; local BW_=${11}
     local KNN_=${12}; local LN_=${13}; local KMETHOD_=${14}
 
+    # Lengthscale-mode tag — fixed (pinned init, no decay) vs learned.
+    local LS_TAG
+    if [ "$FIXED_LENGTHSCALE" = "1" ]; then
+        LS_TAG="fixls${LENGTHSCALE_INIT}"
+    else
+        LS_TAG="learnls"
+    fi
+
     local TAG
     if [ "$FAMILY" = "manifold" ]; then
-        TAG="manifold-product-nu${NU_}-K${NMODES_}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="manifold-product-nu${NU_}-K${NMODES_}-stride${STRIDE}-${LS_TAG}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     else
         TAG="euclidean-no-ard-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
@@ -111,6 +130,12 @@ run_one() {
 
     local manifold_args=""
     if [ "$FAMILY" = "manifold" ]; then
+        # "Fixed" lengthscale mode pins the kernel lengthscale; "learned"
+        # mode omits both flags so the GP trains it from its own default.
+        local ls_args=""
+        if [ "$FIXED_LENGTHSCALE" = "1" ]; then
+            ls_args="--lengthscale-init $LENGTHSCALE_INIT --lengthscale-no-decay"
+        fi
         manifold_args="--eigenvector-dir $EIGENVECTOR_DIR \
             --knn-method $KMETHOD_ \
             --cross-region-inflation $CROSS_REGION_INFLATION \
@@ -122,8 +147,7 @@ run_one() {
             --graphbandwidth-init $BW_ \
             --num-modes $NMODES_ \
             --threshold "$THRESHOLD" \
-            --lengthscale-init 8.0 \
-            --lengthscale-no-decay"
+            $ls_args"
     fi
 
     # Variational-family args. --variational is always passed (defaults to

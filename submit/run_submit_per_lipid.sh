@@ -48,10 +48,19 @@ LIPID_BATCH_SIZE=10
 NUM_INDUCING=1000
 LEARNING_RATE=0.005
 BATCH_SIZE=2048
-NUM_MODES=1300
-STRIDE=4
 STRIDE_BUMP=20.0   # bump_scale — fixed for this sweep
 STRIDE_DECAY=0.01  # bump_decay — fixed for this sweep
+
+# ---- (stride : num_modes) pairs to sweep (manifold only) ------------------
+# Coarser strides need fewer eigenmodes to span the graph; finer strides need
+# more. Each entry is "STRIDE:NUM_MODES" and gets its own job.
+MAN_STRIDE_MODES=("4:1300" "8:6000")
+
+# ---- lengthscale modes (manifold only) ------------------------------------
+# 1 → fixed lengthscale (--lengthscale-init 8.0 --lengthscale-no-decay)
+# 0 → learned lengthscale (no flags; GP trains it).
+# Both modes are submitted so they can be compared head-to-head.
+MAN_FIXED_LS=(1 0)
 
 # ---- subset of lipids to train -------------------------------------------
 # A small subset is what makes a 30-job sweep practical. The file lives
@@ -88,7 +97,10 @@ submit() {
     local threshold=$9
     local prefix=${10}
     local slice=${11}
-    shift 11
+    local stride=${12}
+    local modes=${13}
+    local fixed_ls=${14}
+    shift 14
     local extra_args=("$@")
 
     echo ">>> Submitting $job_name"
@@ -119,8 +131,9 @@ submit() {
         -e CROSS_REGION_INFLATION="$inflation" \
         -e BUMP_SCALE="$STRIDE_BUMP" \
         -e BUMP_DECAY="$STRIDE_DECAY" \
-        -e NUM_MODES="$NUM_MODES" \
-        -e STRIDE="$STRIDE" \
+        -e NUM_MODES="$modes" \
+        -e STRIDE="$stride" \
+        -e FIXED_LENGTHSCALE="$fixed_ls" \
         -e THRESHOLD="$threshold" \
         -e NUM_INDUCING="$NUM_INDUCING" \
         -e LIPID_BATCH_SIZE="$LIPID_BATCH_SIZE" \
@@ -176,9 +189,10 @@ for fold in "${FOLDS[@]}"; do
             # threshold / graphbandwidth, but the submit() function takes
             # them positionally — pass dummy values that the python side
             # will silently ignore for kernel_family=euclidean.
+            # stride/modes/fixed_ls are manifold-only; pass placeholders.
             submit "$job_name" "euclidean" "$nu" \
                 "faiss" "15" "randomwalk" "0.1" "1" "5" \
-                "$fold_upper" "$SLICES_DATASET_FILE"
+                "$fold_upper" "$SLICES_DATASET_FILE" "4" "1300" "1"
             exp_num=$((exp_num + 1))
         done
     fi
@@ -201,13 +215,29 @@ for fold in "${FOLDS[@]}"; do
                                     infl_list=(1)
                                 fi
                                 for infl in "${infl_list[@]}"; do
-                                    job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
-                                    printf "  exp %2d: %-30s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s\n" \
-                                        "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl"
-                                    submit "$job_name" "manifold" "$nu" \
-                                        "$km" "$knn" "$ln" "$gb" "$infl" "$threshold" \
-                                        "$fold_upper" "$SLICES_DATASET_FILE"
-                                    exp_num=$((exp_num + 1))
+                                  for sm in "${MAN_STRIDE_MODES[@]}"; do
+                                    stride="${sm%%:*}"
+                                    modes="${sm##*:}"
+                                    for fixed_ls in "${MAN_FIXED_LS[@]}"; do
+                                        job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
+                                        # Fold the lengthscale mode into the
+                                        # prefix so the two modes (and their
+                                        # output dirs) never collide.
+                                        if [ "$fixed_ls" = "1" ]; then
+                                            ls_tag="fixls"
+                                        else
+                                            ls_tag="learnls"
+                                        fi
+                                        prefix="${fold_upper}-${ls_tag}"
+                                        printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s stride=%s modes=%s ls=%s\n" \
+                                            "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$stride" "$modes" "$ls_tag"
+                                        submit "$job_name" "manifold" "$nu" \
+                                            "$km" "$knn" "$ln" "$gb" "$infl" "$threshold" \
+                                            "$prefix" "$SLICES_DATASET_FILE" \
+                                            "$stride" "$modes" "$fixed_ls"
+                                        exp_num=$((exp_num + 1))
+                                    done
+                                  done
                                 done
                             done
                         done
