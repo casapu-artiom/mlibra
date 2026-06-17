@@ -51,17 +51,6 @@ BATCH_SIZE=2048
 STRIDE_BUMP=20.0   # bump_scale — fixed for this sweep
 STRIDE_DECAY=0.01  # bump_decay — fixed for this sweep
 
-# ---- (stride : num_modes) pairs to sweep (manifold only) ------------------
-# Coarser strides need fewer eigenmodes to span the graph; finer strides need
-# more. Each entry is "STRIDE:NUM_MODES" and gets its own job.
-MAN_STRIDE_MODES=("4:1300" "8:6000")
-
-# ---- lengthscale modes (manifold only) ------------------------------------
-# 1 → fixed lengthscale (--lengthscale-init 8.0 --lengthscale-no-decay)
-# 0 → learned lengthscale (no flags; GP trains it).
-# Both modes are submitted so they can be compared head-to-head.
-MAN_FIXED_LS=(1 0)
-
 # ---- subset of lipids to train -------------------------------------------
 # A small subset is what makes a 30-job sweep practical. The file lives
 # inside the container at the same path the run script expects.
@@ -100,7 +89,8 @@ submit() {
     local stride=${12}
     local modes=${13}
     local fixed_ls=${14}
-    shift 14
+    local no_ard=${15}
+    shift 15
     local extra_args=("$@")
 
     echo ">>> Submitting $job_name"
@@ -134,6 +124,7 @@ submit() {
         -e NUM_MODES="$modes" \
         -e STRIDE="$stride" \
         -e FIXED_LENGTHSCALE="$fixed_ls" \
+        -e NO_ARD="$no_ard" \
         -e THRESHOLD="$threshold" \
         -e NUM_INDUCING="$NUM_INDUCING" \
         -e LIPID_BATCH_SIZE="$LIPID_BATCH_SIZE" \
@@ -161,6 +152,9 @@ FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")
 # learns its own lengthscale per dimension. Other knobs (kernel="matern"
 # etc.) are fixed in run_lgp_per_lipid.sh.
 EUC_NU=(1.5)
+# ARD modes (euclidean only): 1 → isotropic (--no-ard), 0 → per-axis ARD.
+# Both are submitted so isotropic vs per-axis can be compared head-to-head.
+EUC_NO_ARD=(1 0)
 RUN_EUCLIDEAN=1   # 0 = skip the euclidean loop entirely
 
 # ---- Manifold sweep -------------------------------------------------------
@@ -168,10 +162,21 @@ MAN_NU=(2)
 MAN_THRESHOLDS=(5 40)
 MAN_LAPLACIAN_NORMS=("randomwalk")
 MAN_GRAPH_BANDWIDTHS=(0.1)
-MAN_KNN_K=(15)
-MAN_KNN_METHODS=("faiss" "faiss_atlas_weighted")
+MAN_KNN_K=(15 180)
+MAN_KNN_METHODS=("faiss_atlas_weighted")
 MAN_INFLATIONS=(50)   # only used when knn_method=faiss_atlas_weighted
+# ---- (stride : num_modes) pairs to sweep (manifold only) ------------------
+# Coarser strides need fewer eigenmodes to span the graph; finer strides need
+# more. Each entry is "STRIDE:NUM_MODES" and gets its own job.
+MAN_STRIDE_MODES=("4:1300" "8:6000")
+
+# ---- lengthscale modes (manifold only) ------------------------------------
+# 1 → fixed lengthscale (--lengthscale-init 8.0 --lengthscale-no-decay)
+# 0 → learned lengthscale (no flags; GP trains it).
+# Both modes are submitted so they can be compared head-to-head.
+MAN_FIXED_LS=(1 0)
 RUN_MANIFOLD=1
+
 
 exp_num=1
 for fold in "${FOLDS[@]}"; do
@@ -182,9 +187,11 @@ for fold in "${FOLDS[@]}"; do
     # ---- EUCLIDEAN loop ---------------------------------------------------
     if [ "$RUN_EUCLIDEAN" = "1" ]; then
         for nu in "${EUC_NU[@]}"; do
+          for no_ard in "${EUC_NO_ARD[@]}"; do
             job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
-            printf "  exp %2d: %-30s nu=%-4s fold=%s\n" \
-                "$exp_num" "euclidean" "$nu" "$fold"
+            if [ "$no_ard" = "1" ]; then ard_tag="no-ard"; else ard_tag="ard"; fi
+            printf "  exp %2d: %-22s nu=%-4s ard=%s fold=%s\n" \
+                "$exp_num" "euclidean" "$nu" "$ard_tag" "$fold"
             # Euclidean ignores knn_method / laplacian / inflation /
             # threshold / graphbandwidth, but the submit() function takes
             # them positionally — pass dummy values that the python side
@@ -192,8 +199,9 @@ for fold in "${FOLDS[@]}"; do
             # stride/modes/fixed_ls are manifold-only; pass placeholders.
             submit "$job_name" "euclidean" "$nu" \
                 "faiss" "15" "randomwalk" "0.1" "1" "5" \
-                "$fold_upper" "$SLICES_DATASET_FILE" "4" "1300" "1"
+                "$fold_upper" "$SLICES_DATASET_FILE" "4" "1300" "1" "$no_ard"
             exp_num=$((exp_num + 1))
+          done
         done
     fi
 
@@ -231,10 +239,12 @@ for fold in "${FOLDS[@]}"; do
                                         prefix="${fold_upper}-${ls_tag}"
                                         printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s stride=%s modes=%s ls=%s\n" \
                                             "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$stride" "$modes" "$ls_tag"
+                                        # no_ard is euclidean-only; pass a
+                                        # placeholder the manifold path ignores.
                                         submit "$job_name" "manifold" "$nu" \
                                             "$km" "$knn" "$ln" "$gb" "$infl" "$threshold" \
                                             "$prefix" "$SLICES_DATASET_FILE" \
-                                            "$stride" "$modes" "$fixed_ls"
+                                            "$stride" "$modes" "$fixed_ls" "1"
                                         exp_num=$((exp_num + 1))
                                     done
                                   done

@@ -231,6 +231,11 @@ def parse_args() -> dict:
     p.add_argument("--kernel", default="matern",
                    choices=["rbf", "matern", "symmetric"],
                    help="Sub-type for IndependentMultitaskGPModel.")
+    p.add_argument("--no-ard", dest="no_ard", action="store_true",
+                   help="EUCLIDEAN ONLY — use an isotropic (single shared) "
+                        "lengthscale instead of per-axis ARD. Without this "
+                        "flag the Euclidean RBF/Matern kernel learns one "
+                        "lengthscale per spatial axis (ard_num_dims=3).")
 
     # ---- Manifold-only knobs (ignored when --kernel-family=euclidean) ----
     p.add_argument("--eigenvector-dir", default=None,
@@ -772,6 +777,8 @@ def train_lipid_batch(
         voxel_size = 0.025
         # Equivalent to lgp_experiment.minimal_length_scale
         minimal_length_scale = config.n_pixels * voxel_size / 3.0
+        # ard_num_dims: None → isotropic (--no-ard); 3 → per-axis ARD (default).
+        ard_num_dims = None if args.get("no_ard", False) else 3
         model = IndependentMultitaskGPModel(
             inducing_points=inducing_points,
             num_tasks=n_tasks,
@@ -779,6 +786,7 @@ def train_lipid_batch(
             nu=config.nu,
             minimal_length_scale=minimal_length_scale,
             input_dim=3,
+            ard_num_dims=ard_num_dims,
         ).to(device)
     else:
         if args.get("per_task_lengthscale", False):

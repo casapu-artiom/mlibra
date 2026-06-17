@@ -61,13 +61,17 @@ class IndependentMultitaskGPModel(ApproximateGP):
     We define a GP prior for the latent space. The GP prior is defined by a mean and a covariance function.
     """
 
-    def __init__(self, inducing_points, num_tasks, kernel_type="rbf", nu=1.5, minimal_length_scale=1, input_dim=174):
+    def __init__(self, inducing_points, num_tasks, kernel_type="rbf", nu=1.5, minimal_length_scale=1, input_dim=174,
+                 ard_num_dims=None):
         """
         Construct the GPModel class.
 
         Args:
             inducing_points (torch.Tensor): Inducing points for the GP
             num_tasks (int): Number of tasks
+            ard_num_dims (int | None): None/1 → isotropic (single shared
+                lengthscale); 3 → per-axis ARD (one lengthscale per spatial
+                dimension). Applies to the RBF and Matern kernels.
         """
         # Let's use a different set of inducing points for each task
         # for each num_task we have a set of inducing points
@@ -94,16 +98,16 @@ class IndependentMultitaskGPModel(ApproximateGP):
         self.kernel_type = kernel_type
         self.nu = nu
         if kernel_type == "rbf":
-            print("Using RBF kernel")
+            print(f"Using RBF kernel (ard_num_dims={ard_num_dims})")
             self.covar_module = ScaleKernel(
                 RBFKernel(batch_shape=torch.Size([num_tasks]),
-                          ard_num_dims=None),
+                          ard_num_dims=ard_num_dims),
                 batch_shape=torch.Size([num_tasks])
             )
         else:
             if kernel_type == "matern":
-                print(f"Using Matern kernel with nu={self.nu}")
-                ard_num_dims = None  # None/1 → isotropic; set to 3 for per-axis ARD
+                print(f"Using Matern kernel with nu={self.nu} (ard_num_dims={ard_num_dims})")
+                # None/1 → isotropic; 3 → per-axis ARD (passed in by caller).
                 # The constraint must match the lengthscale shape: a per-axis vector
                 # only for ARD, a scalar otherwise. A vector constraint broadcasts the
                 # lengthscale to size-3, and the non-ARD MaternCovariance path then

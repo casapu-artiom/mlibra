@@ -20,6 +20,12 @@
 : "${KERNEL_FAMILY:=manifold}"          # euclidean | manifold
 : "${KERNEL:=matern}"                   # only used for euclidean
 
+# ---- ARD (euclidean kernel only) ----
+# NO_ARD=1 (default) → isotropic single shared lengthscale (passes --no-ard).
+# NO_ARD=0           → per-axis ARD (ard_num_dims=3; no flag passed).
+# Encoded in the euclidean run TAG (no-ard | ard). Ignored for manifold.
+: "${NO_ARD:=1}"
+
 # ---- GP hyperparameters ----
 : "${NU:=2.5}"
 : "${NUM_INDUCING:=1000}"
@@ -110,11 +116,19 @@ run_one() {
         LS_TAG="learnls"
     fi
 
+    # ARD-mode tag (euclidean only) — isotropic vs per-axis.
+    local ARD_TAG
+    if [ "$NO_ARD" = "1" ]; then
+        ARD_TAG="no-ard"
+    else
+        ARD_TAG="ard"
+    fi
+
     local TAG
     if [ "$FAMILY" = "manifold" ]; then
         TAG="manifold-product-nu${NU_}-K${NMODES_}-stride${STRIDE}-${LS_TAG}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     else
-        TAG="euclidean-no-ard-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
     # VNNGP runs get their own tag suffix so they don't clobber the analytic ones.
     if [ "$VARIATIONAL" = "nngp" ]; then
@@ -161,6 +175,14 @@ run_one() {
             --geodesic-graph-k $GEODESIC_GRAPH_K"
     fi
 
+    # ARD args (euclidean only). --no-ard requests an isotropic lengthscale;
+    # omitting it lets the kernel learn per-axis ARD. The flag is ignored by
+    # the manifold path, so only pass it for the euclidean family.
+    local euc_args=""
+    if [ "$FAMILY" != "manifold" ] && [ "$NO_ARD" = "1" ]; then
+        euc_args="--no-ard"
+    fi
+
     # Subset args from env vars. Use --limit OR --lipids OR --lipids-file
     # (or any combination — limit is applied after the name/index filter).
     local subset_args=""
@@ -198,6 +220,7 @@ run_one() {
         --seed "$SEED" \
         $vnngp_args \
         $manifold_args \
+        $euc_args \
         $subset_args \
         "${@:15}"
 }
