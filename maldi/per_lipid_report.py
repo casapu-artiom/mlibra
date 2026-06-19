@@ -39,6 +39,17 @@ import pandas as pd
 # simply skipped for that run.
 METRIC_COLS = ["test_rmse_z", "test_corr", "test_r2", "mean_pred_std_z", "fit_sec"]
 
+# Candidate columns that identify a lipid within a metrics.csv, in priority order.
+LIPID_ID_COLS = ["lipid_name", "slug", "lipid_global_idx"]
+
+
+def _lipid_col(df: pd.DataFrame) -> str | None:
+    """Return the column identifying a lipid, or None if none is present."""
+    for col in LIPID_ID_COLS:
+        if col in df.columns:
+            return col
+    return None
+
 
 def derive_fold(run_dir: Path, config: dict | None) -> str:
     """Best-effort fold label for a run.
@@ -118,6 +129,55 @@ def summarise(df: pd.DataFrame) -> dict:
     return out
 
 
+def summarise_across_folds(g: pd.DataFrame) -> dict:
+    """Mean / median / min / max (range) for each metric across a group's rows.
+
+    Used for the per-lipid x per-model aggregation, where each row is the same
+    lipid scored under one fold, so these stats describe spread across folds.
+    """
+    out: dict[str, float] = {}
+    for col in METRIC_COLS:
+        if col in g.columns:
+            vals = pd.to_numeric(g[col], errors="coerce")
+            out[f"{col}_mean"] = float(np.nanmean(vals)) if len(vals) else float("nan")
+            out[f"{col}_median"] = float(np.nanmedian(vals)) if len(vals) else float("nan")
+            out[f"{col}_min"] = float(np.nanmin(vals)) if len(vals) else float("nan")
+            out[f"{col}_max"] = float(np.nanmax(vals)) if len(vals) else float("nan")
+    return out
+
+
+def build_per_lipid_model(long_df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """One row per (lipid, model type), aggregating metrics across folds.
+
+    Reports mean, median and the min..max range for each metric, plus how many
+    folds contributed.
+    """
+    if long_df.empty:
+        return pd.DataFrame()
+    lipid_col = _lipid_col(long_df)
+    if lipid_col is None:
+        return pd.DataFrame()
+
+    rows = []
+    for (lipid, kernel), g in long_df.groupby([lipid_col, "kernel_family"], dropna=False):
+        row = {
+            "lipid": lipid,
+            "kernel_family": kernel,
+            "n_folds": g["fold"].nunique(),
+            "n_runs": g["run"].nunique(),
+        }
+        row.update(summarise_across_folds(g))
+        rows.append(row)
+    out = pd.DataFrame(rows)
+
+    sort_col = f"{metric}_median"
+    if not out.empty and sort_col in out.columns:
+        ascending = metric.endswith("rmse_z") or metric == "fit_sec"
+        out = out.sort_values(["lipid", sort_col], ascending=[True, ascending],
+                              kind="stable")
+    return out
+
+
 def build_tables(runs: list[dict], metric: str):
     # ---- long per-lipid table (one row per lipid, tagged with run+fold) ----
     long_parts = []
@@ -163,7 +223,10 @@ def build_tables(runs: list[dict], metric: str):
         ascending = metric.endswith("rmse_z") or metric == "fit_sec"
         per_fold = per_fold.sort_values(sort_col, ascending=ascending)
 
-    return long_df, per_run, per_fold
+    # ---- per-lipid x per-model table (aggregated across folds) ----
+    per_lipid_model = build_per_lipid_model(long_df, metric)
+
+    return long_df, per_run, per_fold, per_lipid_model
 
 
 def main() -> int:
@@ -202,7 +265,7 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    long_df, per_run, per_fold = build_tables(runs, args.metric)
+    long_df, per_run, per_fold, per_lipid_model = build_tables(runs, args.metric)
 
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 200)
@@ -230,6 +293,18 @@ def main() -> int:
     total_df = pd.DataFrame([total])
     print(total_df.to_string(index=False))
 
+    # ---- per-lipid x per-model (aggregated across folds) ----
+    print("\n### PER-LIPID x PER-MODEL SUMMARY (aggregated across folds: "
+          "mean / median / min..max)")
+    if per_lipid_model.empty:
+        print("  (none)")
+    else:
+        with pd.option_context("display.max_rows", args.max_rows):
+            print(per_lipid_model.head(args.max_rows).to_string(index=False))
+            if len(per_lipid_model) > args.max_rows:
+                print(f"  ... {len(per_lipid_model) - args.max_rows} more "
+                      f"(lipid, model) rows (raise --max-rows)")
+
     # ---- per-run ----
     print("\n### PER-RUN SUMMARY")
     pr = per_run
@@ -248,6 +323,7 @@ def main() -> int:
         long_df.to_csv(args.csv_dir / "per_lipid_long.csv", index=False)
         per_run.to_csv(args.csv_dir / "per_run.csv", index=False)
         per_fold.to_csv(args.csv_dir / "per_fold.csv", index=False)
+        per_lipid_model.to_csv(args.csv_dir / "per_lipid_model.csv", index=False)
         total_df.to_csv(args.csv_dir / "total.csv", index=False)
         print(f"\nWrote CSVs to {args.csv_dir}/")
 
