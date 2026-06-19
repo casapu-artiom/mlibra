@@ -27,7 +27,7 @@
 : "${NO_ARD:=1}"
 
 # ---- GP hyperparameters ----
-: "${NU:=2.5}"
+: "${NU:=2}"
 : "${NUM_INDUCING:=1000}"
 : "${INDUCING_SOURCE:=reference}"
 : "${LIPID_BATCH_SIZE:=10}"
@@ -63,11 +63,14 @@
 : "${LIPIDS_FILE:=/home/casap/mlibra_git/maldi/data/lipid_subset.txt}"
 
 # ---- Manifold-only ----
-: "${NUM_MODES:=6000}"
-: "${STRIDE:=8}"
+: "${NUM_MODES:=20}"
+# Lanczos Krylov subspace floor. -1 = auto (max(1500, 3*num_modes+20)).
+# At STRIDE=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
+: "${NCV_MIN:=-1}"
+: "${STRIDE:=4}"
 : "${KNN_K:=15}"
 : "${KNN_METHOD:=faiss_atlas_weighted}"
-: "${CROSS_REGION_INFLATION:=10.0}"
+: "${CROSS_REGION_INFLATION:=50.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
 : "${BUMP_SCALE:=1.0}"
 : "${BUMP_DECAY:=0.01}"
@@ -126,7 +129,7 @@ run_one() {
 
     local TAG
     if [ "$FAMILY" = "manifold" ]; then
-        TAG="manifold-product-nu${NU_}-K${NMODES_}-stride${STRIDE}-${LS_TAG}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        TAG="manifold-nu${NU_}-K${NMODES_}-stride${STRIDE}-${LS_TAG}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
@@ -160,6 +163,7 @@ run_one() {
             --bump-decay $BDECAY_ \
             --graphbandwidth-init $BW_ \
             --num-modes $NMODES_ \
+            --ncv-min $NCV_MIN \
             --threshold "$THRESHOLD" \
             $ls_args"
     fi

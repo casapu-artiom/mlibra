@@ -1,6 +1,9 @@
 #!/usr/bin/env sh
 : "${NUM_INDUCING_POINTS:=2000}"
 : "${NUM_MODES:=6000}"
+# Lanczos Krylov subspace floor. -1 = auto (max(1500, 3*NUM_MODES+20)).
+# At stride=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
+: "${NCV_MIN:=-1}"
 : "${INDUCING_SOURCE:=data}"
 : "${LATENT_DIM:=5}"
 : "${STRIDE:=8}"
@@ -66,6 +69,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --per-task-lengthscale \
     --lengthscale-init 1.0 \
     --num-modes $NUM_MODES \
+    --ncv-min $NCV_MIN \
     --kernel "$KERNEL" \
     --laplacian-norm "$LAPLACIAN_NORM" \
     --stride $STRIDE \

@@ -19,7 +19,7 @@
 # config.json + lipid_names.json + predictions/  — i.e. one of the
 # subdirectories under /home/casap/mlibra/output/per_lipid/, NOT that
 # parent dir itself.
-: "${RUN_DIR:=/home/casap/mlibra/output/per_lipid/manifold-nu2-K1300-bs20.0-bd0.01-bw0.1-knn15-faiss-randomwalk-ind500-lr0.005-ep20-lbs10}"
+: "${RUN_DIR:=/home/casap/mlibra/output/per_lipid_batch_3/manifold-nu2-K1300-bs20.0-bd0.01-bw0.1-knn120-faiss-40-randomwalk-ind1000-lr0.005-ep10-lbs1010}"
 
 # ---- optional: a second run for side-by-side comparison --------------------
 # Leave empty (default) to skip. When set, the viewer adds an "A: …" /

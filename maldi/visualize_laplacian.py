@@ -3,6 +3,7 @@
 Layers — all share the same coordinate frame (full-resolution template
 voxel coords). Toggle visibility in napari's left panel.
 
+  Layer A0 — Reference template (anatomical backdrop / context)
   Layer A  — KNN graph fabric
   Layer B  — Graph Laplacian (operator-level)
   Layer C  — Kernel diagonal K(i, i) via `kernel.features()`
@@ -33,7 +34,7 @@ from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 from manifold_gp.utils.anatomical_knn import inflate_cross_region_edges, labels_for_nodes_from_sub_atlas
 from manifold_gp.utils.compute_eigenvectors import (
-    LaplacianEigensolver, make_key as make_eig_key,
+    LaplacianEigensolver, resolve_ncv_min, make_key as make_eig_key,
 )
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
@@ -77,8 +78,6 @@ def parse_args() -> dict:
     p.add_argument("--annotations-file", default=None)
     p.add_argument("--stride", type=int, default=4)
     p.add_argument("--threshold", type=int, default=5)
-    p.add_argument("--region-bbox", type=int, nargs=6, default=None,
-                   metavar=("ZMIN", "ZMAX", "YMIN", "YMAX", "XMIN", "XMAX"))
 
     p.add_argument("--knn-method", choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted"],
                    default="anatomical_atlas")
@@ -91,6 +90,10 @@ def parse_args() -> dict:
 
     p.add_argument("--eigenvector-dir", required=True)
     p.add_argument("--num-modes", type=int, default=200)
+    p.add_argument("--ncv-min", dest="ncv_min", type=int, default=-1,
+                   help="Lanczos Krylov subspace floor. <=0 (default) auto-picks "
+                        "max(1500, 3*num_modes+20); set a small explicit value "
+                        "(e.g. 100) to fit large-N (stride=1) eigensolves in GPU memory.")
     p.add_argument("--initial-modes", type=int, default=None)
     p.add_argument("--force-recompute-graph", action="store_true")
     p.add_argument("--force-recompute-eigvecs", action="store_true")
@@ -117,6 +120,15 @@ def parse_args() -> dict:
     p.add_argument("--fabric-edge-sample", type=int, default=200_000)
     p.add_argument("--fabric-node-size", type=float, default=0.6)
     p.add_argument("--fabric-edge-width", type=float, default=0.3)
+    p.add_argument("--fabric-color-by", choices=["flat", "distance", "affinity"],
+                   default="distance",
+                   help=("A2 fabric edge shading. flat = uniform gray; distance = "
+                         "highlight geometrically SHORT edges (bright/opaque), fade "
+                         "long ones (inflation-free); affinity = shade by the "
+                         "Laplacian affinity exp(-edge_value/4bw^2) (folds in "
+                         "cross-region inflation)."))
+    p.add_argument("--fabric-cmap", default="plasma",
+                   help="matplotlib colormap for --fabric-color-by (close=bright end).")
     p.add_argument("--laplacian-edge-sample", type=int, default=80_000)
 
     p.add_argument("--render-stride", type=int, default=1)
@@ -159,7 +171,7 @@ def setup(args: dict, log: logging.Logger):
 
     sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
         template_full, annotations_full,
-        stride=args["stride"], region_bbox=args["region_bbox"],
+        stride=args["stride"],
     )
     reference_ccf = reference_ccf_from_subvolume(
         sub_volume, voxel_offset, voxel_scale_mm, args["threshold"],
@@ -182,12 +194,12 @@ def setup(args: dict, log: logging.Logger):
     graphs = KnnGraphCache(cache_dir=eigenvector_dir / "knn", verbose=True)
     graph_key_parts = {
         "template": args["template_name"],
-        "stride": (args["stride"] if args["region_bbox"] is None else 1),
+        "stride": args["stride"],
         "thresh": args["threshold"],
         "method": args["knn_method"],
         "k": args["knn_k"],
         "nlist": args["n_list"],
-        "bbox": (tuple(args["region_bbox"]) if args["region_bbox"] is not None else None),
+        "bbox": None,
     }
     if args["knn_method"] == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
@@ -236,7 +248,7 @@ def setup(args: dict, log: logging.Logger):
         "graph": graph_key, "norm": args["laplacian_norm"], "bw": bw, "modes": args["num_modes"],
     }
     eigvec_key = make_eig_key(eigvec_key_parts)
-    ncv_min = max(1500, 3 * args["num_modes"] + 20)
+    ncv_min = resolve_ncv_min(args["num_modes"], args.get("ncv_min", -1))
     solver = LaplacianEigensolver(
         num_modes=args["num_modes"], backend="cupy", tol=1e-4, ncv_min=ncv_min, verbose=True,
     )
@@ -296,6 +308,38 @@ def make_lines_array(pairs: np.ndarray, node_positions: np.ndarray) -> np.ndarra
     lines[:, 0, :] = node_positions[pairs[:, 0]]
     lines[:, 1, :] = node_positions[pairs[:, 1]]
     return lines
+
+
+def fabric_edge_rgba(fabric_lines: np.ndarray, edge_sq_dists: np.ndarray,
+                     mode: str, bw: float, cmap_name: str = "plasma") -> np.ndarray:
+    """Per-edge RGBA for the A2 KNN fabric so CLOSE edges are highlighted and
+    far ones fade out (the raw fabric draws every edge identically).
+
+      flat      -> uniform faint gray (the original look)
+      distance  -> closeness from the edge's GEOMETRIC length (endpoints), so it
+                   is inflation-free: short edges bright/opaque, long edges dim.
+                   Robust min/max via the 5th/95th length percentiles.
+      affinity  -> closeness = exp(-edge_value/4bw^2), the affinity the Laplacian
+                   actually uses; this DOES fold in cross-region inflation (those
+                   edges get large edge_value -> near-zero affinity -> faded).
+
+    closeness in [0,1] (1 = close) is gamma-lifted for contrast, mapped through
+    `cmap_name` (close = bright end), and also drives alpha so far edges are
+    nearly transparent."""
+    M = int(fabric_lines.shape[0])
+    if M == 0 or mode == "flat":
+        return np.tile(np.array([[0.6, 0.6, 0.6, 0.35]], np.float32), (M, 1))
+    if mode == "affinity":
+        d2 = np.asarray(edge_sq_dists, np.float64)
+        closeness = np.exp(-d2 / max(4.0 * bw * bw, 1e-12))          # (0,1], 1=strong
+    else:  # "distance": literal geometric closeness, independent of inflation
+        d = np.linalg.norm(fabric_lines[:, 1, :] - fabric_lines[:, 0, :], axis=1)
+        lo, hi = np.percentile(d, 5), np.percentile(d, 95)
+        closeness = 1.0 - np.clip((d - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
+    c = np.clip(closeness, 0.0, 1.0) ** 0.5                          # lift contrast
+    rgba = matplotlib.colormaps.get_cmap(cmap_name)(c).astype(np.float32)
+    rgba[:, 3] = 0.06 + 0.92 * c                                     # far -> transparent
+    return rgba
 
 
 def _full_voxel_to_normalized(voxel_idx_full: np.ndarray, ctx: dict) -> torch.Tensor:
@@ -989,9 +1033,30 @@ def main():
     # Creating in 2D mode sidesteps that path entirely; we switch to 3D right
     # before napari.run() once all layers have real sub_shape data.
 
+    # A0: the raw reference template as an anatomical backdrop. It is natively in
+    # full-resolution voxel coords -- the shared frame -- so scale=(1,1,1) and
+    # translate=(0,0,0) (default) align it with the strided Image layers (which
+    # carry sv_scale/sv_translate) and the node Points. Rendered as an attenuated
+    # MIP so the tissue shows without a black bounding box; sub-threshold voxels
+    # sit at the low end of the contrast range. Added first => bottom of the
+    # layer list / behind everything else.
+    _tmpl = ctx["template_full"]
+    _tmpl_pos = _tmpl[_tmpl > 0]
+    _tmpl_lo = float(ctx["threshold"])
+    _tmpl_hi = float(np.percentile(_tmpl_pos, 99)) if _tmpl_pos.size else float(_tmpl.max())
+    _tmpl_hi = max(_tmpl_hi, _tmpl_lo + 1.0)
+    viewer.add_image(
+        _tmpl, name="A0: reference template", colormap="gray",
+        blending="translucent", rendering="attenuated_mip",
+        contrast_limits=(_tmpl_lo, _tmpl_hi), opacity=0.4, visible=True,
+    )
+
     viewer.add_points(all_node_positions, name="A1: graph nodes", size=float(args["fabric_node_size"]), face_color="white", border_color="white", symbol="o", opacity=0.25, blending="additive")
     fabric_lines = make_lines_array(fabric_pairs, all_node_positions)
-    viewer.add_shapes([fabric_lines[i] for i in range(fabric_lines.shape[0])], shape_type="line", edge_color=np.tile([[0.6, 0.6, 0.6, 0.35]], (fabric_lines.shape[0], 1)), edge_width=float(args["fabric_edge_width"]), name="A2: KNN fabric (edges)", opacity=0.7, blending="translucent")
+    fabric_rgba = fabric_edge_rgba(fabric_lines, fabric_sq_dists,
+                                   args["fabric_color_by"], ctx["bw"],
+                                   cmap_name=args["fabric_cmap"])
+    viewer.add_shapes([fabric_lines[i] for i in range(fabric_lines.shape[0])], shape_type="line", edge_color=fabric_rgba, edge_width=float(args["fabric_edge_width"]), name="A2: KNN fabric (edges)", opacity=0.7, blending="translucent")
 
     placeholder_vol = np.zeros((2, 2, 2), dtype=np.float32)
     _img_kw = dict(opacity=1.0, rendering="translucent")

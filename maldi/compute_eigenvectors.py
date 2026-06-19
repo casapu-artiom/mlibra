@@ -12,7 +12,7 @@ import wandb
 
 # Import your custom modules
 from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as knn_make_key
-from manifold_gp.utils.compute_eigenvectors import LaplacianEigensolver, make_key as eigen_make_key
+from manifold_gp.utils.compute_eigenvectors import LaplacianEigensolver, resolve_ncv_min, make_key as eigen_make_key
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 
 from utils import crop_or_stride_volume, reference_ccf_from_subvolume
@@ -26,6 +26,11 @@ def main():
     parser.add_argument("--stride", type=int, default=4, help="Subsampling stride for the 25um atlas")
     parser.add_argument("--k", type=int, default=15, help="Number of nearest neighbors")
     parser.add_argument("--modes", type=int, default=200, help="Number of eigenmodes to compute")
+    parser.add_argument("--ncv-min", dest="ncv_min", type=int, default=-1,
+                        help="Lanczos Krylov subspace floor. <=0 (default) "
+                             "auto-picks max(1500, 3*modes+20); set a small "
+                             "explicit value (e.g. 100) to fit large-N (stride=1) "
+                             "eigensolves in GPU memory.")
     parser.add_argument("--bandwidth", type=float, default=1.0, help="Graph bandwidth for Laplacian")
     parser.add_argument("--n-list", type=int, default=1, help="FAISS nlist parameter")
     
@@ -120,8 +125,9 @@ def main():
     eigen_key = eigen_make_key(eigen_config)
     
     solver = LaplacianEigensolver(
-        num_modes=args.modes, 
+        num_modes=args.modes,
         backend="cupy" if args.device == "cuda" else "scipy",
+        ncv_min=resolve_ncv_min(args.modes, args.ncv_min),
         verbose=True
     )
     

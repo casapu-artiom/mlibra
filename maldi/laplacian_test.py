@@ -74,7 +74,7 @@ from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 from manifold_gp.utils.anatomical_knn import inflate_cross_region_edges, labels_for_nodes_from_sub_atlas
 from manifold_gp.utils.compute_eigenvectors import (
-    LaplacianEigensolver, make_key as make_eig_key,
+    LaplacianEigensolver, resolve_ncv_min, make_key as make_eig_key,
 )
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
@@ -1273,7 +1273,7 @@ def build_graph_and_laplacian(
 
     sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
         template_full, annotations_full,
-        stride=args["stride"], region_bbox=args["region_bbox"],
+        stride=args["stride"],
     )
     reference_ccf = reference_ccf_from_subvolume(
         sub_volume, voxel_offset, voxel_scale_mm, threshold,
@@ -1284,12 +1284,12 @@ def build_graph_and_laplacian(
 
     graph_key_parts = {
         "template": args["template_name"],
-        "stride":   1 if args["region_bbox"] is not None else args["stride"],
+        "stride":   args["stride"],
         "thresh":   threshold,
         "method":   knn_method,
         "k":        knn_k,
         "nlist":    args["n_list"],
-        "bbox":     tuple(args["region_bbox"]) if args["region_bbox"] is not None else None,
+        "bbox":     None,
     }
     
     if knn_method == "anatomical_atlas":
@@ -1381,6 +1381,10 @@ def parse_args():
     p.add_argument("--stride", type=int, default=4)
     p.add_argument("--n-list", type=int, default=1)
     p.add_argument("--num-modes", type=int, default=1300)
+    p.add_argument("--ncv-min", dest="ncv_min", type=int, default=-1,
+                   help="Lanczos Krylov subspace floor. <=0 (default) auto-picks "
+                        "max(1500, 3*num_modes+20); set a small explicit value "
+                        "(e.g. 100) to fit large-N (stride=1) eigensolves in GPU memory.")
     p.add_argument("--region-bbox", type=int, nargs=6, default=None)
     p.add_argument("--knn-method", required=True,
                    choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted"])
@@ -1517,7 +1521,7 @@ def main():
     device = torch.device(args["device"])
     graphs_cache = KnnGraphCache(cache_dir=knn_dir, verbose=True)
 
-    ncv_min = max(1500, 3 * args["num_modes"] + 20)
+    ncv_min = resolve_ncv_min(args["num_modes"], args.get("ncv_min", -1))
     knn_method = args["knn_method"]
     norm       = args["normalization"]
     threshold  = args["threshold"]

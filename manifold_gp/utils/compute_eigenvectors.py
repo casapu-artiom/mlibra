@@ -598,3 +598,29 @@ def make_key(parts: Dict[str, Any]) -> str:
             v = f"{v:.6g}"
         pieces.append(f"{k}={v}")
     return "_".join(pieces).replace("/", "-").replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# Helper: resolve the Lanczos Krylov subspace floor (ncv_min)
+# ---------------------------------------------------------------------------
+def resolve_ncv_min(num_modes: int, ncv_min: Optional[int] = None) -> int:
+    """Pick the Krylov subspace floor for the Lanczos solver.
+
+    Two regimes:
+
+    * auto (``ncv_min`` is None or <= 0) -- return ``max(1500, 3*num_modes+20)``.
+      The 1500 floor is robust insurance for the clustered low Laplacian
+      spectrum and is cheap when N is small (stride >= 2: a few hundred
+      thousand nodes).
+
+    * explicit (``ncv_min`` > 0) -- return it verbatim, even if it drops *below*
+      the auto floor. At stride=1 (tens of millions of nodes) the 1500 floor
+      becomes the GPU-memory bottleneck (~ncv * N * 4 bytes for the basis), so
+      a small explicit value (e.g. 100) is the way to make those runs fit. The
+      solver still enforces the hard ARPACK minimum ``2*num_modes+1`` on top of
+      whatever this returns, so an override that is too small is clamped up, not
+      silently wrong.
+    """
+    if ncv_min is not None and int(ncv_min) > 0:
+        return int(ncv_min)
+    return max(1500, 3 * int(num_modes) + 20)

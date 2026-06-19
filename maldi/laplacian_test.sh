@@ -35,6 +35,9 @@ set -eu
 : "${GRAPHBANDWIDTH:=0.1}"
 : "${CROSS_REGION_INFLATION:=10.0}"
 : "${NUM_MODES:=6000}"
+# Lanczos Krylov subspace floor. -1 = auto (max(1500, 3*NUM_MODES+20)).
+# At stride=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
+: "${NCV_MIN:=-1}"
 : "${STRIDE:=8}"
 : "${N_LIST:=1}"
 : "${NU:=2}"
@@ -100,6 +103,7 @@ python "$SRC_PATH/maldi/laplacian_test.py" \
     --stride "$STRIDE" \
     --n-list "$N_LIST" \
     --num-modes "$NUM_MODES" \
+    --ncv-min "$NCV_MIN" \
     --knn-method "$KNN_METHOD" \
     --normalization "$NORMALIZATION" \
     --threshold "$THRESHOLD" \

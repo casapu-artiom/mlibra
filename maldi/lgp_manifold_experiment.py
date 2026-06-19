@@ -16,7 +16,7 @@ from experiment import MaldiExperiment
 from config import MaldiConfig
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 from manifold_gp.utils.compute_eigenvectors import (
-    LaplacianEigensolver, make_key as make_eig_key,
+    LaplacianEigensolver, resolve_ncv_min, make_key as make_eig_key,
 )
 from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as make_graph_key
 from manifold_gp.utils.anatomical_knn import (
@@ -92,6 +92,10 @@ def parse_args():
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
+    parser.add_argument("--ncv-min", dest="ncv_min", type=int, default=-1,
+                        help="Lanczos Krylov subspace floor. <=0 (default) auto-picks "
+                             "max(1500, 3*num_modes+20); set a small explicit value "
+                             "(e.g. 100) to fit large-N (stride=1) eigensolves in GPU memory.")
     parser.add_argument("--per-task-lengthscale", dest="per_task_lengthscale", action='store_true',
                         help="Give each latent dimension its OWN learnable lengthscale "
                              "(one RiemannMaternKernel per task, sharing the eigenpairs/graph) "
@@ -297,7 +301,7 @@ def setup_experiment(args):
     logging.info(f"Eigenvector cache key: {eigvec_key}")
 
     # Lanczos basis must comfortably exceed num_modes; bump as needed.
-    ncv_min = max(1500, 3 * num_modes + 20)
+    ncv_min = resolve_ncv_min(num_modes, args.get("ncv_min", -1))
     solver = LaplacianEigensolver(
         num_modes=num_modes, backend="cupy", tol=1e-4, ncv_min=ncv_min, verbose=True,
     )

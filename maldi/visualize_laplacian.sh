@@ -4,13 +4,14 @@ python maldi/visualize_laplacian.py \
     --annotations-file /home/casap/mlibra/mlibra_data/level_15annot.npy \
     --eigenvector-dir /home/casap/mlibra/output/eigenvectors \
     --knn-method faiss_atlas_weighted \
-    --knn-k 120 \
-    --cross-region-inflation 10.0 \
-    --num-modes 6000 \
+    --knn-k 15 \
+    --cross-region-inflation 50.0 \
+    --num-modes 2000 \
+    --ncv-min ${NCV_MIN:--1} \
     --laplacian-norm randomwalk \
     --graphbandwidth 0.1 \
     --n-sources 100 --n-targets 60 --k-show 30 \
     --source-marker-size 6 \
     --fabric-edge-sample 200000 --laplacian-edge-sample 80000 \
-    --threshold 40 \
-    --stride 8
+    --threshold 50 \
+    --stride 4

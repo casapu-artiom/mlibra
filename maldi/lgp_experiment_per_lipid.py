@@ -74,7 +74,7 @@ from utils import (
 # ``lgp_manifold_experiment.py`` for compatibility.
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 from manifold_gp.utils.compute_eigenvectors import (
-    LaplacianEigensolver, make_key as make_eig_key,
+    LaplacianEigensolver, resolve_ncv_min, make_key as make_eig_key,
 )
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
@@ -274,6 +274,11 @@ def parse_args() -> dict:
     p.add_argument("--bump-scale", type=float, default=20.0)
     p.add_argument("--bump-decay", type=float, default=0.01)
     p.add_argument("--num-modes", type=int, default=1300)
+    p.add_argument("--ncv-min", dest="ncv_min", type=int, default=-1,
+                   help="Lanczos Krylov subspace floor. <=0 (default) auto-picks "
+                        "max(1500, 3*num_modes+20); set a small explicit value "
+                        "(e.g. 100) to fit large-N (stride=1) eigensolves in GPU "
+                        "memory.")
     p.add_argument("--threshold", type=int, default=5)
 
     # ---- lipid restriction / debugging ----
@@ -612,7 +617,7 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         "modes": args["num_modes"],
     }
     eigvec_key = make_eig_key(eigvec_key_parts)
-    ncv_min = max(1500, 3 * args["num_modes"] + 20)
+    ncv_min = resolve_ncv_min(args["num_modes"], args.get("ncv_min", -1))
     solver = LaplacianEigensolver(
         num_modes=args["num_modes"], backend="cupy",
         tol=1e-4, ncv_min=ncv_min, verbose=True,

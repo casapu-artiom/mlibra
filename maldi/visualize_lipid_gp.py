@@ -122,6 +122,28 @@ def parse_args():
                          "share one scale — quantitative comparison "
                          "across layers, but if one role's range is "
                          "narrow it will look uniform."))
+    # --- Kernel reconstruction & highlight sampling -----------------------
+    p.add_argument("--eigenvector-dir", default=None,
+                   help=("Path to the eigenvector cache used by the "
+                         "training run (the dir containing eigvecs/ and "
+                         "knn/ subdirs). When provided, the viewer "
+                         "reconstructs the manifold-Matern kernel from "
+                         "the run config and adds a highlight subset of "
+                         "test points plus a layer rendering K(active "
+                         "source, all test points). Without this, the "
+                         "highlight subset still appears but the kernel "
+                         "layer is skipped."))
+    p.add_argument("--kernel-sample-size", type=int, default=300,
+                   help=("Number of test points to include in the "
+                         "highlight subset. Picked once at startup with "
+                         "--kernel-seed; you cycle through them via the "
+                         "prev/next source buttons."))
+    p.add_argument("--kernel-seed", type=int, default=42,
+                   help="RNG seed for the highlight subset sampling.")
+    p.add_argument("--no-kernel", action="store_true",
+                   help=("Skip kernel reconstruction even when "
+                         "--eigenvector-dir is provided. Highlight subset "
+                         "still appears."))
     return vars(p.parse_args())
 
 
@@ -441,12 +463,468 @@ def graph_pred_to_voxel_positions(graph_meta, axis_order=(0, 1, 2),
 # =============================================================================
 # Layer-set builders
 # =============================================================================
-def add_run_layers(viewer, run, prefix, args, start_lipid_idx=None):
+def reconstruct_matern_kernel(run: dict, args: dict):
+    """Rebuild the deployed manifold-Matern kernel from a run's config + the
+    cached eigenvectors. Returns a dict with ``matern_kernel``, the coord
+    normalisation (``coord_mean``, ``coord_std``), and a callback
+    ``test_to_normalized(test_mm)`` that maps a (N, 3) array of test-point
+    mm coordinates into the kernel's normalized space.
+
+    The kernel is fully deterministic given:
+      - the run's config.json (knn_method, knn_k, threshold, graphbandwidth,
+        num_modes, nu, lengthscale, bump_scale, bump_decay, normalization,
+        cross_region_inflation, stride, template_name)
+      - the reference_file / annotations_file at the same path the training
+        used
+      - the eigenvector cache directory at the same path the training used
+
+    No training data is loaded — the kernel only needs the graph nodes
+    (above-threshold voxels) and the cached eigenpairs.
+
+    Returns None when reconstruction can't proceed (missing config field,
+    cache miss, etc.) — the caller falls back to "no kernel layer."
+    """
+    log = logging.getLogger("viz")
+    config = run["config"]
+
+    try:
+        import torch
+        from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
+        from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
+        from manifold_gp.utils.anatomical_knn import (
+            inflate_cross_region_edges, labels_for_nodes_from_sub_atlas,
+        )
+        from manifold_gp.utils.compute_eigenvectors import (
+            LaplacianEigensolver, make_key as make_eig_key,
+        )
+        from manifold_gp.utils.nearest_neighbors import (
+            KnnGraphCache, make_key as make_graph_key,
+        )
+        from utils import crop_or_stride_volume, reference_ccf_from_subvolume
+    except ImportError as e:
+        log.warning(f"Kernel reconstruction unavailable — import failed: {e}")
+        return None
+
+    # Required hyperparams — fail soft if anything's missing.
+    REQUIRED = ["knn_method", "knn_k", "graphbandwidth", "threshold",
+                "stride", "num_modes", "nu", "lengthscale",
+                "bump_scale", "bump_decay", "laplacian_norm"]
+    missing = [k for k in REQUIRED if k not in config]
+    if missing:
+        log.warning(f"Run config is missing {missing}; can't reconstruct kernel.")
+        return None
+
+    eigvec_dir = Path(args["eigenvector_dir"]) / "eigvecs"
+    knn_dir    = Path(args["eigenvector_dir"]) / "knn"
+    if not eigvec_dir.exists():
+        log.warning(f"--eigenvector-dir/eigvecs not found at {eigvec_dir}")
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Reconstructing matern_kernel on {device} from run config + cached eigvecs …")
+
+    template_full = np.load(args["reference_file"])
+    annotations_full = (np.load(args["annotations_file"])
+                        if args.get("annotations_file") else None)
+
+    stride = int(config["stride"])
+    threshold = int(config["threshold"])
+    knn_method = config["knn_method"]
+    knn_k = int(config["knn_k"])
+    bw = float(config["graphbandwidth"])
+    norm = config["laplacian_norm"]
+    num_modes = int(config["num_modes"])
+    nu = int(config["nu"])
+    lengthscale = float(config["lengthscale"])
+    bump_scale = float(config["bump_scale"])
+    bump_decay = float(config["bump_decay"])
+    n_list = int(config.get("n_list", 1))
+    template_name = config.get("template_name", "reference")
+    cross_region_inflation = float(config.get("cross_region_inflation", 10.0))
+
+    sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
+        template_full, annotations_full, stride=stride, region_bbox=None,
+    )
+    reference_ccf = reference_ccf_from_subvolume(
+        sub_volume, voxel_offset, voxel_scale_mm, threshold,
+    )
+    reference_nodes_mm = torch.tensor(reference_ccf, dtype=torch.float32)
+    coord_mean = reference_nodes_mm.mean(dim=0)
+    coord_std = reference_nodes_mm.std(dim=0).clamp(min=1e-6)
+    reference_nodes = ((reference_nodes_mm - coord_mean) / coord_std).to(device)
+
+    # Same graph key composition the training run + sweep used.
+    graph_key_parts = {
+        "template": template_name,
+        "stride":   stride,
+        "thresh":   threshold,
+        "method":   knn_method,
+        "k":        knn_k,
+        "nlist":    n_list,
+        "bbox":     None,
+    }
+    if knn_method == "anatomical_atlas":
+        graph_key_parts["atlas"] = "annotation_coarse_d4"
+        graph_key_parts["conn"]  = 3
+    graph_key = make_graph_key(graph_key_parts)
+    graphs_cache = KnnGraphCache(cache_dir=knn_dir, verbose=False)
+
+    try:
+        if knn_method == "faiss":
+            knn, edge_index, edge_value = graphs_cache.train_or_load(
+                key=graph_key, method="faiss", coords=reference_nodes,
+                k=knn_k, nlist=n_list, extra=graph_key_parts,
+                device=device, force_recompute=False,
+            )
+        elif knn_method == "anatomical_atlas":
+            if sub_atlas is None:
+                log.warning("anatomical_atlas needs --annotations-file; can't rebuild.")
+                return None
+            knn, edge_index, edge_value = graphs_cache.train_or_load(
+                key=graph_key, method="anatomical_atlas", volume=sub_volume,
+                threshold=threshold, atlas_volume=sub_atlas, connectivity=3,
+                coords=reference_nodes, k=knn_k, nlist=n_list,
+                extra=graph_key_parts, device=device, force_recompute=False,
+            )
+        elif knn_method == "faiss_atlas_weighted":
+            if sub_atlas is None:
+                log.warning("faiss_atlas_weighted needs --annotations-file; can't rebuild.")
+                return None
+            base_parts = dict(graph_key_parts); base_parts["method"] = "faiss"
+            base_key = make_graph_key(base_parts)
+            knn, edge_index, edge_value = graphs_cache.train_or_load(
+                key=base_key, method="faiss", coords=reference_nodes,
+                k=knn_k, nlist=n_list, extra=base_parts,
+                device=device, force_recompute=False,
+            )
+            node_labels = labels_for_nodes_from_sub_atlas(sub_volume, sub_atlas, threshold)
+            edge_index, edge_value, _info = inflate_cross_region_edges(
+                edge_index, edge_value, node_labels,
+                inflation=cross_region_inflation, treat_zero_as_cross=True,
+            )
+            graph_key_parts["weighting"] = f"atlas_x{cross_region_inflation:g}"
+            graph_key = make_graph_key(graph_key_parts)
+        else:
+            log.warning(f"Unknown knn_method: {knn_method}")
+            return None
+    except Exception as e:
+        log.warning(f"KNN cache load failed: {e}")
+        return None
+
+    bw_tensor = torch.tensor(bw, device=device)
+    laplacian_op = GraphLaplacianOperator(
+        edge_value, edge_index, knn.x.shape[0], bw_tensor, norm,
+    )
+    eigvec_key_parts = {
+        "graph": graph_key, "norm": norm, "bw": bw, "modes": num_modes,
+    }
+    ekey = make_eig_key(eigvec_key_parts)
+    solver = LaplacianEigensolver(num_modes=num_modes, verbose=False)
+    try:
+        eigval, eigvec = solver.compute_or_load(
+            laplacian_op, cache_dir=eigvec_dir, key=ekey,
+            graphbandwidth=bw, laplacian_normalization=norm,
+            extra=eigvec_key_parts, force_recompute=False, device=device,
+        )
+    except Exception as e:
+        log.warning(f"Eigvec cache load failed for key={ekey}: {e}")
+        return None
+
+    matern_kernel = RiemannMaternKernel(
+        nu=nu, lengthscale=lengthscale,
+        knn=knn, edge_index=edge_index, edge_value=edge_value,
+        eigval=eigval, eigvec=eigvec,
+        nearest_neighbors=knn_k, laplacian_normalization=norm,
+        num_modes=num_modes,
+        bump_scale=bump_scale, bump_decay=bump_decay,
+        graphbandwidth_init=bw,
+    ).to(device)
+
+    log.info(f"  kernel built: nu={nu} lengthscale={lengthscale} "
+             f"bw={bw} num_modes={num_modes}")
+    return {
+        "matern_kernel": matern_kernel,
+        "coord_mean":    coord_mean.cpu().numpy(),
+        "coord_std":     coord_std.cpu().numpy(),
+        "device":        device,
+        "graphbandwidth": bw,
+        "bump_scale":    bump_scale,
+        "bump_decay":    bump_decay,
+        "lengthscale":   lengthscale,
+        "nu":            nu,
+    }
+
+
+def add_kernel_highlight_layers(
+    viewer, run, layers, args, kernel_pkg,
+    test_voxel: np.ndarray, test_coords_mm: np.ndarray, prefix: str,
+):
+    """Add the highlight + kernel layers for one run.
+
+    Three new layers:
+      - ``highlight_subset``: scatter of N randomly chosen test points,
+        ring-outlined, slightly bigger than the regular markers so they
+        pop out against the prediction layers.
+      - ``active_source``: a single bigger marker at the currently active
+        source within the subset.
+      - ``kernel_at_source``: ALL test points coloured by K(source, point).
+
+    Returns a dict ``{indices, active_idx, refresh_kernel}`` so the prev/next
+    callbacks can change which source is active and re-evaluate the kernel.
+    """
+    import torch
+
+    n_test = test_voxel.shape[0]
+    n_sample = min(int(args["kernel_sample_size"]), n_test)
+    rng = np.random.default_rng(int(args["kernel_seed"]))
+    subset_idx = rng.choice(n_test, size=n_sample, replace=False)
+    subset_idx = np.sort(subset_idx)  # stable navigation order
+
+    highlight_pos = test_voxel[subset_idx].astype(np.float32)
+    state = {"indices": subset_idx, "active_within_subset": 0,
+             "kernel_pkg": kernel_pkg, "test_coords_mm": test_coords_mm}
+
+    # Subset markers — ring outline so they don't drown the underlying
+    # prediction colours. White edge color makes them visible on dark
+    # napari background; size slightly larger than the regular markers.
+    test_size = float(args["point_size"])
+
+    # napari ≥ 0.5 renamed `edge_color`/`edge_width` on Points layers to
+    # `border_color`/`border_width`. Feature-detect via the signature so
+    # we work on both old and new napari without forcing a version pin.
+    import inspect
+    _add_pts_sig = inspect.signature(viewer.add_points)
+    _has_border  = "border_color" in _add_pts_sig.parameters
+    def _outline_kwargs(color, width):
+        if _has_border:
+            return {"border_color": color, "border_width": width}
+        return {"edge_color": color, "edge_width": width}
+
+    highlight_layer = viewer.add_points(
+        highlight_pos,
+        name=f"{prefix}highlight subset ({n_sample}pts)",
+        size=test_size * 1.6,
+        face_color=np.zeros((n_sample, 4), dtype=np.float32),
+        **_outline_kwargs("#ffffff", 0.3),
+        opacity=0.8,
+        blending="translucent",
+        visible=True,
+    )
+
+    active_pos = highlight_pos[0:1].copy()
+    active_layer = viewer.add_points(
+        active_pos,
+        name=f"{prefix}active source",
+        size=test_size * 4.0,
+        face_color="#ffff00",
+        **_outline_kwargs("#ff0000", 0.6),
+        opacity=1.0,
+        blending="translucent",
+        visible=True,
+    )
+
+    # Three kernel layers: bare manifold, Euclidean Matern, and the deployed
+    # composition. The Euclidean one is independent of any cache (analytic
+    # Bessel formula with the same ν/ℓ the run trained with) so it works
+    # whenever kernel_pkg has been built, and provides a baseline that shows
+    # what the bump-Euclidean fallback term contributes.
+    # All three default invisible — toggling any of them on triggers the
+    # eval lazily, and each is independently toggleable.
+    kernel_layer = viewer.add_points(
+        test_voxel.astype(np.float32),
+        name=f"{prefix}K_m manifold (source, ·)",
+        size=test_size,
+        face_color=colors_sequential(
+            np.zeros(n_test, dtype=np.float32), "magma",
+            float(args["gamma"]), vmin=0.0, vmax=1.0,
+        ),
+        opacity=0.9, blending="translucent", visible=False,
+    )
+    kernel_eu_layer = viewer.add_points(
+        test_voxel.astype(np.float32),
+        name=f"{prefix}K_eu Euclidean (source, ·)",
+        size=test_size,
+        face_color=colors_sequential(
+            np.zeros(n_test, dtype=np.float32), "magma",
+            float(args["gamma"]), vmin=0.0, vmax=1.0,
+        ),
+        opacity=0.9, blending="translucent", visible=False,
+    )
+    kernel_full_layer = viewer.add_points(
+        test_voxel.astype(np.float32),
+        name=f"{prefix}K_full deployed (source, ·)",
+        size=test_size,
+        face_color=colors_sequential(
+            np.zeros(n_test, dtype=np.float32), "magma",
+            float(args["gamma"]), vmin=0.0, vmax=1.0,
+        ),
+        opacity=0.9, blending="translucent", visible=False,
+    )
+
+    def _bump(d: "torch.Tensor", scale: float, decay: float) -> "torch.Tensor":
+        """Local copy of the bump function. d is distance to nearest training
+        node; returns b ∈ [0, 1] with the same parametrisation visualize_
+        laplacian.py and RiemannGP.modulation use."""
+        out = torch.zeros_like(d)
+        inside = d < scale
+        if inside.any():
+            u = (d[inside] / scale).clamp(0.0, 1.0 - 1e-6)
+            out[inside] = torch.exp(-decay / (1.0 - u * u)) / float(np.exp(-decay))
+        return out
+
+    def _matern_euclidean_at_src(src_norm: np.ndarray, tgt_norm: np.ndarray,
+                                  nu: float, lengthscale: float) -> np.ndarray:
+        """Euclidean Matern kernel from one source to many targets, evaluated
+        in the same NORMALIZED coordinate frame the manifold kernel uses.
+        Uses scipy's Bessel form so apples-to-apples with the run's ν / ℓ."""
+        from scipy.special import kv, gamma as gamma_fn
+        d = np.linalg.norm(tgt_norm - src_norm[None, :], axis=-1)
+        nu_f = float(nu); ls = float(lengthscale)
+        out = np.ones_like(d, dtype=np.float64)
+        nz = d > 0
+        if nz.any():
+            z = np.sqrt(2.0 * nu_f) * d[nz] / ls
+            # Floor z away from 0 so 0·inf cancellation in z^nu * kv(nu, z)
+            # doesn't produce NaN at near-coincident points.
+            z = np.maximum(z, 1e-12)
+            out[nz] = ((2.0 ** (1.0 - nu_f)) / gamma_fn(nu_f)) * (z ** nu_f) * kv(nu_f, z)
+        return out.astype(np.float32)
+
+    def _update_kernel_layer(layer, vals: np.ndarray):
+        vlo = float(np.percentile(vals, 1.0))
+        vhi = float(np.percentile(vals, 99.0))
+        # Diverging palette when the kernel takes both signs (truncation
+        # artefacts on the manifold path); sequential otherwise.
+        if vlo < -1e-6 and vhi > 1e-6:
+            amax = max(abs(vlo), abs(vhi), 1e-6)
+            layer.face_color = colors_diverging(
+                vals, "RdBu_r", gamma=float(args["gamma"]), amax=amax,
+            )
+        else:
+            layer.face_color = colors_sequential(
+                vals, "magma", float(args["gamma"]),
+                vmin=max(vlo, 0.0), vmax=max(vhi, 1e-6),
+            )
+        layer.refresh()
+
+    def refresh_kernel():
+        """Evaluate whichever of K_m, K_eu, K_full are visible and recolour."""
+        if kernel_pkg is None:
+            return
+        want_m  = kernel_layer.visible
+        want_eu = kernel_eu_layer.visible
+        want_full = kernel_full_layer.visible
+        if not (want_m or want_eu or want_full):
+            return  # nothing to do
+
+        idx = subset_idx[state["active_within_subset"]]
+        src_mm = state["test_coords_mm"][idx]
+        tgt_mm = state["test_coords_mm"]
+        mk = kernel_pkg["matern_kernel"]
+        cm  = kernel_pkg["coord_mean"]
+        cs  = kernel_pkg["coord_std"]
+        device = kernel_pkg["device"]
+        nu = kernel_pkg["nu"]
+        ls = kernel_pkg["lengthscale"]
+        bw_g = kernel_pkg["graphbandwidth"]
+        bs = kernel_pkg["bump_scale"]
+        bd = kernel_pkg["bump_decay"]
+
+        # mm → normalized coords (same transform the training used).
+        src_norm_np = ((src_mm - cm) / cs).astype(np.float32)
+        tgt_norm_np = ((tgt_mm - cm) / cs).astype(np.float32)
+        # K_full needs both K_m and K_eu plus bump weights, so compute
+        # any component another layer depends on even if its own layer is off.
+        need_m  = want_m  or want_full
+        need_eu = want_eu or want_full
+        need_bump = want_full
+
+        try:
+            with torch.no_grad():
+                K_m_vals = None
+                b_src = None
+                b_tgt = None
+                if need_m:
+                    src_n = torch.from_numpy(src_norm_np)[None, :].to(device)
+                    tgt_n = torch.from_numpy(tgt_norm_np).to(device)
+                    feat_src = mk.features(src_n).squeeze(0)
+                    B = 20_000
+                    K_m_vals = np.empty(tgt_n.shape[0], dtype=np.float32)
+                    for s_ in range(0, tgt_n.shape[0], B):
+                        feat_b = mk.features(tgt_n[s_:s_+B])
+                        K_m_vals[s_:s_+B] = (feat_b * feat_src).sum(dim=-1).cpu().numpy()
+                    if need_bump:
+                        # bump radius = bump_scale × graphbandwidth in normalized space
+                        rad = float(bs) * float(bw_g)
+                        ev_src, _ = mk.knn.search(src_n, 1)
+                        d_src_t = ev_src.sqrt().squeeze()
+                        b_src_t = _bump(d_src_t.reshape(1), rad, float(bd))
+                        b_src = float(b_src_t.item())
+                        ev_tgt, _ = mk.knn.search(tgt_n, 1)
+                        d_tgt_t = ev_tgt.sqrt().squeeze(-1)
+                        b_tgt = _bump(d_tgt_t, rad, float(bd)).cpu().numpy().astype(np.float32)
+
+                K_eu_vals = None
+                if need_eu:
+                    K_eu_vals = _matern_euclidean_at_src(
+                        src_norm_np, tgt_norm_np, nu, ls,
+                    )
+
+                K_full_vals = None
+                if want_full:
+                    K_full_vals = (
+                        b_src * K_m_vals * b_tgt
+                        + (1.0 - b_src) * (1.0 - b_tgt) * K_eu_vals
+                    ).astype(np.float32)
+        except Exception as e:
+            logging.getLogger("viz").warning(f"Kernel eval failed: {e}")
+            return
+
+        if want_m   and K_m_vals    is not None: _update_kernel_layer(kernel_layer,      K_m_vals)
+        if want_eu  and K_eu_vals   is not None: _update_kernel_layer(kernel_eu_layer,   K_eu_vals)
+        if want_full and K_full_vals is not None: _update_kernel_layer(kernel_full_layer, K_full_vals)
+
+    def recolor_on_toggle(event):
+        # Any of the three becoming visible triggers a refresh — refresh
+        # itself only computes what's actually needed.
+        if kernel_layer.visible or kernel_eu_layer.visible or kernel_full_layer.visible:
+            refresh_kernel()
+    kernel_layer.events.visible.connect(recolor_on_toggle)
+    kernel_eu_layer.events.visible.connect(recolor_on_toggle)
+    kernel_full_layer.events.visible.connect(recolor_on_toggle)
+
+    def set_active(within_subset_idx: int):
+        within_subset_idx = int(within_subset_idx) % n_sample
+        state["active_within_subset"] = within_subset_idx
+        active_layer.data = highlight_pos[within_subset_idx:within_subset_idx + 1].copy()
+        refresh_kernel()
+
+    layers["highlight_subset"]   = highlight_layer
+    layers["active_source"]      = active_layer
+    layers["kernel_at_source"]   = kernel_layer
+    layers["kernel_eu_source"]   = kernel_eu_layer
+    layers["kernel_full_source"] = kernel_full_layer
+    layers["_highlight_state"]   = state
+    layers["_set_active_src"]    = set_active
+    layers["_refresh_kernel"]    = refresh_kernel
+
+    logging.getLogger("viz").info(
+        f"  highlight: {n_sample} test points sampled, source 0 active"
+    )
+
+
+def add_run_layers(viewer, run, prefix, args, start_lipid_idx=None,
+                   kernel_pkg=None):
     """Create the layer set for one run.
 
     ``start_lipid_idx`` overrides the args-derived "initial lipid" — used
     when SWITCHING runs so the new layers come up coloured for whatever
     lipid the slider is currently on, not for the startup default.
+
+    ``kernel_pkg`` is the dict returned by ``reconstruct_matern_kernel``
+    when --eigenvector-dir was supplied. When non-None we also add the
+    highlight subset + active source + kernel layers; when None we still
+    add the highlight subset (visual only) but skip the kernel layer.
     """
     gamma = args["gamma"]
     test_size = args["point_size"]
@@ -580,6 +1058,20 @@ def add_run_layers(viewer, run, prefix, args, start_lipid_idx=None):
                                               vmin=cr["brain_std"][0],
                                               vmax=cr["brain_std"][1]),
             )
+    # Highlight subset + (optional) kernel layer. Always added so the
+    # subset is visible even when --eigenvector-dir wasn't supplied; the
+    # kernel layer is only meaningful when kernel_pkg is non-None.
+    try:
+        add_kernel_highlight_layers(
+            viewer, run, layers, args, kernel_pkg=kernel_pkg,
+            test_voxel=test_voxel, test_coords_mm=arr["test_coords_mm"],
+            prefix=prefix,
+        )
+    except Exception as e:
+        logging.getLogger("viz").warning(
+            f"Failed to add highlight/kernel layers: {e}"
+        )
+
     layers["current_idx"] = first_idx
     return layers
 
@@ -778,20 +1270,38 @@ def main():
         except Exception as e:
             log.warning(f"Could not load annotations: {e}")
 
+    # Reconstruct the manifold-Matern kernel from each run's config when
+    # --eigenvector-dir is provided. Failure here is non-fatal: the viewer
+    # still works, just without the kernel-overlay layer.
+    kernel_pkg_a = None
+    kernel_pkg_b = None
+    if args.get("eigenvector_dir") and not args.get("no_kernel"):
+        kernel_pkg_a = reconstruct_matern_kernel(run_a, args)
+        if run_b is not None:
+            kernel_pkg_b = reconstruct_matern_kernel(run_b, args)
+    elif args.get("no_kernel"):
+        log.info("--no-kernel set: skipping kernel reconstruction.")
+    else:
+        log.info("--eigenvector-dir not set: highlight subset added, but kernel layer disabled.")
+
     # Mutable state shared across widgets. Wrapping the per-run objects
     # in lists so the closures below can re-assign them when the user
     # navigates between runs without ``nonlocal`` everywhere.
     state = {
         "run_a": run_a,
-        "layers_a": add_run_layers(viewer, run_a, prefix="A: ", args=args),
+        "layers_a": add_run_layers(viewer, run_a, prefix="A: ", args=args,
+                                   kernel_pkg=kernel_pkg_a),
         "metrics_a": None,
         "run_idx": current_run_idx,
+        "kernel_pkg_a": kernel_pkg_a,
+        "kernel_pkg_b": kernel_pkg_b,
     }
 
     # Run B (the optional comparison) is NOT touched by the navigation —
     # the navigation cycles only run A. This keeps a stable baseline for
     # whatever B is set to.
-    layers_b = (add_run_layers(viewer, run_b, prefix="B: ", args=args)
+    layers_b = (add_run_layers(viewer, run_b, prefix="B: ", args=args,
+                               kernel_pkg=kernel_pkg_b)
                 if run_b else None)
 
     import pandas as pd
@@ -1108,11 +1618,18 @@ def main():
         snap = _snapshot_layer_state(state["layers_a"])
         _remove_layers(state["layers_a"])
         new_run = load_run(all_runs[new_idx])
+        # Rebuild the kernel for the new run — its config may differ from
+        # the previous one (different knn_method / num_modes / etc).
+        new_kernel_pkg = None
+        if args.get("eigenvector_dir") and not args.get("no_kernel"):
+            new_kernel_pkg = reconstruct_matern_kernel(new_run, args)
+        state["kernel_pkg_a"] = new_kernel_pkg
         # Clamp to the new run's lipid count.
         new_n = max(1, len(new_run["lipid_names"]))
         start_lipid = min(current_lipid_idx, new_n - 1)
         new_layers = add_run_layers(viewer, new_run, prefix="A: ", args=args,
-                                    start_lipid_idx=start_lipid)
+                                    start_lipid_idx=start_lipid,
+                                    kernel_pkg=new_kernel_pkg)
         _apply_layer_state(new_layers, snap)
         state["run_a"] = new_run
         state["layers_a"] = new_layers
@@ -1185,12 +1702,41 @@ def main():
         target = (state["run_idx"] + 1) % len(all_runs)
         _rebind_to_run(target)
 
+    # Source navigation within the highlight subset. These only do anything
+    # when the highlight layers exist (which they do unless add_run_layers
+    # raised during the kernel/highlight step). Cycles through the subset
+    # and — when the kernel layer is visible — re-evaluates K(src, ·).
+    def _step_source(delta: int):
+        layers = state["layers_a"]
+        set_active = layers.get("_set_active_src")
+        st = layers.get("_highlight_state")
+        if set_active is None or st is None:
+            log.warning("Highlight subset isn't available; skip step.")
+            return
+        new_within = (st["active_within_subset"] + delta) % len(st["indices"])
+        set_active(new_within)
+        # Refresh the info panel too — it shows the active source's test idx.
+        try:
+            _update_info_panel(int(lipid_controls.lipid_idx.value))
+        except Exception:
+            pass
+
+    @magicgui(call_button="◀ prev source")
+    def prev_source():
+        _step_source(-1)
+
+    @magicgui(call_button="next source ▶")
+    def next_source():
+        _step_source(+1)
+
     # ---- Dock all widgets on the right side ----
     viewer.window.add_dock_widget(run_nav, name="run selector", area="right")
     viewer.window.add_dock_widget(prev_run, name="prev", area="right")
     viewer.window.add_dock_widget(next_run, name="next", area="right")
     viewer.window.add_dock_widget(lipid_controls, name="lipid selector",
                                   area="right")
+    viewer.window.add_dock_widget(prev_source, name="prev source", area="right")
+    viewer.window.add_dock_widget(next_source, name="next source", area="right")
     viewer.window.add_dock_widget(info_container, name="info", area="right")
 
     # ---- Visibility hooks: lazy recolor on toggle ----
