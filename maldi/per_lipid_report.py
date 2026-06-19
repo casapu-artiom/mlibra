@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -79,6 +80,21 @@ def _prefix_from_exp(name: str) -> str:
     return name
 
 
+# Leading fold token in a run/exp name, e.g. 'FOLD-3-', 'fold_3-', 'difficult-'.
+_FOLD_PREFIX_RE = re.compile(r"^(fold[-_]?\d+|difficult)[-_]", re.IGNORECASE)
+
+
+def derive_model(run_dir: Path, config: dict | None) -> str:
+    """Full model-configuration label, stable across folds.
+
+    This is the run/exp name with any leading fold token stripped, so the same
+    configuration scored under different folds collapses to one model. Prefers
+    config['exp_name'] (the canonical config string) over the dir name.
+    """
+    name = str((config or {}).get("exp_name") or run_dir.name)
+    return _FOLD_PREFIX_RE.sub("", name, count=1)
+
+
 def load_run(run_dir: Path) -> dict | None:
     """Load one run dir into a record, or None if it has no usable metrics."""
     metrics_path = run_dir / "metrics.csv"
@@ -99,6 +115,7 @@ def load_run(run_dir: Path) -> dict | None:
     return {
         "run": run_dir.name,
         "fold": derive_fold(run_dir, config),
+        "model": derive_model(run_dir, config),
         "kernel_family": (config or {}).get("kernel_family")
         or (summary or {}).get("kernel_family", "?"),
         "failed": (run_dir / "FAILED.txt").exists(),
@@ -147,10 +164,12 @@ def summarise_across_folds(g: pd.DataFrame) -> dict:
 
 
 def build_per_lipid_model(long_df: pd.DataFrame, metric: str) -> pd.DataFrame:
-    """One row per (lipid, model type), aggregating metrics across folds.
+    """One row per (lipid, full model configuration), aggregating across folds.
 
-    Reports mean, median and the min..max range for each metric, plus how many
-    folds contributed.
+    The model key is the full config string (run name minus the fold token), so
+    each row describes how one lipid scores under one specific configuration,
+    pooled over whatever folds ran it. Reports mean, median and the min..max
+    range for each metric, plus how many folds contributed.
     """
     if long_df.empty:
         return pd.DataFrame()
@@ -159,10 +178,11 @@ def build_per_lipid_model(long_df: pd.DataFrame, metric: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     rows = []
-    for (lipid, kernel), g in long_df.groupby([lipid_col, "kernel_family"], dropna=False):
+    for (lipid, model), g in long_df.groupby([lipid_col, "model"], dropna=False):
         row = {
             "lipid": lipid,
-            "kernel_family": kernel,
+            "model": model,
+            "kernel_family": g["kernel_family"].iloc[0],
             "n_folds": g["fold"].nunique(),
             "n_runs": g["run"].nunique(),
         }
@@ -185,7 +205,8 @@ def build_tables(runs: list[dict], metric: str):
         d = r["df"].copy()
         d.insert(0, "run", r["run"])
         d.insert(1, "fold", r["fold"])
-        d.insert(2, "kernel_family", r["kernel_family"])
+        d.insert(2, "model", r["model"])
+        d.insert(3, "kernel_family", r["kernel_family"])
         long_parts.append(d)
     long_df = pd.concat(long_parts, ignore_index=True) if long_parts else pd.DataFrame()
 
