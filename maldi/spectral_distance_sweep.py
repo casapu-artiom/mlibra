@@ -80,9 +80,17 @@ OUTPUTS (resumable — see RESUME)
 --------------------------------
   <out-dir>/rows/<config-slug>.csv   per-config rows (lipid x metric), written
                                      atomically as soon as the config finishes
-  <out-dir>/per_lipid.csv            all rows concatenated
-  <out-dir>/per_config.csv           one row per (config, metric): mean over lipids
-  <out-dir>/ranked.csv               per_config pivoted + sorted by the objective
+
+This script ONLY computes per-config rows — it does NOT aggregate or rank. That
+is a separate step so the sweep can fan out across many one-config jobs (each job
+runs ONE config, writing its own rows/<slug>.csv to a shared dir; see
+submit/run_spectral_distance_sweep.sh). Once the jobs finish, build the report
+with:
+
+  python maldi/spectral_sweep_report.py --out-dir <out-dir> \
+      --objective spectral --rank-stat decay_strength_quantile
+
+which globs rows/*.csv and writes per_lipid.csv / per_config.csv / ranked.csv.
 
 RESUME
 ------
@@ -117,11 +125,14 @@ RUN
       --knn-methods faiss_atlas_weighted --normalizations randomwalk \
       --thresholds 5 --knn-ks 60 120 --bandwidths 0.05 0.1 0.2 \
       --inflations 10 50 --stride-modes 8:1300 4:6000 \
-      --low-modes 64 256 1000 --objective spectral --out-dir ./spectral_sweep
+      --low-modes 64 256 1000 --out-dir ./spectral_sweep
 
   # off-node MALDI points through the bump, sweeping bump scale/decay:
   python spectral_distance_sweep.py ... \
       --feature-mode nystrom --bump-scales 1 2 3 --bump-decays 0.01 0.1
+
+  # then aggregate + rank (separate step; see spectral_sweep_report.py):
+  python spectral_sweep_report.py --out-dir ./spectral_sweep --objective spectral
 """
 from __future__ import annotations
 
@@ -643,88 +654,11 @@ def parse_args():
     p.add_argument("--uniform-min-count", type=int, default=30,
                    help="min pairs per equal-WIDTH bin for the uniform decay Spearman "
                         "(sparse bins dropped; mirrors the notebook Q4b filter)")
-    # ranking / output
-    p.add_argument("--objective", default="spectral",
-                   help="metric to rank configs by (euclidean|geodesic|spectral|"
-                        "spectral_low), or 'spectral_gain' (spectral-euclidean) "
-                        "or 'lowmode_gain' (spectral_low-spectral)")
-    p.add_argument("--rank-stat", default="decay_strength_quantile",
-                   choices=["decay_strength_quantile", "decay_strength_uniform",
-                            "decay_strength", "vario_r2", "cov_curve_corr"],
-                   help="which per-(config,metric) stat to rank by. Default is the "
-                        "equal-count (quantile) binned decay strength — the honest "
-                        "metric robust to spectral-distance pile-up.")
-    p.add_argument("--top", type=int, default=15)
+    # output (ranking/aggregation lives in spectral_sweep_report.py)
     p.add_argument("--out-dir", default="./spectral_sweep")
     p.add_argument("--force", action="store_true",
                    help="recompute configs even if their rows/<slug>.csv exists")
     return p.parse_args()
-
-
-def aggregate_and_rank(per_lipid: pd.DataFrame, a, out_dir: Path):
-    grp = (per_lipid.groupby(["config", "metric"])
-           .agg(metric_modes=("metric_modes", "first"),
-                decay_strength_mean=("decay_strength", "mean"),
-                decay_strength_median=("decay_strength", "median"),
-                decay_strength_quantile_mean=("decay_strength_quantile", "mean"),
-                decay_strength_uniform_mean=("decay_strength_uniform", "mean"),
-                vario_r2_mean=("vario_r2", "mean"),
-                cov_curve_corr_mean=("cov_curve_corr", "mean"),
-                n_lipids=("lipid", "nunique"))
-           .reset_index())
-    cfg_cols = ["config", "knn_method", "normalization", "threshold", "knn_k",
-                "graphbandwidth", "cross_region_inflation", "nu", "lengthscale",
-                "stride", "num_modes", "feature_mode", "bump_scale", "bump_decay",
-                "spectral_norm", "n_nodes", "off_support_frac", "reachable_frac"]
-    cfg_meta = per_lipid[cfg_cols].drop_duplicates("config")
-    per_config = grp.merge(cfg_meta, on="config", how="left")
-    per_config.to_csv(out_dir / "per_config.csv", index=False)
-
-    stat = f"{a.rank_stat}_mean"
-    pivot = per_config.pivot_table(index="config", columns="metric", values=stat)
-    pivot.columns = [f"{stat}__{m}" for m in pivot.columns]
-    ranked = cfg_meta.merge(pivot.reset_index(), on="config", how="left")
-
-    def col(metric):
-        name = f"{stat}__{metric}"
-        if name not in ranked.columns:
-            raise SystemExit(f"objective metric {metric!r} not in results "
-                             f"(have: {[c for c in ranked.columns if c.startswith(stat)]})")
-        return ranked[name]
-
-    if a.objective == "spectral_gain":
-        ranked["objective"] = col("spectral") - col("euclidean")
-    elif a.objective == "lowmode_gain":
-        # spectral_low<N> minus full spectral. With multiple low-mode metrics this
-        # is ambiguous, so require exactly one (else point at a specific name).
-        lows = [c[len(f"{stat}__"):] for c in ranked.columns
-                if c.startswith(f"{stat}__spectral_low")]
-        if len(lows) != 1:
-            raise SystemExit(
-                f"lowmode_gain needs exactly one spectral_low metric, found {lows}. "
-                f"Pass --objective <name> directly (e.g. --objective {lows[0] if lows else 'spectral_low64'}).")
-        ranked["objective"] = col(lows[0]) - col("spectral")
-    else:
-        ranked["objective"] = col(a.objective)
-    ranked = ranked.sort_values("objective", ascending=False)
-    ranked.to_csv(out_dir / "ranked.csv", index=False)
-
-    print("\n" + "=" * 80)
-    print(f"Objective: {a.objective}  (rank-stat: {stat}, higher=better)")
-    best = ranked.iloc[0]
-    print(f"BEST = {best['objective']:.4f}   config: {best['config']}")
-    print("-" * 80)
-    for c in ["knn_method", "normalization", "threshold", "knn_k", "graphbandwidth",
-              "cross_region_inflation", "nu", "lengthscale", "stride", "num_modes",
-              "feature_mode", "bump_scale", "bump_decay", "spectral_norm"]:
-        print(f"  {c:<24} {best[c]}")
-    print("=" * 80)
-    show = (["config", "stride", "num_modes"]
-            + [c for c in ranked.columns if c.startswith(stat)] + ["objective"])
-    with pd.option_context("display.max_columns", None, "display.width", 220):
-        print(f"\nTop {min(a.top, len(ranked))}:\n")
-        print(ranked[show].head(a.top).to_string(index=False))
-    print(f"\n[saved] {out_dir}/per_lipid.csv, per_config.csv, ranked.csv")
 
 
 def main():
@@ -821,23 +755,14 @@ def main():
         log.info(f"[{i}/{n}] DONE {c['_slug']} in {_fmt_dur(dt)} "
                  f"({len(rows)} rows) -> {row_path.name}")
 
-    # aggregate everything on disk (so resumed runs include prior configs)
-    frames = []
-    for c in configs:
-        p = row_path_for(c)
-        if p.exists():
-            try:
-                frames.append(pd.read_csv(p))
-            except Exception as e:
-                log.warning(f"  unreadable {p.name}: {e}")
-    if not frames:
-        print("No results produced.")
-        return
-    per_lipid = pd.concat(frames, ignore_index=True)
-    per_lipid.to_csv(out_dir / "per_lipid.csv", index=False)
+    # No aggregation here: this run only produces per-config rows. Aggregation +
+    # ranking is a separate step (spectral_sweep_report.py) so the sweep can fan
+    # out across many one-config jobs sharing this rows/ dir.
+    n_done = sum(row_path_for(c).exists() for c in configs)
     log.info(f"Total wall: {_fmt_dur(time.time() - t_start)} "
-             f"over {len(frames)} config(s).")
-    aggregate_and_rank(per_lipid, a, out_dir)
+             f"over {len(configs)} config(s); {n_done} rows file(s) present.")
+    log.info(f"Rows in {rows_dir}/*.csv. Build the report with:\n"
+             f"    python maldi/spectral_sweep_report.py --out-dir {out_dir}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Sweep graph params and rank by how cleanly the MALDI lipid data covariance
-# decays along euclidean / geodesic / spectral / spectral_low distance, per lipid.
+# Measure how cleanly the MALDI lipid data covariance decays along euclidean /
+# geodesic / spectral / spectral_low distance, per lipid, for the graph config(s)
+# given by the env vars below. Writes OUT_DIR/rows/<slug>.csv per config; it does
+# NOT aggregate or rank — that is spectral_sweep_report.{py,sh}.
+#
+# With singleton axes this runs ONE config (the batch submitter
+# submit/run_spectral_distance_sweep.sh fans the grid out across one job per
+# config, all writing into a shared OUT_DIR/rows/). Multi-value axes still run a
+# local grid in-process.
 #
 # Every value has a default; override any by exporting it before calling, e.g.
 #     KNN_KS="60 120" BANDWIDTHS="0.05 0.1 0.2" ./spectral_distance_sweep.sh
@@ -62,10 +69,10 @@ set -eu
 # -------------------------------------------------------------------------
 # LOW_MODES: space-separated absolute mode counts -> one spectral_low<N> metric
 # each (e.g. "64 256 1000"). Empty => single spectral_low at LOW_MODE_FRAC.
+# (Ranking lives in spectral_sweep_report.py, so OBJECTIVE/RANK_STAT are no longer
+#  passed here — they belong to spectral_sweep_report.sh.)
 : "${LOW_MODES:=20 50 100 200}"
 : "${LOW_MODE_FRAC:=0.1}"      # used only when LOW_MODES is empty
-: "${OBJECTIVE:=spectral}"     # euclidean|geodesic|spectral|spectral_low<N>|spectral_gain|lowmode_gain
-: "${RANK_STAT:=decay_strength}"
 : "${VARIO_ANCHORS:=1000}"
 : "${VARIO_MAX_TARGETS:=4000}"
 : "${N_BINS:=24}"
@@ -98,8 +105,6 @@ python "$SRC_PATH/maldi/spectral_distance_sweep.py" \
     --bump-decays $BUMP_DECAYS \
     ${LOW_MODES:+--low-modes $LOW_MODES} \
     --low-mode-frac "$LOW_MODE_FRAC" \
-    --objective "$OBJECTIVE" \
-    --rank-stat "$RANK_STAT" \
     --vario-anchors "$VARIO_ANCHORS" \
     --vario-max-targets "$VARIO_MAX_TARGETS" \
     --n-bins "$N_BINS" \
