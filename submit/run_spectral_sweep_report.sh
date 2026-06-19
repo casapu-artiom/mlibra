@@ -29,17 +29,24 @@ IMAGE=${IMAGE:-artiomartiom/sdsc:maldi_manifold_latest}
 SRC_PATH="/myhome/mlibra"
 S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/spectral_sweep"
 
-if [ -z "${EXP_SUFFIX:-}" ]; then
-    echo "ERROR: set EXP_SUFFIX=<batch suffix> (the one printed by run_spectral_distance_sweep.sh)" >&2
-    exit 1
+# Target dir: S3_OUT_DIR wins (point it at any rows dir, e.g. a prior run's
+#   /s3/mlibra/mlibra-data/artiom/spectral_sweep/spectral_sweep ), else derive it
+# from EXP_SUFFIX (the suffix printed by run_spectral_distance_sweep.sh).
+if [ -z "${S3_OUT_DIR:-}" ]; then
+    if [ -z "${EXP_SUFFIX:-}" ]; then
+        echo "ERROR: set S3_OUT_DIR=<rows dir> or EXP_SUFFIX=<batch suffix>" >&2
+        exit 1
+    fi
+    S3_OUT_DIR="${S3_OUTPUT_DIR}/${EXP_SUFFIX}"
 fi
-S3_OUT_DIR="${S3_OUTPUT_DIR}/${EXP_SUFFIX}"
+# job-name component must be k8s-safe (lowercase alphanumeric + '-')
+JOB_TAG=$(echo "${EXP_SUFFIX:-$(basename "$S3_OUT_DIR")}" | tr '_/.' '-')
 
 OBJECTIVE=${OBJECTIVE:-spectral}
 RANK_STAT=${RANK_STAT:-decay_strength_quantile}
 TOP=${TOP:-20}
 
-JOB_NAME=${JOB_NAME:-"spec-report-${EXP_SUFFIX}"}
+JOB_NAME=${JOB_NAME:-"spec-report-${JOB_TAG}"}
 
 echo ">>> Submitting $JOB_NAME  (report over $S3_OUT_DIR)"
 run_or_echo runai training submit "$JOB_NAME" \

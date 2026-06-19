@@ -61,8 +61,22 @@ S3_LIPIDS_FILE="/myhome/mlibra/maldi/data/lipid_subset.txt"
 
 # A per-batch subdir keeps each fan-out's rows together (so the report aggregates
 # one batch). Override EXP_SUFFIX to resume/extend an existing batch.
+#
+# RESUME / reuse past computations: every job skips any config whose
+# rows/<slug>.csv already exists in OUT_DIR (and reuses the cached graph/eigs in
+# EIGENVECTOR_DIR regardless). To extend a PRIOR run, point S3_OUT_DIR at its dir
+# — e.g. the earlier sweep at
+#     /s3/mlibra/mlibra-data/artiom/spectral_sweep/spectral_sweep
+# whose rows/ is already populated:
+#     S3_OUT_DIR=/s3/mlibra/mlibra-data/artiom/spectral_sweep/spectral_sweep \
+#         ./run_spectral_distance_sweep.sh
+# (equivalently EXP_SUFFIX=spectral_sweep). Keep FEATURE_MODE / LOW_MODES the same
+# as that run, or the rows-file identity (slug__metric_tag) changes and nothing is
+# reused.
 EXP_SUFFIX="${EXP_SUFFIX:-$(date +'%y%m%d-%H-%M')}"
-S3_OUT_DIR="${S3_OUTPUT_DIR}/${EXP_SUFFIX}"
+S3_OUT_DIR="${S3_OUT_DIR:-${S3_OUTPUT_DIR}/${EXP_SUFFIX}}"
+# job-name component must be k8s-safe (lowercase alphanumeric + '-')
+JOB_TAG=$(echo "$EXP_SUFFIX" | tr '_/.' '-')
 
 # -------------------------------------------------------------------------
 # Sweep grid (space-separated lists). These are the CONFIG axes — one job per
@@ -95,6 +109,7 @@ submit_one() {
     local job_name=$1; shift
     local method=$1 norm=$2 thr=$3 k=$4 bw=$5 infl=$6 nu=$7 ls=$8 sm=$9
     local bs=${10} bd=${11}
+    shift 11   # drop the config values; remaining "$@" are pass-through flags (e.g. --force)
     runai training submit "$job_name" \
         -i "$IMAGE" \
         --cpu-core-limit "$CPU"     --cpu-core-request   "$CPU" \
@@ -158,7 +173,7 @@ for method in $KNN_METHODS; do
     for bs in $bump_scale_list; do
     for bd in $bump_decay_list; do
         n_submitted=$((n_submitted + 1))
-        job_name="spec-${EXP_SUFFIX}-$(printf '%04d' "$n_submitted")"
+        job_name="spec-${JOB_TAG}-$(printf '%04d' "$n_submitted")"
         echo ">>> [$n_submitted] $job_name  $method/$norm t$thr k$k bw$bw i$infl nu$nu ls$ls $sm bs$bs bd$bd"
         run_or_echo submit_one "$job_name" \
             "$method" "$norm" "$thr" "$k" "$bw" "$infl" "$nu" "$ls" "$sm" "$bs" "$bd" \
