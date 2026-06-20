@@ -63,7 +63,7 @@
 : "${LIPIDS_FILE:=/home/casap/mlibra_git/maldi/data/lipid_subset.txt}"
 
 # ---- Manifold-only ----
-: "${NUM_MODES:=20}"
+: "${NUM_MODES:=1300}"
 # Lanczos Krylov subspace floor. -1 = auto (max(1500, 3*num_modes+20)).
 # At STRIDE=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
 : "${NCV_MIN:=-1}"
@@ -72,10 +72,21 @@
 : "${KNN_METHOD:=faiss_atlas_weighted}"
 : "${CROSS_REGION_INFLATION:=50.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
-: "${BUMP_SCALE:=1.0}"
+: "${BUMP_SCALE:=20.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${GRAPHBANDWIDTH:=0.1}"
 : "${THRESHOLD:=50}"
+# Add the measured MALDI voxels to the graph node set (1=on). Works with
+# KNN_METHOD=faiss and faiss_atlas_weighted (MALDI nodes inherit the region
+# of their nearest atlas node); NOT anatomical_atlas (adjacency-built edges).
+: "${AUGMENT_MALDI_NODES:=1}"
+# Cap on MALDI voxels added (0 = all). The eigensolve workspace is ~ncv*N, so
+# the full measured set (millions) can OOM the GPU — set e.g. 200000 to bound N.
+: "${MAX_MALDI_NODES:=200000}"
+: "${MALDI_SUBSAMPLE_METHOD:=random}"   # random | fps | kmeans_snap
+# Draw inducing points directly from the MALDI nodes (1=on). Defaults to follow
+# AUGMENT_MALDI_NODES so an augmented run's inducing points are MALDI nodes.
+: "${INDUCING_FROM_MALDI_NODES:=$AUGMENT_MALDI_NODES}"
 
 # ---- Lengthscale mode (manifold kernel) ----------------------------------
 # Two modes, selected via FIXED_LENGTHSCALE:
@@ -130,6 +141,7 @@ run_one() {
     local TAG
     if [ "$FAMILY" = "manifold" ]; then
         TAG="manifold-nu${NU_}-K${NMODES_}-stride${STRIDE}-${LS_TAG}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        [ "$AUGMENT_MALDI_NODES" = "1" ] && TAG="${TAG}-augmaldi${MAX_MALDI_NODES}"
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
@@ -153,7 +165,17 @@ run_one() {
         if [ "$FIXED_LENGTHSCALE" = "1" ]; then
             ls_args="--lengthscale-init $LENGTHSCALE_INIT --lengthscale-no-decay"
         fi
+        local augment_args=""
+        if [ "$AUGMENT_MALDI_NODES" = "1" ]; then
+            augment_args="--augment-maldi-nodes \
+                --max-maldi-nodes $MAX_MALDI_NODES \
+                --maldi-subsample-method $MALDI_SUBSAMPLE_METHOD"
+            if [ "$INDUCING_FROM_MALDI_NODES" = "1" ]; then
+                augment_args="$augment_args --inducing-from-maldi-nodes"
+            fi
+        fi
         manifold_args="--eigenvector-dir $EIGENVECTOR_DIR \
+            $augment_args \
             --knn-method $KMETHOD_ \
             --cross-region-inflation $CROSS_REGION_INFLATION \
             --laplacian-norm $LN_ \
