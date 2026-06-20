@@ -30,6 +30,7 @@ from utils import (
     get_data_inducing_points,
     crop_or_stride_volume,
     reference_ccf_from_subvolume,
+    augment_nodes_with_maldi,
 )
 
 def parse_args():
@@ -86,6 +87,9 @@ def parse_args():
     parser.add_argument("--laplacian-norm", dest="laplacian_norm", type=str, default="symmetric",
                         choices=["symmetric", "randomwalk"])
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
+    parser.add_argument("--augment-maldi-nodes", dest="augment_maldi_nodes", action='store_true',
+                        help="Add the measured MALDI voxels to the graph node set so every "
+                             "measured point is an exact graph node (independent of stride).")
     parser.add_argument("--knn-k", dest="knn_k", type=int, default=15, help="Number of knn neighbours for the Graph Laplacian.")
     parser.add_argument("--n-list", type=int, default=1, help="FAISS nlist parameter")
     parser.add_argument("--graphbandwidth-init", dest="graphbandwidth_init", type=float, default=1.0, help="Initial graph bandwidth.")
@@ -171,6 +175,16 @@ def setup_experiment(args):
     reference_nodes = (reference_nodes - coord_mean) / coord_std
     reference_nodes = reference_nodes.to(config.device).contiguous()
 
+    # Optionally add the measured MALDI voxels to the node set BEFORE the KNN
+    # graph is built, so every measurement is an exact graph node (no
+    # Nyström/bump zeroing in grid gaps), independent of stride.
+    augment_maldi = bool(args.get("augment_maldi_nodes", False))
+    if augment_maldi:
+        reference_nodes = augment_nodes_with_maldi(
+            reference_nodes, config.maldi_file, config.section_filter,
+            coord_mean, coord_std,
+        )
+
     # 4. Build (or load) the KNN graph.
     eigenvector_dir = Path(args.get("eigenvector_dir"))
     eigenvector_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +208,19 @@ def setup_experiment(args):
         # The base graph is pure faiss — reuse that cache. Atlas weighting is
         # applied after loading, so we encode it in the eigenvector key only.
         pass
+
+    if augment_maldi:
+        # Augmented graphs have a different node set (and N) than strided-only
+        # ones — key them separately so the KNN/eigenvector caches don't collide.
+        graph_key_parts["augmaldi"] = int(reference_nodes.shape[0])
+        if knn_method in ("anatomical_atlas", "faiss_atlas_weighted"):
+            # These map nodes 1:1 back to strided atlas voxels for region
+            # labels; appended MALDI nodes break that mapping.
+            raise ValueError(
+                f"--augment-maldi-nodes is only supported with --knn-method=faiss "
+                f"(got {knn_method!r}); atlas-label methods assume nodes == strided "
+                f"atlas voxels."
+            )
 
     graph_key = make_graph_key(graph_key_parts)
     logging.info(f"Graph cache key: {graph_key}")

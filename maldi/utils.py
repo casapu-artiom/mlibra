@@ -170,6 +170,78 @@ def get_data_inducing_points(maldi_file, section_filter, num_inducing,
     return inducing_points, coord_mean, coord_std
 
 
+def maldi_voxels_standardized(maldi_file, section_filter, coord_mean, coord_std,
+                              coord_cols=("xccf", "yccf", "zccf"), decimals=6):
+    """Load the measured MALDI voxels and standardize them into the SAME space
+    as the atlas graph nodes (global ``coord_mean`` / ``coord_std``).
+
+    Many MALDI rows share a voxel; identical voxels are collapsed (rounded to
+    ``decimals``). Returns an (M, 3) float32 tensor of unique standardized
+    coordinates. ``section_filter`` is the train filter."""
+    import pandas as pd
+    df = pd.read_parquet(maldi_file, columns=list(coord_cols), filters=section_filter)
+    coords_mm = torch.tensor(df.values, dtype=torch.float32)
+    coords_z = (coords_mm - coord_mean) / coord_std
+    uniq = np.unique(np.round(coords_z.numpy(), decimals), axis=0)
+    return torch.tensor(uniq, dtype=torch.float32)
+
+
+def augment_nodes_with_maldi(reference_nodes, maldi_file, section_filter,
+                             coord_mean, coord_std,
+                             coord_cols=("xccf", "yccf", "zccf"),
+                             max_nodes=None, subsample_method="random",
+                             seed=0, return_mask=False):
+    """Append the actual measured MALDI voxels to the atlas graph nodes BEFORE
+    the KNN graph is built, so every MALDI measurement is an exact graph node
+    regardless of atlas stride.
+
+    Why: in ``RiemannKernel.features`` a query point gets an exact eigenvector
+    only if it coincides with a node (dist^2 < 1e-8); otherwise it is
+    Nyström/bump extended and ZEROED beyond ``bump_scale * graphbandwidth``.
+    Strided atlas nodes rarely coincide with MALDI voxels, so measured points
+    in grid gaps are smeared or dropped. Adding the MALDI voxels to the node
+    set (FAISS then connects them to their neighbours) guarantees on-manifold,
+    exact features for every measured point.
+
+    Parameters
+    ----------
+    reference_nodes : (N, 3) tensor, ALREADY standardized with coord_mean/std.
+    max_nodes : cap on the number of MALDI voxels added. ``None``/<=0 adds them
+        all (can be millions → the eigensolve workspace is ``ncv * N``, so this
+        is the knob to keep N — and GPU memory — bounded). If the measured set
+        is larger, it is subsampled to ``max_nodes`` via ``subsample_method``.
+    subsample_method : 'random' (fast, density-weighted), 'fps' (farthest-point,
+        max spatial coverage; O(N*max_nodes)), or 'kmeans_snap' (k-means
+        centroids snapped to real voxels). See ``_inducing_from_coords``.
+
+    Returns
+    -------
+    nodes : (N + M, 3) tensor on ``reference_nodes.device`` — atlas nodes
+        first, appended MALDI nodes last.
+    maldi_mask : (N + M,) bool tensor (only if ``return_mask``) — True for the
+        appended MALDI-derived nodes (handy for inducing-point selection)."""
+    device = reference_nodes.device
+    ref = reference_nodes.detach().cpu()
+    maldi = maldi_voxels_standardized(maldi_file, section_filter,
+                                      coord_mean, coord_std, coord_cols)
+    if max_nodes is not None and max_nodes > 0 and maldi.shape[0] > max_nodes:
+        n_full = maldi.shape[0]
+        sub = _inducing_from_coords(maldi.numpy(), int(max_nodes),
+                                    method=subsample_method, seed=seed)
+        maldi = torch.tensor(sub, dtype=torch.float32)
+        logging.info(f"[augment] subsampled MALDI voxels {n_full:,} -> "
+                     f"{maldi.shape[0]:,} (method={subsample_method})")
+    n_ref, n_new = ref.shape[0], maldi.shape[0]
+    nodes = torch.cat([ref, maldi], dim=0).to(device).contiguous()
+    logging.info(f"[augment] atlas nodes={n_ref:,} + MALDI nodes={n_new:,} "
+                 f"-> {nodes.shape[0]:,} total")
+    if return_mask:
+        mask = torch.zeros(nodes.shape[0], dtype=torch.bool, device=device)
+        mask[n_ref:] = True
+        return nodes, mask
+    return nodes
+
+
 def get_symmetric_points(reference_image, exp_path, num_inducing, x_median, labels_file):
     """
     Get symmetric inducing points from the reference image.

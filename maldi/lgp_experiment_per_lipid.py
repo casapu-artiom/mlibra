@@ -68,6 +68,7 @@ from utils import (
     get_data_inducing_points,
     crop_or_stride_volume,
     reference_ccf_from_subvolume,
+    augment_nodes_with_maldi,
 )
 
 # Manifold kernel + graph stack. Imports kept identical to
@@ -136,6 +137,13 @@ def parse_args() -> dict:
                    help="(--inducing-source data) on-data selection: "
                         "'kmeans_snap' (default), 'fps' (max coverage), "
                         "'random'.")
+    p.add_argument("--inducing-from-maldi-nodes", dest="inducing_from_maldi_nodes",
+                   action="store_true",
+                   help="(manifold + --augment-maldi-nodes) select the inducing "
+                        "points DIRECTLY from the appended MALDI graph nodes, "
+                        "guaranteeing every inducing point is an exact MALDI node "
+                        "(via --inducing-method). Overrides --inducing-source for "
+                        "the manifold kernel.")
     p.add_argument("--lipid-batch-size", type=int, default=10,
                    help="Number of lipids to fit simultaneously (= "
                         "num_tasks of the multitask GP). Increase this "
@@ -268,6 +276,18 @@ def parse_args() -> dict:
     p.add_argument("--laplacian-norm", default="randomwalk",
                    choices=["symmetric", "randomwalk"])
     p.add_argument("--stride", type=int, default=4)
+    p.add_argument("--augment-maldi-nodes", dest="augment_maldi_nodes", action="store_true",
+                   help="Add the measured MALDI voxels to the graph node set so every "
+                        "measured point is an exact graph node (independent of stride). "
+                        "Supported with --knn-method faiss / faiss_atlas_weighted "
+                        "(not anatomical_atlas).")
+    p.add_argument("--max-maldi-nodes", dest="max_maldi_nodes", type=int, default=0,
+                   help="Cap on MALDI voxels added by --augment-maldi-nodes (0 = all). "
+                        "The eigensolve workspace is ~ncv*N, so use this to bound N "
+                        "(e.g. 200000) when the full measured set blows up GPU memory.")
+    p.add_argument("--maldi-subsample-method", dest="maldi_subsample_method",
+                   default="random", choices=["random", "fps", "kmeans_snap"],
+                   help="How to subsample MALDI voxels down to --max-maldi-nodes.")
     p.add_argument("--knn-k", type=int, default=15)
     p.add_argument("--n-list", type=int, default=1)
     p.add_argument("--graphbandwidth-init", type=float, default=0.1)
@@ -508,6 +528,20 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     reference_nodes = (reference_nodes - coord_mean) / coord_std
     reference_nodes = reference_nodes.to(args["device"]).contiguous()
 
+    # Optionally add the measured MALDI voxels to the node set BEFORE the KNN
+    # graph is built, so every measurement is an exact graph node (no
+    # Nyström/bump zeroing in grid gaps), independent of stride.
+    augment_maldi = bool(args.get("augment_maldi_nodes", False))
+    n_atlas_nodes = reference_nodes.shape[0]   # before any MALDI nodes are added
+    if augment_maldi:
+        reference_nodes = augment_nodes_with_maldi(
+            reference_nodes, config.maldi_file, config.section_filter,
+            coord_mean, coord_std,
+            max_nodes=args.get("max_maldi_nodes", 0),
+            subsample_method=args.get("maldi_subsample_method", "random"),
+            seed=args.get("seed", 0),
+        )
+
     eig_dir = Path(args["eigenvector_dir"])
     eig_dir.mkdir(parents=True, exist_ok=True)
     graph_cache_dir = eig_dir / "knn"
@@ -533,6 +567,19 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         # cache key uses "faiss" so it's shareable with vanilla faiss
         # runs of the same k / stride / threshold).
         pass
+    if augment_maldi:
+        # Augmented graphs have a different node set (and N) than strided-only
+        # ones — key them separately so the KNN/eigenvector caches don't collide.
+        graph_key_parts["augmaldi"] = int(reference_nodes.shape[0])
+        if args["knn_method"] == "anatomical_atlas":
+            # anatomical_atlas builds edges from voxel ADJACENCY over the
+            # strided grid, so appended MALDI coords would get no edges at all.
+            raise ValueError(
+                f"--augment-maldi-nodes is not supported with "
+                f"--knn-method=anatomical_atlas (edges come from strided-voxel "
+                f"adjacency, so MALDI nodes would be disconnected). Use "
+                f"--knn-method=faiss or faiss_atlas_weighted."
+            )
     graph_key = make_graph_key(graph_key_parts)
 
     # Build / load KNN graph
@@ -578,6 +625,14 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         node_labels = labels_for_nodes_from_sub_atlas(
             sub_volume, sub_atlas, args["threshold"],
         )
+        if augment_maldi and reference_nodes.shape[0] > n_atlas_nodes:
+            # The strided grid only labels the first n_atlas_nodes; give each
+            # appended MALDI node the region of its NEAREST strided atlas node.
+            from scipy.spatial import cKDTree
+            atlas_xyz = reference_nodes[:n_atlas_nodes].detach().cpu().numpy()
+            maldi_xyz = reference_nodes[n_atlas_nodes:].detach().cpu().numpy()
+            _, nn = cKDTree(atlas_xyz).query(maldi_xyz, k=1)
+            node_labels = np.concatenate([node_labels, node_labels[nn]])
         if node_labels.shape[0] != knn.x.shape[0]:
             raise RuntimeError(
                 f"Mismatch between labelled voxels ({node_labels.shape[0]}) "
@@ -659,6 +714,10 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         "voxel_offset": voxel_offset,
         "voxel_scale_mm": voxel_scale_mm,
         "template_shape": template_volume.shape,
+        # Node bookkeeping for MALDI-node inducing selection. When augment is
+        # on, nodes [n_atlas_nodes:] are the appended measured MALDI voxels.
+        "augment_maldi": augment_maldi,
+        "n_atlas_nodes": n_atlas_nodes,
     }
 
 
@@ -1730,21 +1789,43 @@ def main():
         manifold_ctx = setup_manifold_kernel(
             args, config, coord_mean, coord_std, log,
         )
-        # Snap the k-means inducing points to the nearest graph nodes so
-        # that every K_uu evaluation uses the exact eigenvector lookup
-        # branch (is_on_graph) rather than the numerically fragile Nyström
-        # OOS path. Mirrors lgp_manifold_experiment.setup_experiment().
-        with torch.no_grad():
-            knn = manifold_ctx["knn"]
-            ind_gpu = inducing_points.to(args["device"])
-            _, nn_idx = knn.search(ind_gpu, 1)       # (M, 1) nearest node
-            nn_idx = nn_idx.squeeze(1).cpu()          # (M,)
-            nn_idx_unique = torch.unique(nn_idx)
-            inducing_points = knn.x[nn_idx_unique].cpu()
-        log.info(
-            f"  Inducing points snapped to graph nodes: "
-            f"{inducing_points.shape[0]} unique (from {config.num_inducing} requested)"
-        )
+        knn = manifold_ctx["knn"]
+        want_maldi_inducing = bool(args.get("inducing_from_maldi_nodes", False))
+        if want_maldi_inducing and manifold_ctx.get("augment_maldi"):
+            # Select the inducing points DIRECTLY from the appended MALDI nodes
+            # (knn.x[n_atlas_nodes:]) so every one is an exact MALDI graph node.
+            from utils import _inducing_from_coords
+            n_atlas = manifold_ctx["n_atlas_nodes"]
+            maldi_nodes = knn.x[n_atlas:].detach().cpu().numpy()
+            sel = _inducing_from_coords(
+                maldi_nodes, config.num_inducing,
+                method=args.get("inducing_method", "kmeans_snap"),
+                seed=args["seed"],
+            )
+            inducing_points = torch.tensor(sel, dtype=torch.float32)
+            log.info(
+                f"  Inducing points drawn from {maldi_nodes.shape[0]:,} MALDI "
+                f"nodes (method={args.get('inducing_method', 'kmeans_snap')}): "
+                f"{inducing_points.shape[0]} (from {config.num_inducing} requested)"
+            )
+        else:
+            if want_maldi_inducing:
+                log.warning("--inducing-from-maldi-nodes ignored: requires "
+                            "--augment-maldi-nodes (no MALDI nodes in the graph).")
+            # Snap the k-means inducing points to the nearest graph nodes so
+            # that every K_uu evaluation uses the exact eigenvector lookup
+            # branch (is_on_graph) rather than the numerically fragile Nyström
+            # OOS path. Mirrors lgp_manifold_experiment.setup_experiment().
+            with torch.no_grad():
+                ind_gpu = inducing_points.to(args["device"])
+                _, nn_idx = knn.search(ind_gpu, 1)       # (M, 1) nearest node
+                nn_idx = nn_idx.squeeze(1).cpu()          # (M,)
+                nn_idx_unique = torch.unique(nn_idx)
+                inducing_points = knn.x[nn_idx_unique].cpu()
+            log.info(
+                f"  Inducing points snapped to graph nodes: "
+                f"{inducing_points.shape[0]} unique (from {config.num_inducing} requested)"
+            )
         config.num_inducing = inducing_points.shape[0]
         inducing_points = inducing_points.to(args["device"])
 

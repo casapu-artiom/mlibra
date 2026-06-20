@@ -7,7 +7,7 @@ from argparse import ArgumentParser
 
 from experiment import MaldiExperiment
 from config import MaldiConfig
-from utils import get_inducing_points
+from utils import get_inducing_points, augment_nodes_with_maldi
 
 # Import the new Manifold classes we added to lgp.py
 from l3di.lgp_manifold import LatentRiemannGP, ManifoldLGP, SpectralLatentGP, SpectralManifoldLGP
@@ -36,6 +36,9 @@ def parse_args():
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=2000, help="Batch size for training")
     parser.add_argument("--load-args", dest="load_args", action='store_true', help="Load arguments from a file instead of command line.")
     parser.add_argument("--use-diffusion", dest="use_diffusion", action='store_true', help="Use diffusion model in the experiment.")
+    parser.add_argument("--augment-maldi-nodes", dest="augment_maldi_nodes", action='store_true',
+                        help="Add the measured MALDI voxels to the graph node set so every "
+                             "measured point is an exact graph node (independent of stride).")
 
     return vars(parser.parse_args())
 
@@ -83,6 +86,14 @@ def setup_experiment(args):
     reference_nodes = torch.tensor(reference_ccf, dtype=torch.float32)
     reference_nodes = (reference_nodes - coord_mean) / coord_std
     reference_nodes = reference_nodes.to(config.device).contiguous()
+
+    # Optionally add the measured MALDI voxels to the node set so every
+    # measurement is an exact graph node (no Nyström/bump zeroing in grid gaps).
+    if args.get("augment_maldi_nodes", False):
+        reference_nodes = augment_nodes_with_maldi(
+            reference_nodes, config.maldi_file, config.section_filter,
+            coord_mean, coord_std,
+        )
 
     # 4. Initialize the Manifold Kernel and compute geometry
     logging.info("Building Riemann Kernel and solving Laplacian Eigenvectors...")
