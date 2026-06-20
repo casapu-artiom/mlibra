@@ -31,6 +31,8 @@ TOL="${TOL:-1e-6}"
 APPROACHES="${APPROACHES:-cupy_sa,cupy_si_cg,scipy_si,lobpcg}"
 SI_SIGMA="${SI_SIGMA:--1e-3}"
 SI_CG_INNER_RTOL="${SI_CG_INNER_RTOL:-1e-6}"
+REFERENCE="${REFERENCE:-auto}"
+MAX_DIRECT_NODES="${MAX_DIRECT_NODES:-2000000}"
 
 # --- paths (override KNN_DIR / OUT_DIR to S3 mounts on the cluster) ---
 KNN_DIR="${KNN_DIR:-/home/casap/mlibra/output/eigenvectors/knn}"
@@ -58,7 +60,10 @@ DEVICE="${DEVICE:-$(python -c 'import torch;print("cuda" if torch.cuda.is_availa
 
 echo "[eigensolver_compare] -> $RUN_DIR  (device=$DEVICE, approaches=$APPROACHES)"
 
-python "${REPO}/maldi/eigensolver_compare.py" \
+# Unbuffer Python: piping through tee makes stdout/stderr block-buffered, which
+# otherwise hides all prints + tqdm bars until a stage finishes (looks "stuck").
+export PYTHONUNBUFFERED=1
+python -u "${REPO}/maldi/eigensolver_compare.py" \
     --knn-dir "$KNN_DIR" \
     --template "$TEMPLATE" \
     --stride "$STRIDE" \
@@ -71,6 +76,8 @@ python "${REPO}/maldi/eigensolver_compare.py" \
     --ncv-min="$NCV_MIN" \
     --tol "$TOL" \
     --approaches "$APPROACHES" \
+    --reference "$REFERENCE" \
+    --max-direct-nodes "$MAX_DIRECT_NODES" \
     --si-sigma="$SI_SIGMA" \
     --si-cg-inner-rtol "$SI_CG_INNER_RTOL" \
     --lobpcg-backend auto \

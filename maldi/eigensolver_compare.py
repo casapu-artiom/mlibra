@@ -589,6 +589,15 @@ def main():
                    help="Disable the Jacobi preconditioner on the inner CG.")
     p.add_argument("--max-dense", type=int, default=6000,
                    help="Use exact dense reference when N <= this.")
+    p.add_argument("--reference", choices=["auto", "none"], default="auto",
+                   help="'auto' = dense (small N) or scipy shift-invert; 'none' "
+                        "= skip the reference and report only the self-contained "
+                        "residual / orthonormality / perf columns (use at very "
+                        "large N where no gold standard is feasible).")
+    p.add_argument("--max-direct-nodes", type=int, default=2_000_000,
+                   help="Above this N, skip the direct-factorization methods "
+                        "(scipy_si, cupy_si) and any scipy reference -- their LU "
+                        "fill-in overflows memory / SuperLU's 32-bit indexing.")
     p.add_argument("--reuse-reference", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="When the reference is scipy shift-invert (large N), "
@@ -660,14 +669,37 @@ def main():
                       else args.lobpcg_backend)
 
     # ---- reference ----
-    print("[compare] computing reference eigenpairs ...")
-    t0 = time.perf_counter()
-    ref_evals, ref_evecs, ref_name = run_reference(
-        L_csr, op, args.modes, args.max_dense, args.tol)
-    ref_wall = time.perf_counter() - t0
-    ref_is_scipy_si = ref_name.startswith("scipy shift-invert")
-    print(f"[compare] reference = {ref_name}  ({ref_wall:.1f}s)")
-    lam_max = float(ref_evals[-1]) if ref_evals[-1] > 0 else lam_max_est
+    # The reference is the "truth" the eval-error and subspace-angle columns are
+    # scored against; the residual / orthonormality / perf columns are
+    # reference-free. At very large N there is no feasible gold standard (dense
+    # is too big, scipy's LU overflows), so --reference none drops the
+    # reference-dependent columns and reports only the self-contained metrics.
+    want_reference = (args.reference != "none")
+    if want_reference and N > args.max_direct_nodes and N > args.max_dense:
+        print(f"[compare] N={N:,} exceeds --max-direct-nodes "
+              f"({args.max_direct_nodes:,}) and --max-dense ({args.max_dense:,}) "
+              f"-- no feasible reference (dense too big, scipy LU would "
+              f"overflow). Proceeding reference-free.")
+        want_reference = False
+
+    if want_reference:
+        print("[compare] computing reference eigenpairs ...")
+        t0 = time.perf_counter()
+        ref_evals, ref_evecs, ref_name = run_reference(
+            L_csr, op, args.modes, args.max_dense, args.tol)
+        ref_wall = time.perf_counter() - t0
+        ref_method = "scipy_si" if ref_name.startswith("scipy") else "dense"
+        print(f"[compare] reference = {ref_name}  ({ref_wall:.1f}s)")
+        lam_max = float(ref_evals[-1]) if ref_evals[-1] > 0 else lam_max_est
+    else:
+        ref_evals = ref_evecs = None
+        ref_name = "none (reference-free metrics only)"
+        ref_method = None
+        ref_wall = 0.0
+        # No reference eigenvalue to set the spectral scale; use a cheap
+        # Gershgorin-style upper bound (2*max diagonal) to normalize residuals.
+        lam_max = lam_max_est
+        print(f"[compare] reference = {ref_name}")
 
     si_ncv = None if args.si_ncv_min <= 0 else args.si_ncv_min
     runners = {
@@ -688,6 +720,16 @@ def main():
         if gpu_only in wanted and not cupy_available:
             print(f"[compare] cupy not available -- skipping {gpu_only}")
             wanted.remove(gpu_only)
+    # Direct-factorization methods (scipy_si, cupy_si) build an LU whose 3D
+    # fill-in blows past memory / SuperLU's 32-bit indexing at large N. Skip
+    # them above the node ceiling rather than crash or hang.
+    if N > args.max_direct_nodes:
+        for direct in ("scipy_si", "cupy_si"):
+            if direct in wanted:
+                print(f"[compare] N={N:,} > --max-direct-nodes "
+                      f"({args.max_direct_nodes:,}) -- skipping {direct} "
+                      f"(direct factorization infeasible at this size).")
+                wanted.remove(direct)
 
     results: Dict[str, dict] = {}
     for name in wanted:
@@ -695,9 +737,10 @@ def main():
         # At large N the reference itself is scipy shift-invert, so running
         # scipy_si as a contestant just solves the same thing again (~minutes).
         # Reuse the reference solve for that row instead of recomputing.
-        if (name == "scipy_si" and args.reuse_reference and ref_is_scipy_si):
-            print("[compare] scipy_si == reference (scipy shift-invert) -- "
-                  "reusing the reference solve, skipping redundant recompute")
+        if (args.reuse_reference and ref_method is not None
+                and name == ref_method):
+            print(f"[compare] {name} == reference ({ref_name}) -- reusing the "
+                  f"reference solve, skipping redundant recompute")
             evals, evecs = ref_evals, ref_evecs
             wall, perf = ref_wall, {}
         else:
@@ -717,28 +760,35 @@ def main():
                 continue
 
         res = per_mode_residual(L_csr, evals, evecs)
-        angles = principal_angles_deg(ref_evecs, evecs)
-        ev_err = np.abs(evals - ref_evals)
         results[name] = {
             "wall_seconds": wall,
             **perf,
-            "eval_abs_err_max": float(ev_err.max()),
-            "eval_abs_err_mean": float(ev_err.mean()),
-            "eval_rel_err_max": float((ev_err / lam_max).max()),
             "residual_abs_max": float(res.max()),
             "residual_abs_mean": float(res.mean()),
             "residual_rel_max": float(res.max() / lam_max),
             "orthonormality_err": orthonormality_error(evecs),
-            "subspace_angle_max_deg": float(angles.max()),
-            "subspace_overlap_mean": float(np.cos(np.radians(angles)).mean()),
             "_per_mode_residual": res,
-            "_eval_abs_err": ev_err,
-            "_angles": np.sort(angles)[::-1],
             "_evals": evals,
         }
+        # Reference-dependent metrics only when we have a reference.
+        if ref_evals is not None:
+            angles = principal_angles_deg(ref_evecs, evecs)
+            ev_err = np.abs(evals - ref_evals)
+            results[name].update({
+                "eval_abs_err_max": float(ev_err.max()),
+                "eval_abs_err_mean": float(ev_err.mean()),
+                "eval_rel_err_max": float((ev_err / lam_max).max()),
+                "subspace_angle_max_deg": float(angles.max()),
+                "subspace_overlap_mean": float(np.cos(np.radians(angles)).mean()),
+                "_eval_abs_err": ev_err,
+                "_angles": np.sort(angles)[::-1],
+            })
 
     # ---- table ----
-    cols = [
+    # Reference-dependent columns are dropped when running reference-free.
+    ref_dependent = {"eval_abs_err_max", "eval_rel_err_max",
+                     "subspace_angle_max_deg"}
+    cols = [c for c in (
         ("wall_seconds", "wall(s)", "{:.2f}"),
         ("eval_abs_err_max", "λ|err|max", "{:.2e}"),
         ("eval_rel_err_max", "λ relerr", "{:.2e}"),
@@ -746,7 +796,7 @@ def main():
         ("residual_rel_max", "resid/λmax", "{:.2e}"),
         ("orthonormality_err", "ortho err", "{:.2e}"),
         ("subspace_angle_max_deg", "maxAngle°", "{:.3f}"),
-    ]
+    ) if ref_evals is not None or c[0] not in ref_dependent]
     perf_cols = [
         ("wall_seconds", "wall(s)", "{:.2f}"),
         ("gpu_util_mean_pct", "gpu%mean", "{:.0f}"),
@@ -808,17 +858,24 @@ def _write_report(out: Path, args, ref_name, N, lam_max, results, wanted):
         print(f"[compare] matplotlib unavailable, skipping plot: {e}")
         return
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    # The eval-error / principal-angle panels only exist with a reference.
+    have_ref = any("_eval_abs_err" in results.get(n, {}) for n in wanted)
+    n_panels = 3 if have_ref else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.3 * n_panels, 4.5),
+                             squeeze=False)
+    axes = axes[0]
     for name in wanted:
         r = results.get(name, {})
         if "failed" in r:
             continue
         axes[0].semilogy(r["_per_mode_residual"], label=name, lw=1.2)
-        axes[1].semilogy(np.maximum(r["_eval_abs_err"], 1e-16), label=name, lw=1.2)
-        axes[2].plot(r["_angles"], label=name, lw=1.2)
+        if have_ref and "_eval_abs_err" in r:
+            axes[1].semilogy(np.maximum(r["_eval_abs_err"], 1e-16), label=name, lw=1.2)
+            axes[2].plot(r["_angles"], label=name, lw=1.2)
     axes[0].set(title="per-mode residual ||Lv-λv||", xlabel="mode", ylabel="residual")
-    axes[1].set(title="per-mode |λ error| vs reference", xlabel="mode", ylabel="abs err")
-    axes[2].set(title="principal angles vs reference", xlabel="rank", ylabel="degrees")
+    if have_ref:
+        axes[1].set(title="per-mode |λ error| vs reference", xlabel="mode", ylabel="abs err")
+        axes[2].set(title="principal angles vs reference", xlabel="rank", ylabel="degrees")
     for ax in axes:
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3)

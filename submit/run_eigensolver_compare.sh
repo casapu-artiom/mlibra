@@ -28,7 +28,7 @@ fi
 # Cluster resources. A full GPU by default -- eigsh / shift-invert want the
 # memory for the Lanczos basis at high mode counts.
 # -------------------------------------------------------------------------
-MEM=${MEM:-64G}
+MEM=${MEM:-128G}
 CPU=${CPU:-4}
 GPU=${GPU:-1.0}
 IMAGE=${IMAGE:-artiomartiom/sdsc:maldi_manifold_latest}
@@ -96,11 +96,11 @@ submit_one() {
 # volumes, then cached for reuse; set BUILD_IF_MISSING=0 to fail fast instead.
 #            stride thr  k   modes  [bw]  [norm]      [approaches]
 # -------------------------------------------------------------------------
-submit_one      4   50  15   1300
-submit_one      4   50  15   4000
-submit_one      4   50  15   1300   1.0  randomwalk  cupy_sa,cupy_si_cg
+submit_one      4   5  15   1300   1.0  randomwalk  cupy_sa,cupy_si_cg,scipy_si
 # stride=2 is the shift-invert sweet spot (graph auto-built on first run):
-submit_one      2   50  15   1300
+submit_one      2   5  15   1300   1.0  randomwalk  cupy_sa,cupy_si_cg
+submit_one      2   5  15   1300   1.0  randomwalk  cupy_sa,cupy_si_cg
+submit_one      1   5  15   300    1.0  randomwalk  cupy_sa,cupy_si_cg
 
 echo "Submitted $n_submitted jobs. Suffix: $EXP_SUFFIX"
 echo "Outputs: $S3_OUTPUT_DIR/$EXP_SUFFIX/<run_slug>/compare.{json,png,log}"
