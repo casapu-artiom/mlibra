@@ -913,6 +913,10 @@ def _register_hyperpriors(model, likelihood, args, log):
     )
     registered.append("task_noises~SmoothedBox[e^-3,e^0.5]")
 
+    device = next(likelihood.parameters()).device
+    model.to(device)
+    likelihood.to(device)
+
     log.info("  hyperpriors registered: " + "; ".join(registered))
 
 
