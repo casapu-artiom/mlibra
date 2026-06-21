@@ -21,6 +21,7 @@ from manifold_gp.utils.compute_eigenvectors import (
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
     add_faiss_cpu_args, apply_faiss_cpu_args,
+    resolve_nlist, resolve_nprobe,
 )
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
@@ -94,7 +95,13 @@ def parse_args():
                         help="Add the measured MALDI voxels to the graph node set so every "
                              "measured point is an exact graph node (independent of stride).")
     parser.add_argument("--knn-k", dest="knn_k", type=int, default=15, help="Number of knn neighbours for the Graph Laplacian.")
-    parser.add_argument("--n-list", type=int, default=1, help="FAISS nlist parameter")
+    parser.add_argument("--n-list", default="1",
+                        help="FAISS IVF nlist: an int, or 'sqrt' for round(sqrt(N)). "
+                             "sqrt makes the CPU path near-linear (see faiss_bench_report).")
+    parser.add_argument("--n-probe", default="1",
+                        help="FAISS IVF nprobe: an int, or 'sqrt' for round(sqrt(nlist)). "
+                             "For 3D coords a small FIXED value (~8) already gives recall "
+                             "~1.0 at every N; 'sqrt' over-scans (grows with N for no gain).")
     parser.add_argument("--graphbandwidth-init", dest="graphbandwidth_init", type=float, default=1.0, help="Initial graph bandwidth.")
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
@@ -125,6 +132,12 @@ def parse_args():
         help="Restrict reconstruction to these lipids. Accepts indices (0 5 10) "
             "or names ('PA 36:4' 'PE 40:7'). Default: all lipids.",
     )
+
+    parser.add_argument("--force-recompute-graph", dest="force_recompute_graph",
+                        action="store_true",
+                        help="Ignore the cached KNN graph and rebuild it from "
+                             "scratch (needed to actually time graph construction, "
+                             "e.g. under --faiss-cpu-graph).")
 
     add_faiss_cpu_args(parser)
 
@@ -161,7 +174,8 @@ def setup_experiment(args):
     threshold            = args.get("threshold", 5)
     stride               = args.get("stride", 4)
     knn_k                = args.get("knn_k", 15)
-    nlist                = args.get("n_list", 1)
+    nlist_spec           = args.get("n_list", "1")    # int or 'sqrt'; resolved below
+    nprobe_spec          = args.get("n_probe", "1")   # int or 'sqrt'; resolved below
     num_modes            = args.get("num_modes", 200)
     bump_scale           = args.get("bump_scale", 20.0)
     bump_decay           = args.get("bump_decay", 0.01)
@@ -190,6 +204,12 @@ def setup_experiment(args):
             coord_mean, coord_std,
         )
 
+    # Resolve IVF nlist/nprobe now that the node count N is fixed (after any
+    # MALDI augmentation). 'sqrt' -> nlist=round(sqrt(N)), nprobe=round(sqrt(nlist)).
+    nlist = resolve_nlist(nlist_spec, reference_nodes.shape[0])
+    nprobe = resolve_nprobe(nprobe_spec, nlist)
+    logging.info(f"FAISS IVF: N={reference_nodes.shape[0]:,} -> nlist={nlist} nprobe={nprobe}")
+
     # 4. Build (or load) the KNN graph.
     eigenvector_dir = Path(args.get("eigenvector_dir"))
     eigenvector_dir.mkdir(parents=True, exist_ok=True)
@@ -203,9 +223,17 @@ def setup_experiment(args):
         "thresh": threshold,
         "method": knn_method,
         "k": knn_k,
-        "nlist": nlist,
         "bbox": None,   # kept (always None) so existing graph/eig cache keys match
     }
+    # nlist/nprobe are IVF index-construction knobs, not graph *content*: with an
+    # adequate nprobe the build has recall ~1.0, so it produces the exact KNN
+    # graph regardless of the specific nprobe (and nlist) value. So we don't key
+    # on nprobe at all, and key on nlist only when it's non-default -- keeping the
+    # default (nlist=1) compatible with caches built before nlist was ever keyed,
+    # while still preventing an approximate IVF build from colliding with the
+    # exact nlist=1 graph.
+    if nlist != 1:
+        graph_key_parts["nlist"] = nlist
     if knn_method == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
         graph_key_parts["conn"] = 3
@@ -239,6 +267,7 @@ def setup_experiment(args):
             coords=reference_nodes,
             k=knn_k,
             nlist=nlist,
+            nprobe=nprobe,
             extra=graph_key_parts,
             force_recompute=bool(args.get("force_recompute_graph", False)),
             device=config.device,
@@ -254,6 +283,7 @@ def setup_experiment(args):
             coords=reference_nodes,
             k=knn_k,
             nlist=nlist,
+            nprobe=nprobe,
             extra=graph_key_parts,
             force_recompute=bool(args.get("force_recompute_graph", False)),
             device=config.device,
@@ -271,6 +301,7 @@ def setup_experiment(args):
             coords=reference_nodes,
             k=knn_k,
             nlist=nlist,
+            nprobe=nprobe,
             extra=base_key_parts,
             force_recompute=bool(args.get("force_recompute_graph", False)),
             device=config.device,

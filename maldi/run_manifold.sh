@@ -46,6 +46,16 @@ FAISS_CPU_ARGS=""
 [ "$FAISS_CPU_SEARCH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-search"
 [ "$FAISS_CPU_RECON" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-recon"
 
+# Force a fresh KNN-graph build (bypass the cache) -- needed to actually time
+# graph construction; otherwise the cached graph is just reloaded.
+: "${FORCE_RECOMPUTE_GRAPH:=0}"
+[ "$FORCE_RECOMPUTE_GRAPH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --force-recompute-graph"
+
+# FAISS IVF sizing. Pass an int or 'sqrt' (nlist=sqrt(N), nprobe=sqrt(nlist)) --
+# 'sqrt' is what makes the CPU path fast at scale (see faiss_bench_report).
+: "${N_LIST:=1}"
+: "${N_PROBE:=1}"
+
 cd $SRC_PATH
 #pip install -e .
 
@@ -92,6 +102,8 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --knn-method $KNN_METHOD \
     --cross-region-inflation $CROSS_REGION_INFLATION \
     --knn-k $KNN_K \
+    --n-list "$N_LIST" \
+    --n-probe "$N_PROBE" \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
     --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \

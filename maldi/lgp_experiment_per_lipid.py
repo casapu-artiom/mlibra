@@ -80,6 +80,7 @@ from manifold_gp.utils.compute_eigenvectors import (
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
     add_faiss_cpu_args, apply_faiss_cpu_args, faiss_cpu_recon,
+    resolve_nlist, resolve_nprobe,
 )
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
@@ -290,7 +291,12 @@ def parse_args() -> dict:
                    default="random", choices=["random", "fps", "kmeans_snap"],
                    help="How to subsample MALDI voxels down to --max-maldi-nodes.")
     p.add_argument("--knn-k", type=int, default=15)
-    p.add_argument("--n-list", type=int, default=1)
+    p.add_argument("--n-list", default="1",
+                   help="FAISS IVF nlist: an int, or 'sqrt' for round(sqrt(N)).")
+    p.add_argument("--n-probe", default="1",
+                   help="FAISS IVF nprobe: an int, or 'sqrt' for round(sqrt(nlist)). "
+                        "For 3D coords a small FIXED value (~8) gives recall ~1.0 at "
+                        "every N; 'sqrt' over-scans (grows with N for no gain).")
     p.add_argument("--graphbandwidth-init", type=float, default=0.1)
     p.add_argument("--bump-scale", type=float, default=20.0)
     p.add_argument("--bump-decay", type=float, default=0.01)
@@ -397,6 +403,12 @@ def parse_args() -> dict:
                    default=True,
                    help="In per-lipid mode this is always on — the "
                         "whole-brain prediction is what the viewer needs.")
+
+    p.add_argument("--force-recompute-graph", dest="force_recompute_graph",
+                   action="store_true",
+                   help="Ignore the cached KNN graph and rebuild it from scratch "
+                        "(needed to time graph construction, e.g. under "
+                        "--faiss-cpu-graph).")
 
     add_faiss_cpu_args(p)
 
@@ -545,6 +557,12 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
             seed=args.get("seed", 0),
         )
 
+    # Resolve IVF nlist/nprobe now that N is fixed (after any MALDI augmentation).
+    # 'sqrt' -> nlist=round(sqrt(N)), nprobe=round(sqrt(nlist)).
+    nlist = resolve_nlist(args.get("n_list", "1"), reference_nodes.shape[0])
+    nprobe = resolve_nprobe(args.get("n_probe", "1"), nlist)
+    log.info(f"FAISS IVF: N={reference_nodes.shape[0]:,} -> nlist={nlist} nprobe={nprobe}")
+
     eig_dir = Path(args["eigenvector_dir"])
     eig_dir.mkdir(parents=True, exist_ok=True)
     graph_cache_dir = eig_dir / "knn"
@@ -557,9 +575,17 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         "thresh": args["threshold"],
         "method": args["knn_method"],
         "k": args["knn_k"],
-        "nlist": args["n_list"],
         "bbox": None,   # kept (always None) so existing graph/eig cache keys match
     }
+    # nlist/nprobe are IVF index-construction knobs, not graph *content*: with an
+    # adequate nprobe the build has recall ~1.0, so it produces the exact KNN
+    # graph regardless of the specific nprobe (and nlist) value. So we don't key
+    # on nprobe at all, and key on nlist only when it's non-default -- keeping the
+    # default (nlist=1) compatible with caches built before nlist was ever keyed,
+    # while still preventing an approximate IVF build from colliding with the
+    # exact nlist=1 graph.
+    if nlist != 1:
+        graph_key_parts["nlist"] = nlist
     if args["knn_method"] == "anatomical_atlas":
         graph_key_parts["atlas"] = "annotation_coarse_d4"
         graph_key_parts["conn"] = 3
@@ -590,8 +616,9 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key, method="faiss",
             coords=reference_nodes,
-            k=args["knn_k"], nlist=args["n_list"],
+            k=args["knn_k"], nlist=nlist, nprobe=nprobe,
             extra=graph_key_parts, device=args["device"],
+            force_recompute=bool(args.get("force_recompute_graph", False)),
         )
     elif args["knn_method"] == "anatomical_atlas":
         knn, edge_index, edge_value = graphs.train_or_load(
@@ -599,8 +626,9 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
             volume=sub_volume, threshold=args["threshold"],
             atlas_volume=sub_atlas, connectivity=3,
             coords=reference_nodes,
-            k=args["knn_k"], nlist=args["n_list"],
+            k=args["knn_k"], nlist=nlist, nprobe=nprobe,
             extra=graph_key_parts, device=args["device"],
+            force_recompute=bool(args.get("force_recompute_graph", False)),
         )
     elif args["knn_method"] == "faiss_atlas_weighted":
         # ---- 1. Get the base faiss graph ---------------------------
@@ -613,8 +641,9 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         knn, edge_index, edge_value = graphs.train_or_load(
             key=base_key, method="faiss",
             coords=reference_nodes,
-            k=args["knn_k"], nlist=args["n_list"],
+            k=args["knn_k"], nlist=nlist, nprobe=nprobe,
             extra=base_key_parts, device=args["device"],
+            force_recompute=bool(args.get("force_recompute_graph", False)),
         )
         # ---- 2. Look up each node's atlas region -------------------
         # Use the helper in anatomical_knn so other models can do the

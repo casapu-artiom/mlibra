@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 import logging
-import os
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,8 +20,10 @@ import faiss.contrib.torch_utils
 # Force-CPU controls (benchmarking knobs; default off -> original behavior)
 # ---------------------------------------------------------------------------
 # Three independent phases can be pinned to CPU FAISS, to time a CPU-only run
-# before committing to a code change. Each can be set from the environment
-# (FAISS_CPU_GRAPH / FAISS_CPU_SEARCH / FAISS_CPU_RECON) or via set_faiss_cpu().
+# before committing to a code change. These are driven purely from the Python
+# CLI (add_faiss_cpu_args / apply_faiss_cpu_args), NOT the environment -- env
+# vars are only the channel between the submit and runner shell scripts, which
+# translate them into the --faiss-cpu-* flags below.
 #
 #   graph  -- build the KNN-graph index on CPU even if coords are CUDA tensors.
 #   search -- run every NearestNeighbors.search() on CPU.
@@ -32,15 +33,7 @@ import faiss.contrib.torch_utils
 # Mechanically the index lives on one device; when a phase asks for CPU but the
 # index is on GPU, search() transparently builds/uses a CPU mirror of the index
 # and moves the (small) query to CPU and the results back to the query device.
-def _envflag(name: str) -> bool:
-    return os.environ.get(name, "").lower() not in ("", "0", "false", "no")
-
-
-_FAISS_CPU = {
-    "graph": _envflag("FAISS_CPU_GRAPH"),
-    "search": _envflag("FAISS_CPU_SEARCH"),
-    "recon": _envflag("FAISS_CPU_RECON"),
-}
+_FAISS_CPU = {"graph": False, "search": False, "recon": False}
 _RECON_ACTIVE = [False]
 
 
@@ -89,12 +82,32 @@ def add_faiss_cpu_args(parser):
 
 
 def apply_faiss_cpu_args(args):
-    """Apply parsed --faiss-cpu-* flags (OR-combined with any env defaults)."""
+    """Apply parsed --faiss-cpu-* flags. Accepts an argparse.Namespace or dict."""
+    get = args.get if isinstance(args, dict) else lambda k, d=False: getattr(args, k, d)
     set_faiss_cpu(
-        graph=getattr(args, "faiss_cpu_graph", False) or _FAISS_CPU["graph"],
-        search=getattr(args, "faiss_cpu_search", False) or _FAISS_CPU["search"],
-        recon=getattr(args, "faiss_cpu_recon", False) or _FAISS_CPU["recon"],
+        graph=bool(get("faiss_cpu_graph", False)),
+        search=bool(get("faiss_cpu_search", False)),
+        recon=bool(get("faiss_cpu_recon", False)),
     )
+
+
+# ---------------------------------------------------------------------------
+# IVF sizing helpers (CLI '--n-list sqrt' / '--n-probe sqrt')
+# ---------------------------------------------------------------------------
+# The benchmarks showed nlist=sqrt(N) with nprobe=sqrt(nlist) makes the CPU
+# path viable (near-linear search) while keeping recall ~1.0 -- nprobe=1 is too
+# aggressive for the k-NN (Nystrom) searches. These resolve the CLI value
+# ('sqrt' or an int) once N (or nlist) is known.
+def resolve_nlist(spec, n: int) -> int:
+    if isinstance(spec, str) and spec.strip().lower() == "sqrt":
+        return max(1, round(n ** 0.5))
+    return max(1, int(spec))
+
+
+def resolve_nprobe(spec, nlist: int) -> int:
+    if isinstance(spec, str) and spec.strip().lower() == "sqrt":
+        return max(1, min(nlist, round(nlist ** 0.5)))
+    return max(1, min(nlist, int(spec)))
 
 
 class NearestNeighbors():
@@ -103,6 +116,10 @@ class NearestNeighbors():
         self.on_gpu = False
         self._nlist = nlist
         self._cpu_idx = None
+        # Default IVF probe count for searches that don't pass one explicitly
+        # (notably the kernel's per-forward search() calls). Set by
+        # KnnGraphCache.train_or_load so all searches share one nprobe.
+        self.nprobe = 1
 
         if x is not None:
             self.train(x, nlist)
@@ -150,7 +167,11 @@ class NearestNeighbors():
             self._cpu_idx = idx
         return self._cpu_idx
 
-    def search(self, x, k, nprobe=1, force_cpu=None):
+    def search(self, x, k, nprobe=None, force_cpu=None):
+        # Fall back to the instance default (set at graph-build time) so the
+        # kernel's no-nprobe search() calls still use the right IVF probe count.
+        if nprobe is None:
+            nprobe = self.nprobe
         # A CPU index must always be queried on CPU; a GPU index is queried on
         # CPU only when a force-CPU phase asks for it.
         want_cpu = (not self.on_gpu) or (
@@ -431,6 +452,7 @@ class KnnGraphCache:
                     if self.verbose:
                         print(f"[knn_graph] HIT  {self.cache_dir}/{key} "
                               f"(N={cached_fp.n_nodes:,}  E={cached_fp.n_edges:,})")
+                    knn.nprobe = nprobe   # propagate to prediction-time searches
                     return knn, ei, ev
  
         # 2. Train fresh
@@ -471,6 +493,7 @@ class KnnGraphCache:
  
          # 3. Save
         self.save(key, knn, ei, ev, method=method, nlist=nlist, extra=extra)
+        knn.nprobe = nprobe   # propagate to prediction-time searches
         return knn, ei, ev
  
     # ----------------------------------------------------------- backends
