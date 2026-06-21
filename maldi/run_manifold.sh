@@ -35,6 +35,17 @@
 : "${LAPLACIAN_NORM:=randomwalk}"
 : "${THRESHOLD:=50}"
 
+# ---- FAISS CPU-only flags (env -> CLI) ------------------------------------
+# The submit script passes FAISS_CPU_* as env vars; here we translate them into
+# the Python --faiss-cpu-* flags. Python reads ONLY the CLI, never the env.
+: "${FAISS_CPU_GRAPH:=0}"
+: "${FAISS_CPU_SEARCH:=0}"
+: "${FAISS_CPU_RECON:=0}"
+FAISS_CPU_ARGS=""
+[ "$FAISS_CPU_GRAPH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-graph"
+[ "$FAISS_CPU_SEARCH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-search"
+[ "$FAISS_CPU_RECON" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-recon"
+
 cd $SRC_PATH
 #pip install -e .
 
@@ -84,4 +95,4 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
     --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
-    $SAMPLING_FLAG "$@"
+    $FAISS_CPU_ARGS $SAMPLING_FLAG "$@"

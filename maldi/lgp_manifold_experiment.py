@@ -18,7 +18,10 @@ from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperato
 from manifold_gp.utils.compute_eigenvectors import (
     LaplacianEigensolver, resolve_ncv_min, make_key as make_eig_key,
 )
-from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as make_graph_key
+from manifold_gp.utils.nearest_neighbors import (
+    KnnGraphCache, make_key as make_graph_key,
+    add_faiss_cpu_args, apply_faiss_cpu_args,
+)
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
 )
@@ -122,6 +125,8 @@ def parse_args():
         help="Restrict reconstruction to these lipids. Accepts indices (0 5 10) "
             "or names ('PA 36:4' 'PE 40:7'). Default: all lipids.",
     )
+
+    add_faiss_cpu_args(parser)
 
     return vars(parser.parse_args())
 
@@ -420,6 +425,10 @@ if __name__ == "__main__":
     logging.info("Starting MALDI experiment with Riemann Manifold")
     args = parse_args()
     logging.info(f"Parsed arguments: {args}")
+
+    # Pin FAISS phases to CPU if requested (benchmarking knob). Graph build
+    # happens inside setup_experiment, so apply the flags before it.
+    apply_faiss_cpu_args(args)
 
     experiment = setup_experiment(args)
     experiment.run()

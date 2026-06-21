@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 import logging
+import os
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,36 +16,160 @@ import faiss
 from torch_sparse import coalesce
 import faiss.contrib.torch_utils
 
+
+# ---------------------------------------------------------------------------
+# Force-CPU controls (benchmarking knobs; default off -> original behavior)
+# ---------------------------------------------------------------------------
+# Three independent phases can be pinned to CPU FAISS, to time a CPU-only run
+# before committing to a code change. Each can be set from the environment
+# (FAISS_CPU_GRAPH / FAISS_CPU_SEARCH / FAISS_CPU_RECON) or via set_faiss_cpu().
+#
+#   graph  -- build the KNN-graph index on CPU even if coords are CUDA tensors.
+#   search -- run every NearestNeighbors.search() on CPU.
+#   recon  -- run searches on CPU only while inside faiss_cpu_recon() (wrapped
+#             around whole-brain reconstruction).
+#
+# Mechanically the index lives on one device; when a phase asks for CPU but the
+# index is on GPU, search() transparently builds/uses a CPU mirror of the index
+# and moves the (small) query to CPU and the results back to the query device.
+def _envflag(name: str) -> bool:
+    return os.environ.get(name, "").lower() not in ("", "0", "false", "no")
+
+
+_FAISS_CPU = {
+    "graph": _envflag("FAISS_CPU_GRAPH"),
+    "search": _envflag("FAISS_CPU_SEARCH"),
+    "recon": _envflag("FAISS_CPU_RECON"),
+}
+_RECON_ACTIVE = [False]
+
+
+def set_faiss_cpu(graph=None, search=None, recon=None):
+    """Toggle the force-CPU phases. None leaves a phase unchanged."""
+    if graph is not None:
+        _FAISS_CPU["graph"] = bool(graph)
+    if search is not None:
+        _FAISS_CPU["search"] = bool(search)
+    if recon is not None:
+        _FAISS_CPU["recon"] = bool(recon)
+
+
+@contextmanager
+def faiss_cpu_recon():
+    """Within this context, searches run on CPU iff the 'recon' phase is set.
+
+    Wrap the whole-brain reconstruction in this so --faiss-cpu-recon pins only
+    reconstruction to CPU, leaving training-time searches on whatever device
+    they would otherwise use.
+    """
+    if not _FAISS_CPU["recon"]:
+        yield
+        return
+    prev = _RECON_ACTIVE[0]
+    _RECON_ACTIVE[0] = True
+    try:
+        yield
+    finally:
+        _RECON_ACTIVE[0] = prev
+
+
+def _search_wants_cpu() -> bool:
+    return _FAISS_CPU["search"] or (_FAISS_CPU["recon"] and _RECON_ACTIVE[0])
+
+
+def add_faiss_cpu_args(parser):
+    """Register --faiss-cpu-{graph,search,recon} on an argparse parser."""
+    parser.add_argument("--faiss-cpu-graph", action="store_true",
+                        help="Force FAISS onto CPU for KNN graph construction.")
+    parser.add_argument("--faiss-cpu-search", action="store_true",
+                        help="Force FAISS onto CPU for all nearest-neighbour searches.")
+    parser.add_argument("--faiss-cpu-recon", action="store_true",
+                        help="Force FAISS onto CPU during whole-brain reconstruction only.")
+    return parser
+
+
+def apply_faiss_cpu_args(args):
+    """Apply parsed --faiss-cpu-* flags (OR-combined with any env defaults)."""
+    set_faiss_cpu(
+        graph=getattr(args, "faiss_cpu_graph", False) or _FAISS_CPU["graph"],
+        search=getattr(args, "faiss_cpu_search", False) or _FAISS_CPU["search"],
+        recon=getattr(args, "faiss_cpu_recon", False) or _FAISS_CPU["recon"],
+    )
+
+
 class NearestNeighbors():
     def __init__(self, x=None, nlist=1) -> None:
         self.min_ivf = 5000
+        self.on_gpu = False
+        self._nlist = nlist
+        self._cpu_idx = None
 
         if x is not None:
             self.train(x, nlist)
 
-    def train(self, x, nlist=1):
+    def train(self, x, nlist=1, force_cpu=None):
         self.x = x
+        self._nlist = nlist
+        self._cpu_idx = None
         (n, d) = self.x.shape
-        if x.device.type == 'cuda':
+
+        use_cpu = _FAISS_CPU["graph"] if force_cpu is None else force_cpu
+        self.on_gpu = (x.device.type == 'cuda') and not use_cpu
+
+        if self.on_gpu:
             res = faiss.StandardGpuResources()
             self.index = faiss.GpuIndexIVFFlat(res, d, nlist, faiss.METRIC_L2) if n >= self.min_ivf else faiss.GpuIndexFlatL2(res, d)
+            train_data = self.x
         else:
             self.index = faiss.IndexIVFFlat(faiss.IndexFlatL2(d), d, nlist) if n >= self.min_ivf else faiss.IndexFlatL2(d)
+            # A CPU index can't ingest a CUDA tensor; mirror coords to host.
+            train_data = self.x if x.device.type == 'cpu' else self.x.detach().cpu().contiguous()
 
         if n >= self.min_ivf:
             assert not self.index.is_trained
-            self.index.train(self.x)
+            self.index.train(train_data)
             assert self.index.is_trained
-        self.index.add(self.x)
+        self.index.add(train_data)
 
         return self
 
-    def search(self, x, k, nprobe=1):
-        if hasattr(self.index, 'nprobe'):
-            self.index.nprobe = nprobe
-        
-        # Faiss-CPU expects numpy arrays, while GPU can take tensors
-        return self.index.search(x, k)
+    def _cpu_index(self):
+        """Lazily build (and cache) a CPU mirror of the index from self.x.
+
+        Used when a search is forced to CPU but the primary index is on GPU.
+        """
+        if self._cpu_idx is None:
+            xc = self.x.detach().cpu().contiguous()
+            n, d = xc.shape
+            if n >= self.min_ivf:
+                idx = faiss.IndexIVFFlat(faiss.IndexFlatL2(d), d, self._nlist)
+                idx.train(xc)
+            else:
+                idx = faiss.IndexFlatL2(d)
+            idx.add(xc)
+            self._cpu_idx = idx
+        return self._cpu_idx
+
+    def search(self, x, k, nprobe=1, force_cpu=None):
+        # A CPU index must always be queried on CPU; a GPU index is queried on
+        # CPU only when a force-CPU phase asks for it.
+        want_cpu = (not self.on_gpu) or (
+            force_cpu if force_cpu is not None else _search_wants_cpu())
+
+        if not want_cpu:
+            # GPU index, GPU search -- original behavior (GPU takes tensors).
+            if hasattr(self.index, 'nprobe'):
+                self.index.nprobe = nprobe
+            return self.index.search(x, k)
+
+        index = self.index if not self.on_gpu else self._cpu_index()
+        if hasattr(index, 'nprobe'):
+            index.nprobe = nprobe
+        q = x if x.device.type == 'cpu' else x.detach().cpu().contiguous()
+        val, idx = index.search(q, k)
+        if x.device.type != 'cpu':
+            val, idx = val.to(x.device), idx.to(x.device)
+        return val, idx
 
     def graph(self, k, symmetric=True, self_loop=False, nprobe=1):
         val, idx = self.search(self.x, k, nprobe)

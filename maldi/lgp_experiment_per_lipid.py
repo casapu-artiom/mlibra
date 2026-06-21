@@ -79,6 +79,7 @@ from manifold_gp.utils.compute_eigenvectors import (
 )
 from manifold_gp.utils.nearest_neighbors import (
     KnnGraphCache, make_key as make_graph_key,
+    add_faiss_cpu_args, apply_faiss_cpu_args, faiss_cpu_recon,
 )
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
@@ -396,6 +397,8 @@ def parse_args() -> dict:
                    default=True,
                    help="In per-lipid mode this is always on — the "
                         "whole-brain prediction is what the viewer needs.")
+
+    add_faiss_cpu_args(p)
 
     return vars(p.parse_args())
 
@@ -1725,6 +1728,7 @@ def main():
     )
     log = logging.getLogger("per_lipid_gp")
     args = parse_args()
+    apply_faiss_cpu_args(args)  # pin FAISS phases to CPU before any graph build
     config = MaldiConfig.from_args(args)
 
     torch.manual_seed(args["seed"])
@@ -2319,9 +2323,11 @@ def main():
         test_mean_z, test_var_z = predict_batched(
             model, log_var_n, coords_te_z, n_tasks=batch_size_actual,
         )
-        brain_mean_z, brain_var_z = predict_batched(
-            model, log_var_n, brain_nodes_z, n_tasks=batch_size_actual,
-        )
+        # faiss_cpu_recon() pins KNN searches to CPU iff --faiss-cpu-recon is set.
+        with faiss_cpu_recon():
+            brain_mean_z, brain_var_z = predict_batched(
+                model, log_var_n, brain_nodes_z, n_tasks=batch_size_actual,
+            )
         pred_sec = time.time() - t0
         log.info(f"  fit={fit_sec:.1f}s pred={pred_sec:.1f}s")
 

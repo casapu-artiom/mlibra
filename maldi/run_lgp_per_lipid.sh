@@ -114,6 +114,17 @@
 
 #cd $SRC_PATH
 
+# ---- FAISS CPU-only flags (env -> CLI) ------------------------------------
+# The submit script passes FAISS_CPU_* as env vars; here we translate them into
+# the Python --faiss-cpu-* flags. Python reads ONLY the CLI, never the env.
+: "${FAISS_CPU_GRAPH:=0}"
+: "${FAISS_CPU_SEARCH:=0}"
+: "${FAISS_CPU_RECON:=0}"
+FAISS_CPU_ARGS=""
+[ "$FAISS_CPU_GRAPH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-graph"
+[ "$FAISS_CPU_SEARCH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-search"
+[ "$FAISS_CPU_RECON" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-recon"
+
 # ---- one-shot launcher (called by the sweep loops too) -----------------
 run_one() {
     local FAMILY=$1; local NU_=$2; local LR_=$3; local EPS_=$4
@@ -248,6 +259,7 @@ run_one() {
         $manifold_args \
         $euc_args \
         $subset_args \
+        $FAISS_CPU_ARGS \
         "${@:15}"
 }
 

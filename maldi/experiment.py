@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import wandb
 from config import MaldiConfig
 from l3di.lgp import LGP
+from manifold_gp.utils.nearest_neighbors import faiss_cpu_recon
 
 def density_scatter(ax, x, y, x_min, x_max, y_min, y_max, bins=50, **kwargs):
     """
@@ -648,10 +649,12 @@ class MaldiExperiment:
         logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
 
         lipid_filter = self._resolve_lipid_filter(lipid_indices, lipid_names)
-        self._reconstruct_voxels(
-            non_zero_indices, volume_path, template_volume.shape, suffix=suffix,
-            lipid_filter=lipid_filter,
-        )
+        # faiss_cpu_recon() pins KNN searches to CPU iff --faiss-cpu-recon is set.
+        with faiss_cpu_recon():
+            self._reconstruct_voxels(
+                non_zero_indices, volume_path, template_volume.shape, suffix=suffix,
+                lipid_filter=lipid_filter,
+            )
         self.render_reconstruction(template_volume, volume_path, lipid_filter, suffix)
 
     def region_reconstruction(self, region_bbox, threshold=5.0,
@@ -672,10 +675,11 @@ class MaldiExperiment:
         non_zero_indices = np.stack([z + zmin, y + ymin, x + xmin], axis=1).astype(np.int32)
         logging.info(f"Region reconstruction: {non_zero_indices.shape[0]:,} voxels in {region_bbox}")
         lipid_filter = self._resolve_lipid_filter(lipid_indices, lipid_names)
-        self._reconstruct_voxels(
-            non_zero_indices, volume_path, template_volume.shape,
-            suffix=f"_region_{bbox_str}", lipid_filter=lipid_filter,
-        )
+        with faiss_cpu_recon():
+            self._reconstruct_voxels(
+                non_zero_indices, volume_path, template_volume.shape,
+                suffix=f"_region_{bbox_str}", lipid_filter=lipid_filter,
+            )
 
 
     def _resolve_lipid_filter(self, lipid_indices=None, lipid_names=None):
