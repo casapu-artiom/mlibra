@@ -16,8 +16,6 @@ from linear_operator.utils.broadcasting import _pad_with_singletons
 from linear_operator.utils.getitem import _noop_index, IndexType
 from linear_operator.utils.memoize import cached
 
-from torch_sparse import transpose, spmm
-
 from torch.nn.functional import normalize
 
 
@@ -111,6 +109,18 @@ class GraphLaplacianOperator(LinearOperator):
         degree_sqrt = self.degree_mat.sqrt()
         return self.adjacency_mat.div(degree_sqrt[self.idx[0, :]]*degree_sqrt[self.idx[1, :]]).div(self.graphbandwidth.square().squeeze())
 
+    @property
+    @cached(name="sparse_laplacian_triu")
+    def sparse_laplacian_triu(self: Float[LinearOperator, "N N"]) -> Tuple[Tensor, Tensor]:
+        # Upper-triangular adjacency as a sparse tensor (and its transpose), so the
+        # symmetric apply in `_matmul` is two sparse-dense matmuls. Cached because
+        # `_matmul` is called repeatedly inside the Lanczos/CG iterations.
+        upper = torch.sparse_coo_tensor(
+            self.idx, self.laplacian_triu,
+            (self.operator_dimension, self.operator_dimension),
+        ).coalesce()
+        return upper, upper.transpose(0, 1).coalesce()
+
     def _matmul(
         self: Float[LinearOperator, "N N"],
         rhs: Union[Float[torch.Tensor, "N C"], Float[torch.Tensor, "N"]],
@@ -120,9 +130,10 @@ class GraphLaplacianOperator(LinearOperator):
         else:
             vec = rhs.contiguous()
 
+        upper, lower = self.sparse_laplacian_triu
         out = vec * self.laplacian_diag.view(-1, 1)
-        out -= spmm(self.idx, self.laplacian_triu, self.operator_dimension, self.operator_dimension, vec)
-        out -= spmm(torch.stack((self.idx[1], self.idx[0]), dim=0), self.laplacian_triu, self.operator_dimension, self.operator_dimension, vec)
+        out -= torch.sparse.mm(upper, vec)
+        out -= torch.sparse.mm(lower, vec)
 
         if self.normalization == "randomwalk":
             out *= self.degree_mat.pow(0.5).view(-1, 1) if self.transposed else self.degree_mat.pow(-0.5).view(-1, 1)

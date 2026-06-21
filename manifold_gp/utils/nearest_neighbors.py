@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import faiss
-from torch_sparse import coalesce
+from torch_geometric.utils import coalesce
 import faiss.contrib.torch_utils
 
 
@@ -204,7 +204,7 @@ class NearestNeighbors():
         if symmetric:
             split = cols > rows
             rows, cols = torch.cat([rows[split], cols[~split]], dim=0), torch.cat([cols[split], rows[~split]], dim=0)
-            idx, val = coalesce(torch.stack([rows, cols], dim=0), torch.cat([val[split], val[~split]]), self.x.shape[0], self.x.shape[0], op='mean')
+            idx, val = coalesce(torch.stack([rows, cols], dim=0), torch.cat([val[split], val[~split]]), num_nodes=self.x.shape[0], reduce='mean')
         else:
             idx = torch.stack([rows, cols], dim=0)
 
