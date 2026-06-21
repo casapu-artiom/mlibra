@@ -11,8 +11,6 @@ protobuf
 pandas
 scipy
 torch
-torch-scatter
-torch-sparse
 # --- Your other project dependencies ---
 gpytorch
 tqdm

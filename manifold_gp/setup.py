@@ -23,11 +23,11 @@ setup(
         "Operating System :: OS Independent",
     ],
     python_requires='>=3.6',
+    # NOTE: torch and faiss-gpu are provided by conda in the runtime image
+    # (see Dockerfile) and intentionally NOT listed here — declaring faiss-gpu
+    # would make pip pull the broken unofficial PyPI package over conda's build.
     install_requires=[
-        "torch",
-        "torch-scatter",
-        "torch-sparse",
-        "faiss-gpu",
+        "torch-geometric",
         "gpytorch"
     ],
     extras_require={
