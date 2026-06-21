@@ -1,3 +1,5 @@
+import math
+
 import gpytorch
 import numpy as np
 import torch
@@ -20,6 +22,64 @@ from tqdm import tqdm
 import wandb
 from linear_operator.operators import (DiagLinearOperator, RootLinearOperator,
                                         LowRankRootLinearOperator, MatmulLinearOperator)
+
+# --------------------------------------------------------------------------- #
+# Hyperparameter priors (MAP-II) for the decoder-ELBO manifold models.
+#
+# Unlike the per-lipid path (lgp_experiment_per_lipid.py), these models put an
+# MLP decoder between the GP latent f and the observations, so the likelihood
+# p(x | f) = N(x | decode(f), σ²) is NOT Gaussian in f. That's why training uses
+# rsample()+decode (a Monte-Carlo ELBO) and CANNOT use gpytorch.VariationalELBO
+# (whose expected_log_prob assumes a likelihood directly Gaussian in f). The one
+# piece that transfers from the per-lipid refactor is the hyperparameter priors:
+# we add log p(θ) to the ELBO so kernel/noise hyperparameters get MAP-II
+# regularization, matching what manifold_informed_train applies to the exact
+# model.
+#
+# The prior objects are stored OUTSIDE the nn.Module graph (in a plain list, not
+# as submodules) and evaluated manually in loss_function — so the model's
+# state_dict is byte-for-byte unchanged and existing checkpoints still load.
+# --------------------------------------------------------------------------- #
+def _build_kernel_hyperpriors(gp_model, lengthscale_prior_mean, device):
+    """Priors on the GP kernel hyperparameters whose natural scale is known for
+    z-scored data: outputscale (signal variance ~1) → Gamma(2,2); lengthscale
+    only if a center is given (its scale is data/constraint-dependent).
+
+    Returns a list of (prior, closure) pairs; ``closure()`` returns the current
+    constrained value. Priors are moved to ``device`` here (they're not module
+    submodules, so .to() on the model won't move them)."""
+    from gpytorch.priors import GammaPrior
+    terms = []
+    covar = getattr(gp_model, "covar_module", None)
+    if isinstance(covar, ScaleKernel):
+        terms.append((GammaPrior(2.0, 2.0).to(device), lambda c=covar: c.outputscale))
+        base = getattr(covar, "base_kernel", None)
+        if (lengthscale_prior_mean is not None and base is not None
+                and hasattr(base, "raw_lengthscale")):
+            conc = 3.0
+            terms.append((
+                GammaPrior(conc, conc / float(lengthscale_prior_mean)).to(device),
+                lambda b=base: b.lengthscale,
+            ))
+    return terms
+
+
+def _make_noise_prior(device):
+    """Soft prior on the observation-noise variance exp(log_var_n) for z-scored
+    outputs: a SmoothedBox over [e^-3, e^0.5] that discourages noise collapse /
+    explosion without a hard clamp."""
+    from gpytorch.priors import SmoothedBoxPrior
+    return SmoothedBoxPrior(math.exp(-3.0), math.exp(0.5), sigma=0.1).to(device)
+
+
+def _eval_hyperprior_logprob(terms, ref):
+    """Sum of prior log-probs over the (prior, closure) ``terms``. ``ref`` is any
+    tensor on the right device/dtype used to seed the accumulator."""
+    lp = ref.new_zeros(())
+    for prior, closure in terms:
+        lp = lp + prior.log_prob(closure()).sum()
+    return lp
+
 
 class BatchedRiemannWrapper(gpytorch.kernels.Kernel):
     def __init__(self, base_kernel):
@@ -153,7 +213,8 @@ class ManifoldLGP(nn.Module):
     End-to-End architecture:
     Manifold Graph Coordinates -> Latent Riemann GP -> MLP -> 172 Channels
     """
-    def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model, use_rsample=True):
+    def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model, use_rsample=True,
+                 hyperpriors=True, lengthscale_prior_mean=None):
         super().__init__()
         self.mode = "manifold_lgp"
         self.use_rsample = use_rsample
@@ -172,6 +233,17 @@ class ManifoldLGP(nn.Module):
         self.float_type = torch.float32
         self.device = device
         self.to(device)
+
+        # Hyperparameter priors (MAP-II). Stored as a plain list — NOT module
+        # submodules — so state_dict / checkpoints are unchanged. See the
+        # helper docstrings above for why VariationalELBO can't be used here.
+        self.hyperpriors = hyperpriors
+        if hyperpriors:
+            terms = _build_kernel_hyperpriors(self.gp_model, lengthscale_prior_mean, device)
+            terms.append((_make_noise_prior(device), lambda: self.log_var_n.exp()))
+            self._hyperprior_terms = terms
+        else:
+            self._hyperprior_terms = []
 
     def build_decoder(self, n_neurons, dropout, activation, input_dim):
         layers = []
@@ -213,6 +285,12 @@ class ManifoldLGP(nn.Module):
         recon_loss = self.nll_loss(x, x_reconstructed, self.log_var_n)
         kl_gp = self.gp_model.variational_strategy.kl_divergence().sum()
         total_loss = recon_loss + beta * kl_gp
+        # MAP-II: subtract log p(θ). Added once per batch at full scale, exactly
+        # like the (full) KL term above, so the prior is weighted consistently
+        # with the KL in this minibatch objective.
+        if self.hyperpriors and self._hyperprior_terms:
+            total_loss = total_loss - _eval_hyperprior_logprob(
+                self._hyperprior_terms, self.log_var_n)
         return total_loss, recon_loss, kl_gp
 
     def nll_loss(self, x, x_reconstructed, log_var_x):
@@ -329,7 +407,8 @@ class SpectralManifoldLGP(nn.Module):
     End-to-End architecture:
     Manifold Graph Coordinates -> Latent Riemann GP -> MLP -> 172 Channels
     """
-    def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model):
+    def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model,
+                 hyperpriors=True, lengthscale_prior_mean=None):
         super().__init__()
         self.mode = "spectral_manifold_lgp"
         self.p = p  # number of channels (e.g., 172)
@@ -347,6 +426,17 @@ class SpectralManifoldLGP(nn.Module):
         self.float_type = torch.float32
         self.device = device
         self.to(device)
+
+        # Hyperparameter priors (MAP-II), stored outside the module graph.
+        # For a SpectralLatentGP gp_model there is no ScaleKernel/outputscale, so
+        # _build_kernel_hyperpriors returns [] and only the noise prior applies.
+        self.hyperpriors = hyperpriors
+        if hyperpriors:
+            terms = _build_kernel_hyperpriors(self.gp_model, lengthscale_prior_mean, device)
+            terms.append((_make_noise_prior(device), lambda: self.log_var_n.exp()))
+            self._hyperprior_terms = terms
+        else:
+            self._hyperprior_terms = []
 
     def build_decoder(self, n_neurons, dropout, activation, input_dim):
         layers = []
@@ -382,14 +472,18 @@ class SpectralManifoldLGP(nn.Module):
 
     def loss_function(self, x, x_reconstructed, beta=1.0):
         recon_loss = self.nll_loss(x, x_reconstructed, self.log_var_n)
-        
+
         # Check if using Spectral GP or Approximate GP
         if hasattr(self.gp_model, 'kl_divergence'):
             kl_gp = self.gp_model.kl_divergence()
         else:
             kl_gp = self.gp_model.variational_strategy.kl_divergence().sum()
-            
+
         total_loss = recon_loss + beta * kl_gp
+        # MAP-II: subtract log p(θ), weighted like the (full) KL term.
+        if self.hyperpriors and self._hyperprior_terms:
+            total_loss = total_loss - _eval_hyperprior_logprob(
+                self._hyperprior_terms, self.log_var_n)
         return total_loss, recon_loss, kl_gp
     
     def train_model(self, exp_path, dataloader, optimizer, epochs, current_epoch, print_every=1000):

@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -389,6 +390,30 @@ def parse_args() -> dict:
                          "long run that may never converge. The "
                          "counter resets on the first fully-clean "
                          "step, so a single recovery clears it."))
+    p.add_argument("--hyperpriors", dest="hyperpriors", action="store_true",
+                   default=True,
+                   help=("Register weakly-informative priors on the GP "
+                         "hyperparameters (signal variance / outputscale and "
+                         "observation noise) so the analytic multitask path "
+                         "does MAP-II rather than ML-II. This matches the "
+                         "regularization the exact manifold_gp model applies "
+                         "via manifold_informed_train, making exact-vs-"
+                         "variational comparisons apples-to-apples. The "
+                         "VariationalELBO folds the prior log-probs in at the "
+                         "correct 1/num_data scale automatically. Default on."))
+    p.add_argument("--no-hyperpriors", dest="hyperpriors", action="store_false",
+                   help=("Disable hyperparameter priors (pure ML-II). Use for "
+                         "A/B comparisons against the --hyperpriors default."))
+    p.add_argument("--lengthscale-prior-mean", dest="lengthscale_prior_mean",
+                   type=float, default=None,
+                   help=("If set (and --hyperpriors), also register a "
+                         "Gamma(3, 3/mean) prior on the base-kernel "
+                         "lengthscale centered at this value. Off by default "
+                         "because the lengthscale's natural scale is data-"
+                         "dependent (it carries a GreaterThan(minimal_length_"
+                         "scale) constraint), so a bad center fights the "
+                         "constraint. Set it explicitly when you know the "
+                         "expected lengthscale for your z-scored coordinates."))
 
     # ---- compatibility scarecrows: accepted but unused ----
     # The l3di MaldiConfig may demand these. We provide harmless defaults
@@ -822,6 +847,89 @@ def _maybe_bail_on_nan_streak(streak, it, args, skip_frac, log, pbar):
     )
 
 
+# Bounds on the log observation-noise variance for z-scored outputs (unit
+# variance by construction). These are the SAME bounds the old manual
+# log_var_n clamp used: -5.0 → σ²≈0.0067 (tight but reachable), +1.5 → σ²≈4.5
+# (genuinely noisy lipids). With the MultitaskGaussianLikelihood they become a
+# hard Interval constraint on task_noises rather than a post-step clamp, so the
+# noise can't leave the safe range regardless of the optimizer or prior.
+NOISE_LOG_MIN, NOISE_LOG_MAX = -5.0, 1.5
+
+
+def _build_task_likelihood(n_tasks: int, device: str):
+    """Per-task Gaussian noise model — the GaussianLikelihood analogue of the
+    old ``log_var_n`` (shape (n_tasks,), independent per task, no cross-task
+    coupling and no shared global noise). ``task_noises`` is the noise VARIANCE
+    per task; initialised to 1.0 to match the old ``log_var_n = 0`` init. The
+    Interval constraint reproduces the old clamp range exactly."""
+    constraint = gpytorch.constraints.Interval(
+        math.exp(NOISE_LOG_MIN), math.exp(NOISE_LOG_MAX)
+    )
+    likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(
+        num_tasks=n_tasks, rank=0,
+        has_global_noise=False, has_task_noise=True,
+        noise_constraint=constraint,
+    ).to(device)
+    with torch.no_grad():
+        likelihood.task_noises = torch.ones(n_tasks, device=device)
+    return likelihood
+
+
+def _register_hyperpriors(model, likelihood, args, log):
+    """Register weakly-informative priors on the GP hyperparameters so the
+    VariationalELBO does MAP-II. The mll picks these up via ``named_priors()``
+    on its (model, likelihood) submodules and adds their log-probs at the
+    correct ``1/num_data`` scale. Priors are placed only on parameters whose
+    natural scale is known a priori for z-scored data:
+
+      • outputscale (signal variance) → ~1   : Gamma(2, 2), mean 1
+      • observation noise (task_noises) → ~1  : SmoothedBox in [e^-3, e^0.5],
+        a soft version of the noise bounds that discourages collapse/explosion
+        without the hard wall doing all the work.
+
+    The lengthscale prior is opt-in (``--lengthscale-prior-mean``) because its
+    scale is data/constraint-dependent."""
+    from gpytorch.priors import GammaPrior, SmoothedBoxPrior
+    registered = []
+
+    covar = getattr(model, "covar_module", None)
+    if isinstance(covar, gpytorch.kernels.ScaleKernel):
+        covar.register_prior("outputscale_prior", GammaPrior(2.0, 2.0),
+                             "outputscale")
+        registered.append("outputscale~Gamma(2,2)")
+        ls_mean = args.get("lengthscale_prior_mean", None)
+        base = getattr(covar, "base_kernel", None)
+        if ls_mean is not None and base is not None and hasattr(base, "raw_lengthscale"):
+            conc = 3.0
+            base.register_prior("lengthscale_prior",
+                                GammaPrior(conc, conc / float(ls_mean)),
+                                "lengthscale")
+            registered.append(f"lengthscale~Gamma(mean={ls_mean})")
+
+    likelihood.register_prior(
+        "task_noise_prior",
+        SmoothedBoxPrior(math.exp(-3.0), math.exp(0.5), sigma=0.1),
+        "task_noises",
+    )
+    registered.append("task_noises~SmoothedBox[e^-3,e^0.5]")
+
+    log.info("  hyperpriors registered: " + "; ".join(registered))
+
+
+def _restore_noise(likelihood, ckpt, device):
+    """Load the per-task noise from a checkpoint into ``likelihood``. Handles
+    both the new format (``likelihood_state``) and pre-VariationalELBO
+    checkpoints that stored a bare ``log_var_n`` tensor (noise = exp(log_var_n),
+    clamped into the constraint's range)."""
+    if "likelihood_state" in ckpt:
+        likelihood.load_state_dict(ckpt["likelihood_state"])
+    elif "log_var_n" in ckpt:
+        with torch.no_grad():
+            likelihood.task_noises = torch.exp(
+                ckpt["log_var_n"].to(device)
+            ).clamp(math.exp(NOISE_LOG_MIN), math.exp(NOISE_LOG_MAX))
+
+
 def train_lipid_batch(
     *,
     coords_train: torch.Tensor,   # (N, 3) on device, already z-scored
@@ -835,35 +943,31 @@ def train_lipid_batch(
     pbar_desc: str,
 ):
     """Build one multitask model with num_tasks=B, run variational SGD,
-    return the trained model + per-task log-variance.
+    return the trained model + per-task Gaussian likelihood.
 
-    Loss formulation mirrors ``LGP.loss_function`` / ``ManifoldLGP.loss_function``
-    in the existing l3di code base, but uses the *analytic* expected-
-    log-likelihood form rather than rsample-then-MC. Two things differ:
+    The objective is the sparse-variational ELBO computed by
+    ``gpytorch.mlls.VariationalELBO`` against a per-task
+    ``MultitaskGaussianLikelihood``. The likelihood's ``task_noises`` (one
+    noise variance per task) is the GaussianLikelihood analogue of LGP's
+    ``log_var_n`` — see :func:`_build_task_likelihood`.
 
-      1. For a Gaussian observation model (which is what LGP's
-         ``log_var_n`` defines), the expected log-likelihood under
-         q(f|x) has a closed form:
-             E_q[(y - f)²] = (y - E_q[f])² + Var_q[f]
-             recon = 0.5 * sum_n ( ((y - mean)² + var) / σ² + log σ² )
-         where mean = q(f|x).mean, var = q(f|x).variance (diagonal),
-         and σ² = exp(log_var_n). This is EXACT for the expectation, not
-         an MC estimator — gradients have zero MC variance, which gives
-         faster convergence than the rsample version used by LGP.
-         The LGP framework can't use this because its MLP decoder
-         breaks the closed form; we can because we go straight from
-         the GP to the Gaussian loss.
-      2. The KL is computed via
-         ``model.variational_strategy.kl_divergence().sum()``
-         (summed over tasks), as in LGP. No likelihood object is
-         constructed because the noise lives in ``log_var_n``, not in
-         a ``GaussianLikelihood``.
+    Loss scale.  ``VariationalELBO`` returns the *per-datum* ELBO
+    (full-data ELBO / num_data). We multiply by ``n_train`` so the loss is
+    on the SAME full-data scale as the old inlined ``(n_train/bs) * recon +
+    kl`` formulation — recon coefficient ``n_train/bs`` and KL coefficient
+    ``1`` are reproduced exactly (verified: the two losses differ only by the
+    gradient-free constant ``0.5·log(2π)·n_tasks·n_train``). Keeping the
+    scale identical means the tuned ``--grad-clip``, learning rate, and
+    bail-out thresholds remain valid.
 
-    Why not use ``gpytorch.mlls.VariationalELBO`` directly? It would do
-    the same math, but it requires a ``GaussianLikelihood`` object that
-    duplicates ``log_var_n``'s role. Inlining the formula keeps
-    ``log_var_n`` as the single source of truth for noise (matching the
-    LGP framework's design) while still getting the closed-form speedup.
+    Why VariationalELBO instead of the previous inlined recon+KL?  It does
+    the same expected-log-likelihood math (``MultitaskGaussianLikelihood.
+    expected_log_prob`` is the analytic ``0.5·sum[((y-mean)²+var)/σ² +
+    logσ²]`` we used to write by hand), but additionally folds in
+    hyperparameter prior log-probs at the correct ``1/num_data`` scale (see
+    :func:`_register_hyperpriors`), turning ML-II into MAP-II. That matches
+    the regularization the exact ``manifold_informed_train`` applies, making
+    exact-vs-variational comparisons apples-to-apples.
     """
     n_tasks = y_train.shape[1]
     n_train = y_train.shape[0]
@@ -919,11 +1023,19 @@ def train_lipid_batch(
                 m.lengthscale = torch.tensor(float(ls_init))
         log.info(f"  lengthscale init = {ls_init}")
 
-    # Per-task learnable log-variance — exactly LGP.log_var_n with p = n_tasks.
-    # Initialised to zero (variance = 1) to match LGP's nn.Parameter(torch.zeros(p)).
-    log_var_n = torch.nn.Parameter(torch.zeros(n_tasks, device=device))
+    # Per-task observation noise model — the GaussianLikelihood analogue of
+    # LGP's log_var_n (task_noises = noise variance per task, init 1.0).
+    likelihood = _build_task_likelihood(n_tasks, device)
+    if args.get("hyperpriors", True):
+        _register_hyperpriors(model, likelihood, args, log)
+
+    # VariationalELBO over the full dataset. num_data=n_train makes the KL and
+    # prior terms full-data-scaled; we multiply the returned per-datum ELBO by
+    # n_train in the loop to recover the old full-data loss scale exactly.
+    mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=n_train)
 
     model.train()
+    likelihood.train()
     if args.get("lengthscale_no_decay", False):
         # keep raw_lengthscale / raw_graphbandwidth out of weight_decay so AdamW
         # doesn't pull the (log-)scale toward its init independent of the data.
@@ -934,12 +1046,12 @@ def train_lipid_batch(
         optimizer = torch.optim.AdamW(
             [{"params": decay, "weight_decay": 1e-3},
              {"params": no_decay, "weight_decay": 0.0},
-             {"params": [log_var_n], "weight_decay": 0.0}],
+             {"params": list(likelihood.parameters()), "weight_decay": 0.0}],
             lr=config.learning_rate,
         )
     else:
         optimizer = torch.optim.AdamW(
-            list(model.parameters()) + [log_var_n],
+            list(model.parameters()) + list(likelihood.parameters()),
             lr=config.learning_rate, weight_decay=1e-3,
         )
 
@@ -965,8 +1077,7 @@ def train_lipid_batch(
             ckpt = torch.load(ckpt_path, map_location=device)
             if ckpt.get("n_tasks") == n_tasks:
                 model.load_state_dict(ckpt["model_state"])
-                with torch.no_grad():
-                    log_var_n.copy_(ckpt["log_var_n"].to(device))
+                _restore_noise(likelihood, ckpt, device)
                 iter_start = int(ckpt.get("iter", 0))
                 log.info(
                     f"  [{pbar_desc}] resumed from "
@@ -1011,16 +1122,9 @@ def train_lipid_batch(
                 desc=pbar_desc, leave=False, dynamic_ncols=True)
     last_recon = float("nan")
     last_kl = float("nan")
-    # Clamp log_var_n to a sane range. The natural scale for z-scored
-    # outputs is variance ~1 (so log_var_n ~0). Values <-10 mean noise
-    # variance of <5e-5 — far below numerical precision for typical
-    # mini-batch residuals, where (y-z)² / exp(-10) overflows fast.
-    # Bounds for log observation noise variance on z-scored outputs (unit
-    # variance by construction). -5.0 → σ²≈0.007 (tight but reachable);
-    # +1.5 → σ²≈4.5 (allows genuinely noisy lipids). The old [-8, 4]
-    # range let AdamW momentum drive log_var_n to exp(-8)≈3e-4, making
-    # the recon term explode on any nonzero residual early in training.
-    log_var_n_min, log_var_n_max = -5.0, 1.5
+    # Observation-noise bounds are enforced by the likelihood's Interval
+    # constraint (see _build_task_likelihood / NOISE_LOG_MIN, NOISE_LOG_MAX),
+    # so there is no manual log_var_n clamp here anymore.
 
     fit_t0 = time.time()
     epoch_t0 = fit_t0
@@ -1051,9 +1155,9 @@ def train_lipid_batch(
     def _save_ckpt(iter_idx):
         """Save the latest in-progress model state to ckpt_path. The
         whole save is a torch.save of a dict including model state,
-        log_var_n, current iter, epoch, and last losses. Atomic via
-        write-to-temp-then-rename so a SIGKILL mid-save doesn't leave
-        a corrupt checkpoint."""
+        likelihood state (per-task noise), current iter, epoch, and last
+        losses. Atomic via write-to-temp-then-rename so a SIGKILL mid-save
+        doesn't leave a corrupt checkpoint."""
         if ckpt_path is None:
             return
         try:
@@ -1061,7 +1165,7 @@ def train_lipid_batch(
             tmp.parent.mkdir(parents=True, exist_ok=True)
             torch.save({
                 "model_state": model.state_dict(),
-                "log_var_n": log_var_n.detach().cpu(),
+                "likelihood_state": likelihood.state_dict(),
                 "iter": iter_idx,
                 "epoch": current_epoch,
                 "recon": last_recon,
@@ -1137,67 +1241,46 @@ def train_lipid_batch(
                         # (unlike a single NaN gradient entry), and sustained
                         # forward failures should trigger the bail-out.
 
-                    # ---- Analytic expected log-likelihood --------------------
-                    # For a Gaussian observation model with noise σ² = exp(log_var_n[t]),
-                    # the expected log-lik under q(f|x) has a closed form that
-                    # does NOT need samples:
+                    # ---- Variational ELBO loss -------------------------------
+                    # gp_posterior is the latent MultitaskMVN q(f|x), shape
+                    # (bs, n_tasks). VariationalELBO computes the analytic
+                    # expected log-likelihood (MultitaskGaussianLikelihood.
+                    # expected_log_prob = the SAME closed form
+                    #   0.5·sum[((y-mean)² + var)/σ² + logσ²]
+                    # we used to inline — exact in the expectation, no MC
+                    # sampling), minus the KL, minus hyperparameter prior
+                    # log-probs, all on a PER-DATUM scale (full ELBO / num_data).
                     #
-                    #   E_q[(y - f)²]      = (y - E_q[f])² + Var_q[f]
-                    #                      = (y - mean)²  + variance
-                    #
-                    #   E_q[-log p(y|f)]   = 0.5 * [ ((y-mean)² + variance) / σ²
-                    #                                 + log(2π σ²) ]
-                    #
-                    # Dropping the y-independent 0.5 * log(2π) (constant, no
-                    # gradient) leaves us with the LGP-style nll_loss but
-                    # with `var` taking the place of the MC noise from a
-                    # single rsample. This is *exact* for the expectation,
-                    # not an estimator — gradients have zero MC variance.
-                    # The LGP framework can't use this because its MLP
-                    # decoder breaks the closed form; we can because we go
-                    # straight from GP to Gaussian loss.
-                    #
-                    # gp_posterior is MultitaskMVN with shape (bs, n_tasks).
-                    # .mean and .variance are both (bs, n_tasks). .variance
-                    # extracts ONLY the diagonal of the posterior covariance,
-                    # which avoids the full Cholesky that rsample requires
-                    # — that's where the per-iter speedup comes from.
-                    mean_f = gp_posterior.mean
-                    var_f = gp_posterior.variance.clamp(min=0)
-                    inv_sigma2 = torch.exp(-log_var_n).unsqueeze(0)  # (1, n_tasks)
-                    recon = 0.5 * torch.sum(
-                        ((y_b - mean_f).pow(2) + var_f) * inv_sigma2
-                        + log_var_n.unsqueeze(0)
-                    )
-
-                    # ---- KL from the variational strategy ----
+                    # Multiplying by n_train recovers the old full-data loss
+                    # scale EXACTLY: recon coefficient n_train/bs and KL
+                    # coefficient 1 (the two losses differ only by the
+                    # gradient-free constant 0.5·log(2π)·n_tasks·n_train). Same
+                    # scale ⇒ the tuned --grad-clip / lr / bail thresholds stay
+                    # valid. The prior log-probs are folded in by the mll at the
+                    # correct 1/num_data scale, so this is MAP-II.
+                    loss = -n_train * mll(gp_posterior, y_b)
+                    # KL alone (cheap) for the progress logs; the data-fit +
+                    # prior remainder is reported as `recon` so the existing
+                    # log/postfix lines stay meaningful.
                     kl = model.variational_strategy.kl_divergence().sum()
-
-                    # ELBO upweighting: the recon was summed over a mini-batch of
-                    # bs points, but the KL is exact (total over all data). To
-                    # keep the gradient unbiased w.r.t. the full-data ELBO, we
-                    # rescale either the KL down by bs/n_train or scale recon up
-                    # by n_train/bs. The LGP scripts use the latter implicitly
-                    # by accumulating recon across all batches in an epoch and
-                    # adding the KL once per batch — we just inline the
-                    # equivalent: minimize (n_train/bs) * recon + kl.
-                    loss = (n_train / bs) * recon + kl
+                    recon = loss.detach() - kl.detach()
 
                     # ---- Loss-NaN: treat same as any forward failure ----
                     # The forward + posterior-NaN check upstream already
                     # catches most kernel ill-conditioning. A NaN here is
-                    # rarer — usually log_var_n drift or KL overflow. Route
+                    # rarer — usually noise drift or KL overflow. Route
                     # it through the same bad-grad streak counter so it
                     # contributes to the bail-out logic uniformly.
                     if not torch.isfinite(loss):
                         bad_grad_count += 1
+                        lvn = likelihood.task_noises.detach().log()
                         _record_error(
                             config, "loss_nan", it,
                             f"loss={loss.item()}, "
                             f"recon={recon.item():.3g}, "
                             f"kl={kl.item():.3g}, "
-                            f"lvn=[{float(log_var_n.min().item()):.2f},"
-                            f"{float(log_var_n.max().item()):.2f}]",
+                            f"lvn=[{float(lvn.min().item()):.2f},"
+                            f"{float(lvn.max().item()):.2f}]",
                             bad_grad_count, log,
                         )
                         optimizer.zero_grad()
@@ -1249,7 +1332,8 @@ def train_lipid_batch(
                     # which parameter had the bad gradient entries.
                     bad_params: list[tuple[str, int]] = []
                     for pname, p in (
-                        list(model.named_parameters()) + [("log_var_n", log_var_n)]
+                        list(model.named_parameters())
+                        + [(f"likelihood.{n}", p_) for n, p_ in likelihood.named_parameters()]
                     ):
                         if p.grad is None:
                             continue
@@ -1298,7 +1382,7 @@ def train_lipid_batch(
                     # Always zero whatever bad entries exist so downstream
                     # grad-clip and optimizer.step() see finite values.
                     if n_bad_grad > 0:
-                        for p in list(model.parameters()) + [log_var_n]:
+                        for p in list(model.parameters()) + list(likelihood.parameters()):
                             if p.grad is None:
                                 continue
                             bad = ~torch.isfinite(p.grad)
@@ -1344,20 +1428,20 @@ def train_lipid_batch(
                     # the analytic ELBO's large gradients at init.
                     grad_clip = float(args.get("grad_clip", 10.0))
                     torch.nn.utils.clip_grad_norm_(
-                        list(model.parameters()) + [log_var_n],
+                        list(model.parameters()) + list(likelihood.parameters()),
                         max_norm=grad_clip,
                     )
 
                     optimizer.step()
-                    # Clamp log_var_n back into a sane range so the noise term
-                    # can't explode/underflow. Done after the step so AdamW's
-                    # update can move freely, then we project.
-                    with torch.no_grad():
-                        log_var_n.clamp_(log_var_n_min, log_var_n_max)
+                    # No manual noise clamp: the likelihood's Interval
+                    # constraint maps raw_task_noises through a sigmoid into
+                    # [e^NOISE_LOG_MIN, e^NOISE_LOG_MAX], so task_noises is
+                    # ALWAYS in range regardless of the optimizer step — this
+                    # replaces the old post-step log_var_n.clamp_.
 
                     # ---- periodic log line (cluster-friendly) -----------------
                     # Visible even when tqdm output is suppressed (non-tty, log
-                    # capture, runai, etc). Includes recon / KL / log_var_n
+                    # capture, runai, etc). Includes recon / KL / log-noise
                     # range / elapsed / ETA so a cluster job log gives a
                     # full picture.
                     if it % log_every == 0 or it == n_iters - 1:
@@ -1365,8 +1449,9 @@ def train_lipid_batch(
                         done = it + 1
                         rate = done / max(elapsed, 1e-9)
                         eta = (n_iters - done) / max(rate, 1e-9)
-                        lvn_min = float(log_var_n.min().item())
-                        lvn_max = float(log_var_n.max().item())
+                        lvn = likelihood.task_noises.detach().log()
+                        lvn_min = float(lvn.min().item())
+                        lvn_max = float(lvn.max().item())
                         log.info(
                             f"  [{pbar_desc}] it {done:>6d}/{n_iters} "
                             f"({100 * done / n_iters:5.1f}%) "
@@ -1393,11 +1478,12 @@ def train_lipid_batch(
                             _save_ckpt(it + 1)
 
                     if (it % max(1, n_iters // 30)) == 0:
+                        lvn = likelihood.task_noises.detach().log()
                         pbar.set_postfix(
                             recon=f"{last_recon:.3g}",
                             kl=f"{last_kl:.3g}",
-                            lvn=f"[{log_var_n.min().item():.2f},"
-                                f"{log_var_n.max().item():.2f}]",
+                            lvn=f"[{lvn.min().item():.2f},"
+                                f"{lvn.max().item():.2f}]",
                         )
 
                     # Advance the global iter counter + progress bar. The
@@ -1428,8 +1514,7 @@ def train_lipid_batch(
                     ckpt = torch.load(ckpt_path, map_location=device)
                     if ckpt.get("n_tasks") == n_tasks:
                         model.load_state_dict(ckpt["model_state"])
-                        with torch.no_grad():
-                            log_var_n.copy_(ckpt["log_var_n"].to(device))
+                        _restore_noise(likelihood, ckpt, device)
                         log.warning(
                             f"  [{pbar_desc}] recovered from "
                             f"{Path(ckpt_path).name} @ iter "
@@ -1439,7 +1524,8 @@ def train_lipid_batch(
                             f"counts this as a failed batch."
                         )
                         model.eval()
-                        return model, log_var_n.detach(), "early_stopped_from_ckpt"
+                        likelihood.eval()
+                        return model, likelihood, "early_stopped_from_ckpt"
                     else:
                         log.warning(
                             f"  [{pbar_desc}] checkpoint n_tasks "
@@ -1465,25 +1551,25 @@ def train_lipid_batch(
     )
 
     model.eval()
-    return model, log_var_n.detach(), "ok"
+    likelihood.eval()
+    return model, likelihood, "ok"
 
 
-def predict_batched(model, log_var_n, x: torch.Tensor, n_tasks: int,
+def predict_batched(model, likelihood, x: torch.Tensor, n_tasks: int,
                     chunk: int = 20_000):
     """Forward in chunks. Returns (mean, var) of the **posterior over
     the latent f**, NOT the predictive over y. We then add the per-task
     observation noise back in at the end.
 
-    Why split f vs y? Because the LGP / ManifoldLGP framework doesn't
-    use a likelihood object — the observation noise lives in
-    ``log_var_n``. To get a predictive variance that's directly
-    comparable to held-out y values, we add ``exp(log_var_n)`` to the
-    latent variance (i.e., predictive variance = q(f|x).variance +
-    obs_noise).
+    Why split f vs y? Downstream metrics want both the latent-f mean and a
+    y-comparable variance. The observation noise lives in the likelihood's
+    per-task ``task_noises`` (the GaussianLikelihood analogue of the old
+    ``log_var_n``); we add it to the latent variance to get the predictive
+    variance over y (= q(f|x).variance + obs_noise).
     """
     means, vars_f = [], []
     n = x.shape[0]
-    obs_var = torch.exp(log_var_n).to(x.device)  # (n_tasks,)
+    obs_var = likelihood.task_noises.detach().to(x.device)  # (n_tasks,)
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         for s in range(0, n, chunk):
             e = min(s + chunk, n)
@@ -2257,7 +2343,7 @@ def main():
 
         t0 = time.time()
         try:
-            model, log_var_n, train_status = train_lipid_batch(
+            model, likelihood, train_status = train_lipid_batch(
                 coords_train=coords_tr_z,
                 y_train=y_tr_z_batch,
                 inducing_points=inducing_points,
@@ -2346,26 +2432,25 @@ def main():
         fit_sec = time.time() - t0
 
         # Predict on test set + brain. predict_batched returns y-space
-        # variance (latent f variance + obs noise from log_var_n), so the
+        # variance (latent f variance + obs noise from the likelihood), so the
         # std arrays we save are comparable to held-out y values.
         t0 = time.time()
         test_mean_z, test_var_z = predict_batched(
-            model, log_var_n, coords_te_z, n_tasks=batch_size_actual,
+            model, likelihood, coords_te_z, n_tasks=batch_size_actual,
         )
         # faiss_cpu_recon() pins KNN searches to CPU iff --faiss-cpu-recon is set.
         with faiss_cpu_recon():
             brain_mean_z, brain_var_z = predict_batched(
-                model, log_var_n, brain_nodes_z, n_tasks=batch_size_actual,
+                model, likelihood, brain_nodes_z, n_tasks=batch_size_actual,
             )
         pred_sec = time.time() - t0
         log.info(f"  fit={fit_sec:.1f}s pred={pred_sec:.1f}s")
 
-        # Save state_dict + log_var_n (one file per batch).
-        # log_var_n IS the noise model — analogous to a GaussianLikelihood's
-        # noise parameter but per-task and outside the gpytorch object.
+        # Save state_dict + likelihood state (one file per batch).
+        # The likelihood's per-task task_noises IS the observation noise model.
         torch.save({
             "model_state": model.state_dict(),
-            "log_var_n": log_var_n.cpu(),  # (n_tasks,)
+            "likelihood_state": likelihood.state_dict(),
             "lipid_global_idx": batch_lipid_global,
             "lipid_names": batch_names,
             "n_tasks": batch_size_actual,
@@ -2437,7 +2522,7 @@ def main():
             log.warning(f"  cleanup of {ckpt_path.name} failed: {ex}")
 
         # Free memory before the next batch
-        del model, log_var_n, test_mean_z, test_var_z
+        del model, likelihood, test_mean_z, test_var_z
         del brain_mean_z, brain_var_z, y_tr_z_batch
         torch.cuda.empty_cache() if args["device"].startswith("cuda") else None
 
