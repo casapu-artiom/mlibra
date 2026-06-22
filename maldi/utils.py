@@ -125,6 +125,78 @@ def _inducing_from_coords(coords, num_inducing, method="kmeans_snap", seed=0):
     return coords[idx]
 
 
+def inducing_blend_density_maldi(graph_coords, maldi_coords, num_inducing,
+                                 density_frac=0.8, density_k=15,
+                                 method="kmeans_snap", seed=0):
+    """Blend inducing points over a FIXED (strided) graph, 80/20 by default.
+
+    The KNN graph is left UNTOUCHED (atlas/strided nodes only — this is *not*
+    node augmentation); the blend only chooses WHERE the inducing points sit:
+
+      * ``density_frac`` (default 0.8) from the DENSEST graph nodes — local
+        density is the inverse mean distance to the ``density_k`` nearest graph
+        neighbours; nodes are sampled with probability proportional to density,
+        so inducing points concentrate where the graph is dense.
+      * the remaining ``1 - density_frac`` (default 0.2) from the measured
+        MALDI voxels that snap onto the graph most CHEAPLY — ranked by distance
+        to their nearest graph node (smallest first), spatially subsampled via
+        ``method`` across that near-graph band, then SNAPPED to that nearest
+        graph node. These guarantee well-aligned real measurements are
+        represented even outside the densest regions.
+
+    Every returned point is an EXACT graph-node coordinate, so the kernel always
+    uses its exact-eigenvector branch — no fragile Nyström out-of-sample eval.
+
+    Parameters
+    ----------
+    graph_coords : (N, 3) array — the graph nodes (``knn.x``), standardized.
+    maldi_coords : (Mraw, 3) array — measured MALDI voxels in the SAME
+        standardized space. These are NOT graph nodes (the graph is not
+        augmented); they are snapped onto the graph.
+    Returns (M', 3) float32 array of unique graph-node coordinates
+    (M' <= num_inducing after de-duplicating overlap / snap collisions).
+    """
+    from scipy.spatial import cKDTree
+    graph = np.ascontiguousarray(graph_coords, dtype=np.float32)
+    N = graph.shape[0]
+    M = int(min(num_inducing, N))
+    rng = np.random.default_rng(seed)
+
+    maldi = (np.ascontiguousarray(maldi_coords, dtype=np.float32)
+             if maldi_coords is not None and len(maldi_coords)
+             else np.empty((0, graph.shape[1]), dtype=np.float32))
+    n_dense = int(round(density_frac * M))
+    n_maldi = M - n_dense
+    if maldi.shape[0] == 0:
+        # No MALDI voxels available — fall back to pure density selection.
+        n_dense, n_maldi = M, 0
+
+    # ---- dense source: density-weighted sample over the graph nodes ----
+    tree_g = cKDTree(graph)
+    k = int(min(density_k + 1, N))          # +1: the point itself at dist 0
+    dist, _ = tree_g.query(graph, k=k)
+    mean_nn = dist[:, 1:].mean(axis=1) if k > 1 else np.zeros(N)
+    density = 1.0 / (mean_nn + 1e-8)
+    weights = density / density.sum()
+    n_dense = int(min(n_dense, N))
+    dense_idx = rng.choice(N, size=n_dense, replace=False, p=weights)
+
+    # ---- maldi source: cheapest-to-snap measured voxels, then snapped ----
+    maldi_nodes = np.empty((0, graph.shape[1]), dtype=np.float32)
+    if n_maldi > 0:
+        snap_dist, _ = tree_g.query(maldi, k=1)     # dist to nearest graph node
+        order = np.argsort(snap_dist)               # smallest snap distance first
+        # Candidate pool of the cheapest-to-snap voxels, then spatially
+        # subsample so the 20% still spread across that near-graph band.
+        pool = order[: int(min(maldi.shape[0], max(n_maldi * 5, n_maldi)))]
+        sub = _inducing_from_coords(maldi[pool], n_maldi, method=method, seed=seed)
+        _, g_idx = tree_g.query(sub, k=1)           # snap onto the graph nodes
+        maldi_nodes = graph[np.unique(g_idx)]
+
+    blended = np.concatenate([graph[dense_idx], maldi_nodes], axis=0)
+    return np.unique(blended, axis=0).astype(np.float32)
+
+
 def get_data_inducing_points(maldi_file, section_filter, num_inducing,
                              reference_image, method="kmeans_snap",
                              exp_path=None, force_recompute=False,
