@@ -92,6 +92,14 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         self.num_modes = num_modes
         self.bump_scale = bump_scale
         self.bump_decay = bump_decay
+
+        # When True, gradient-carrying inputs (i.e. LEARNED inducing-point
+        # parameters) are routed through the differentiable feature map
+        # (`features_differentiable`) instead of the exact eigenvector lookup,
+        # whose node-index gather has zero gradient w.r.t. coordinates. Off by
+        # default — training/prediction inputs don't require grad and keep the
+        # exact path. Flipped on by the model when learn_inducing_locations=True.
+        self.differentiable_inducing = False
  
         # ---- Bandwidth: register learnable parameter ----
         if graphbandwidth_constraint is None:
@@ -214,6 +222,15 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         raise NotImplementedError()
  
     def features(self, x: Tensor) -> Tensor:
+        # Learned-inducing mode: route gradient-carrying inputs (the inducing-
+        # point parameters) through the differentiable feature map. Data/test
+        # inputs do not require grad, so they keep the exact lookup below. The
+        # two maps are mutually consistent (the Nyström correction is designed
+        # to extend the on-graph eigenvectors), exactly as features() already
+        # mixes exact + Nyström rows within a single call.
+        if self.differentiable_inducing and x.requires_grad:
+            return self.features_differentiable(x)
+
         laplacian_ = self.laplacian()
 
         # Check if x is a *subset* of knn.x by nearest-neighbor lookup,
@@ -265,3 +282,59 @@ class RiemannKernel(gpytorch.kernels.Kernel):
                 )
 
         return features
+
+    def features_differentiable(self, x: Tensor) -> Tensor:
+        """Feature map that is DIFFERENTIABLE w.r.t. the input coordinates.
+
+        ``features()`` gathers exact eigenvectors by node index for on-graph
+        points (``self.eigvec[node_idx]``) — a discrete lookup with ZERO
+        gradient w.r.t. ``x`` — and even its Nyström branch reads the neighbour
+        distances straight from FAISS (also detached from ``x``). So
+        d features / d x ≡ 0 and learned inducing points never move.
+
+        This variant ALWAYS uses the Nyström interpolation and RECOMPUTES the
+        neighbour squared-distances in torch from ``x`` and the (constant) graph
+        node coordinates, so the heat weights — and hence the interpolated
+        eigenvectors — carry a gradient back to ``x``. FAISS is used only to
+        pick the neighbour SET (treated as a stop-gradient: the set is
+        piecewise-constant in ``x``, so the within-cell gradient is exact almost
+        everywhere). Used for LEARNED inducing points; the exact ``features()``
+        path is untouched for training/prediction.
+        """
+        laplacian_ = self.laplacian()
+
+        # Neighbour SELECTION via FAISS — indices only, no gradient through the
+        # (locally constant) selection. Detach + contiguous for the FAISS call.
+        with torch.no_grad():
+            _, ei_k = self.knn.search(x.detach().contiguous(), self.nearest_neighbors)
+        ei_k = ei_k.long()
+
+        # Differentiable squared distances: recompute from x and the fixed graph
+        # node coordinates the FAISS indices point at. This is the one line that
+        # was detached in features(); everything downstream now flows to x.
+        nbr = self.knn.x[ei_k]                             # (n, k, d) — constant
+        ev_k = (x.unsqueeze(1) - nbr).pow(2).sum(dim=-1)   # (n, k) — grad → x
+
+        # Out-of-sample spectral density (same Nyström correction as the OOS
+        # branch of features(), so K_uu is consistent with K_uf / K_ff).
+        sd = self.spectral_density().div(
+            (1 - self.graphbandwidth.square() * self.eigval).square().clamp(min=1e-6)
+        )
+        sd = (sd / sd.sum().clamp(min=1e-12)) * self.eigvec.shape[0]
+        scale = sd.sqrt()                                 # (num_modes,)
+
+        # Interpolate neighbour eigenvectors with the heat weights, then apply
+        # the smooth bump so points beyond bump support decay to zero features
+        # (and the gradient only pulls inducing points ALONG the manifold).
+        feats = scale * laplacian_.out_of_sample(self.eigvec, ev_k, ei_k)
+        # Bump gate on the distance to the nearest graph node. Clamp under the
+        # sqrt: an inducing point sitting exactly on a node has nearest distance
+        # 0, where d(sqrt)/d· is infinite — and the bump is flat there, so the
+        # raw product is a 0·inf NaN in the backward. The floor makes it 0·finite
+        # (the gate's gradient at the centre is ~0 anyway, which is correct).
+        bump = bump_function(
+            ev_k[:, 0].clamp(min=1e-12).sqrt(),
+            self.bump_scale * self.graphbandwidth.squeeze(),
+            self.bump_decay,
+        ).unsqueeze(-1)
+        return feats * bump

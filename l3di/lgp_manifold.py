@@ -209,6 +209,17 @@ class LatentRiemannGP(ApproximateGP):
 
         self.covar_module = ScaleKernel(base, batch_shape=torch.Size([num_tasks]))
 
+        # Learned inducing points need a DIFFERENTIABLE feature map: the default
+        # exact-eigenvector lookup gathers by node index (zero gradient w.r.t.
+        # coordinates), so the inducing-point parameters would never move. Flip
+        # the Riemann kernel(s) into differentiable-inducing mode so K_uu
+        # gradients reach them. Duck-typed (hasattr) to cover both the batched
+        # and per-task wrappers without importing the kernel class here.
+        if learn_inducing_locations:
+            for m in self.modules():
+                if hasattr(m, "differentiable_inducing"):
+                    m.differentiable_inducing = True
+
     def forward(self, x):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)

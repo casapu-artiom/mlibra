@@ -1084,11 +1084,12 @@ def train_lipid_batch(
     wandb_on = bool(args.get("wandb", False))
     learn_inducing = bool(args.get("learn_inducing", False))
     if learn_inducing and manifold_kernel is not None:
-        log.warning(
-            "  --learn-inducing with the manifold kernel: inducing points "
-            "will drift OFF the graph nodes onto the Nyström out-of-sample "
-            "path (less stable for small graphbandwidth). Tracked via the "
-            "inducing-point gradient norm."
+        log.info(
+            "  --learn-inducing (manifold): inducing points use the "
+            "differentiable Nyström feature map (features_differentiable), so "
+            "their coordinates receive gradients and move ALONG the manifold "
+            "within bump support. Watch grad_norm/inducing in W&B — it is "
+            "structurally zero with the default exact-lookup feature map."
         )
 
     if manifold_kernel is None:
