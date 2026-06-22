@@ -151,21 +151,27 @@ class LatentRiemannGP(ApproximateGP):
     lengthscales.
     """
     def __init__(self, inducing_points, num_tasks, manifold_kernel,
-                 product_ard_matern=False, product_ard_nu=2.5):
+                 product_ard_matern=False, product_ard_nu=2.5,
+                 learn_inducing_locations=False):
         # Ensure inducing points are correctly batched for multi-task
         if inducing_points.dim() == 2:
             inducing_points = inducing_points.unsqueeze(0).repeat(num_tasks, 1, 1)
-            
+
         variational_distribution = CholeskyVariationalDistribution(
             inducing_points.size(-2), batch_shape=torch.Size([num_tasks])
         )
 
-        # CRITICAL: learn_inducing_locations MUST be False.
-        # The points must stay anchored to the specific nodes on the FAISS graph.
+        # NOTE: learn_inducing_locations defaults to False — the points stay
+        # anchored to the exact FAISS graph nodes, so every K_uu evaluation
+        # uses the Riemann kernel's exact-eigenvector branch. Setting it True
+        # lets the optimizer move inducing points off-graph; they then go
+        # through the kernel's Nyström out-of-sample path (less stable for
+        # small graphbandwidth — see RiemannKernel.features). Opt in only
+        # deliberately (via --learn-inducing).
         variational_strategy = IndependentMultitaskVariationalStrategy(
             VariationalStrategy(
-                self, inducing_points, variational_distribution, 
-                learn_inducing_locations=False
+                self, inducing_points, variational_distribution,
+                learn_inducing_locations=learn_inducing_locations,
             ),
             num_tasks=num_tasks,
         )

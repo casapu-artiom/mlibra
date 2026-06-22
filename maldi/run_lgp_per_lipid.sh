@@ -84,9 +84,24 @@
 # the full measured set (millions) can OOM the GPU — set e.g. 200000 to bound N.
 : "${MAX_MALDI_NODES:=200000}"
 : "${MALDI_SUBSAMPLE_METHOD:=random}"   # random | fps | kmeans_snap
-# Draw inducing points directly from the MALDI nodes (1=on). Defaults to follow
-# AUGMENT_MALDI_NODES so an augmented run's inducing points are MALDI nodes.
+# Blend inducing points (1=on): ~INDUCING_DENSITY_FRAC from the densest graph
+# nodes + the rest from the measured MALDI voxels that snap onto the graph most
+# cheaply. INDEPENDENT of AUGMENT_MALDI_NODES — the KNN graph is not modified,
+# so you can keep the graph at stride (AUGMENT_MALDI_NODES=0) and still blend.
+# Defaults to follow AUGMENT_MALDI_NODES only for backward compatibility; set it
+# to 1 explicitly to blend on a strided graph.
 : "${INDUCING_FROM_MALDI_NODES:=$AUGMENT_MALDI_NODES}"
+# Fraction of inducing points from the densest graph nodes (rest from
+# cheapest-to-snap MALDI nodes). Default 0.8 → 80/20 blend.
+: "${INDUCING_DENSITY_FRAC:=0.8}"
+# Learn the inducing-point LOCATIONS jointly with the rest (1=on). Default off
+# (points stay anchored where initialized). For the manifold kernel this lets
+# them drift off the graph nodes onto the Nyström path — enable deliberately.
+: "${LEARN_INDUCING:=0}"
+# Weights & Biases logging (1=on): loss / KL / hypers / noise / per-group
+# gradient norms (incl. inducing points when LEARN_INDUCING=1). Off by default.
+: "${WANDB:=0}"
+: "${WANDB_PROJECT:=l3di_maldi_per_lipid}"
 
 # ---- Lengthscale mode (manifold kernel) ----------------------------------
 # Two modes, selected via FIXED_LENGTHSCALE:
@@ -188,13 +203,19 @@ run_one() {
             ls_args="--lengthscale-init $LENGTHSCALE_INIT --lengthscale-no-decay"
         fi
         local augment_args=""
+        # Graph augmentation (adds MALDI voxels as graph nodes) — optional and
+        # INDEPENDENT of the inducing blend below.
         if [ "$AUGMENT_MALDI_NODES" = "1" ]; then
             augment_args="--augment-maldi-nodes \
                 --max-maldi-nodes $MAX_MALDI_NODES \
                 --maldi-subsample-method $MALDI_SUBSAMPLE_METHOD"
-            if [ "$INDUCING_FROM_MALDI_NODES" = "1" ]; then
-                augment_args="$augment_args --inducing-from-maldi-nodes"
-            fi
+        fi
+        # Inducing-point blend over the (possibly strided, unaltered) graph.
+        # Does NOT require --augment-maldi-nodes: the graph stays as-is and the
+        # measured MALDI voxels are merely snapped onto it for the 20% share.
+        if [ "$INDUCING_FROM_MALDI_NODES" = "1" ]; then
+            augment_args="$augment_args --inducing-from-maldi-nodes \
+                --inducing-density-frac $INDUCING_DENSITY_FRAC"
         fi
         manifold_args="--eigenvector-dir $EIGENVECTOR_DIR \
             $augment_args \
@@ -246,6 +267,15 @@ run_one() {
         subset_args="$subset_args --lipids-file $LIPIDS_FILE"
     fi
 
+    # Learned inducing points + W&B logging (both opt-in via env vars).
+    local extra_args=""
+    if [ "$LEARN_INDUCING" = "1" ]; then
+        extra_args="$extra_args --learn-inducing"
+    fi
+    if [ "$WANDB" = "1" ]; then
+        extra_args="$extra_args --wandb --wandb-project $WANDB_PROJECT"
+    fi
+
     python "$SRC_PATH/maldi/lgp_experiment_per_lipid.py" \
         --kernel-family "$FAMILY" \
         --exp-name "$EXP_NAME" \
@@ -270,6 +300,7 @@ run_one() {
         $manifold_args \
         $euc_args \
         $subset_args \
+        $extra_args \
         $FAISS_CPU_ARGS \
         "${@:15}"
 }

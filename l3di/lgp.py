@@ -62,7 +62,7 @@ class IndependentMultitaskGPModel(ApproximateGP):
     """
 
     def __init__(self, inducing_points, num_tasks, kernel_type="rbf", nu=1.5, minimal_length_scale=1, input_dim=174,
-                 ard_num_dims=None):
+                 ard_num_dims=None, learn_inducing_locations=False):
         """
         Construct the GPModel class.
 
@@ -85,7 +85,8 @@ class IndependentMultitaskGPModel(ApproximateGP):
 
         variational_strategy = IndependentMultitaskVariationalStrategy(
             VariationalStrategy(
-                self, inducing_points, variational_distribution, learn_inducing_locations=False
+                self, inducing_points, variational_distribution,
+                learn_inducing_locations=learn_inducing_locations,
             ),
             num_tasks=num_tasks,
         )

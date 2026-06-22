@@ -142,11 +142,29 @@ def parse_args() -> dict:
                         "'random'.")
     p.add_argument("--inducing-from-maldi-nodes", dest="inducing_from_maldi_nodes",
                    action="store_true",
-                   help="(manifold + --augment-maldi-nodes) select the inducing "
-                        "points DIRECTLY from the appended MALDI graph nodes, "
-                        "guaranteeing every inducing point is an exact MALDI node "
-                        "(via --inducing-method). Overrides --inducing-source for "
-                        "the manifold kernel.")
+                   help="(manifold) blend the inducing points over the UNALTERED "
+                        "strided graph: ~--inducing-density-frac from the densest "
+                        "graph nodes + the rest from the measured MALDI voxels "
+                        "that snap onto the graph most cheaply (smallest snap "
+                        "distance). Every inducing point is an exact graph node "
+                        "(subsampling via --inducing-method). Independent of "
+                        "--augment-maldi-nodes (the KNN graph is NOT modified). "
+                        "Overrides --inducing-source for the manifold kernel.")
+    p.add_argument("--inducing-density-frac", dest="inducing_density_frac",
+                   type=float, default=0.8,
+                   help="(--inducing-from-maldi-nodes) fraction of inducing "
+                        "points drawn from the densest graph nodes; the "
+                        "remainder come from cheapest-to-snap MALDI nodes. "
+                        "Default 0.8 (80/20 blend).")
+    p.add_argument("--learn-inducing", dest="learn_inducing",
+                   action="store_true", default=False,
+                   help="Optimize the inducing-point LOCATIONS jointly with the "
+                        "variational/kernel parameters (learn_inducing_locations="
+                        "True). Default off: inducing points stay anchored where "
+                        "they were initialized. For the manifold kernel anchored "
+                        "points sit exactly on graph nodes (exact-eigenvector "
+                        "branch); learning lets them drift off-graph onto the "
+                        "kernel's Nyström path, so enable deliberately.")
     p.add_argument("--lipid-batch-size", type=int, default=10,
                    help="Number of lipids to fit simultaneously (= "
                         "num_tasks of the multitask GP). Increase this "
@@ -353,6 +371,16 @@ def parse_args() -> dict:
                          "a good default; >4 hits diminishing returns "
                          "and uses more RAM since each worker keeps a "
                          "copy of the dataset tensors."))
+    p.add_argument("--wandb", dest="wandb", action="store_true", default=False,
+                   help=("Log training metrics (loss / recon / KL / kernel "
+                         "hypers / observation noise / per-group gradient "
+                         "norms, including the inducing points when "
+                         "--learn-inducing is set) to Weights & Biases. One "
+                         "run for the whole job; steps are global across "
+                         "lipid batches."))
+    p.add_argument("--wandb-project", dest="wandb_project",
+                   default="l3di_maldi_per_lipid",
+                   help="W&B project name (used only when --wandb is set).")
     p.add_argument("--grad-clip", type=float, default=10.0,
                    help=("Gradient L2-norm clip. The analytic ELBO can "
                          "produce very large gradients at initialization "
@@ -934,6 +962,83 @@ def _restore_noise(likelihood, ckpt, device):
             ).clamp(math.exp(NOISE_LOG_MIN), math.exp(NOISE_LOG_MAX))
 
 
+def _grad_norms_by_group(model, likelihood):
+    """L2 gradient norm, total and per parameter-group, for W&B logging.
+
+    Buckets parameters by name so each W&B line isolates a distinct part of
+    the model:
+      * inducing    — inducing-point locations (only nonzero when
+                      learn_inducing_locations=True; zero/absent otherwise)
+      * variational — variational distribution (mean + Cholesky factor)
+      * kernel      — covar_module (lengthscale / outputscale / graphbandwidth)
+      * mean        — mean_module
+      * likelihood  — observation-noise params
+    'grad_norm/total' is the global L2 norm (== what clip_grad_norm_ measures).
+    Returns a flat {key: float} dict ready to hand to ``wandb.log``.
+    """
+    groups = {"inducing": 0.0, "variational": 0.0, "kernel": 0.0,
+              "mean": 0.0, "likelihood": 0.0, "other": 0.0}
+
+    def bucket(name):
+        if "inducing_points" in name:        # check first: name also has "variational"
+            return "inducing"
+        if "variational" in name:            # variational_mean / chol_variational_covar
+            return "variational"
+        if "mean_module" in name:
+            return "mean"
+        if ("covar_module" in name or "raw_lengthscale" in name
+                or "raw_graphbandwidth" in name):
+            return "kernel"
+        return "other"
+
+    total_sq = 0.0
+    named = (list(model.named_parameters())
+             + [(f"likelihood.{n}", p) for n, p in likelihood.named_parameters()])
+    for name, p in named:
+        if p.grad is None:
+            continue
+        g2 = float(p.grad.detach().pow(2).sum().item())
+        total_sq += g2
+        grp = "likelihood" if name.startswith("likelihood.") else bucket(name)
+        groups[grp] += g2
+    out = {f"grad_norm/{k}": math.sqrt(v) for k, v in groups.items()}
+    out["grad_norm/total"] = math.sqrt(total_sq)
+    return out
+
+
+def _kernel_hypers_for_log(model):
+    """Best-effort scalar kernel hyperparameters for W&B (means across tasks /
+    per-task kernels). Wrapped in try/except so a kernel layout we don't expect
+    never breaks training — logging is non-essential."""
+    out = {}
+    try:
+        oscale = [float(m.outputscale.detach().mean().item())
+                  for m in model.modules()
+                  if isinstance(m, gpytorch.kernels.ScaleKernel)]
+        if oscale:
+            out["kernel/outputscale_mean"] = float(np.mean(oscale))
+        ls, gb = [], []
+        for m in model.modules():
+            if getattr(m, "lengthscale", None) is not None:
+                try:
+                    ls.append(float(m.lengthscale.detach().mean().item()))
+                except Exception:
+                    pass
+            if getattr(m, "graphbandwidth", None) is not None:
+                try:
+                    gb.append(float(torch.as_tensor(m.graphbandwidth).detach()
+                                    .mean().item()))
+                except Exception:
+                    pass
+        if ls:
+            out["kernel/lengthscale_mean"] = float(np.mean(ls))
+        if gb:
+            out["kernel/graphbandwidth_mean"] = float(np.mean(gb))
+    except Exception:
+        pass
+    return out
+
+
 def train_lipid_batch(
     *,
     coords_train: torch.Tensor,   # (N, 3) on device, already z-scored
@@ -976,6 +1081,16 @@ def train_lipid_batch(
     n_tasks = y_train.shape[1]
     n_train = y_train.shape[0]
 
+    wandb_on = bool(args.get("wandb", False))
+    learn_inducing = bool(args.get("learn_inducing", False))
+    if learn_inducing and manifold_kernel is not None:
+        log.warning(
+            "  --learn-inducing with the manifold kernel: inducing points "
+            "will drift OFF the graph nodes onto the Nyström out-of-sample "
+            "path (less stable for small graphbandwidth). Tracked via the "
+            "inducing-point gradient norm."
+        )
+
     if manifold_kernel is None:
         # Euclidean — same as run_final.sh's setup.
         voxel_size = 0.025
@@ -991,6 +1106,7 @@ def train_lipid_batch(
             minimal_length_scale=minimal_length_scale,
             input_dim=3,
             ard_num_dims=ard_num_dims,
+            learn_inducing_locations=learn_inducing,
         ).to(device)
     else:
         if args.get("per_task_lengthscale", False):
@@ -1017,6 +1133,7 @@ def train_lipid_batch(
             manifold_kernel=manifold_arg,
             product_ard_matern=args.get("product_ard_matern", False),
             product_ard_nu=float(args.get("product_ard_nu", 2.5)),
+            learn_inducing_locations=learn_inducing,
         ).to(device)
 
     # Optional lengthscale initialisation (manifold path).
@@ -1068,6 +1185,11 @@ def train_lipid_batch(
     # Log frequency for cluster runs — write a line every ~5% of training
     # so cluster job logs show progress even when the tqdm bar is hidden.
     log_every = max(1, n_iters // 20)
+
+    # W&B global step: each lipid batch occupies a contiguous [b*n_iters,
+    # (b+1)*n_iters) block, so steps stay monotonic across the whole job
+    # (n_iters is identical for every batch — same n_train / bs / epochs).
+    wandb_step0 = int(args.get("wandb_batch_index", 0)) * n_iters
 
     # ---- Resume from in-progress checkpoint if one exists ---------------
     # ckpt_path is set by the caller (per-batch). If a previous crash
@@ -1426,6 +1548,15 @@ def train_lipid_batch(
                     #     # Fully clean step — reset the streak counter.
                     #     bad_grad_count = 0
 
+                    # ---- per-group gradient norms (pre-clip) for W&B ---------
+                    # Captured BEFORE clipping so they reflect the true gradient
+                    # magnitude. Only computed at the log cadence (the per-param
+                    # reduction is wasteful every iter). Includes the inducing-
+                    # point grad norm, which is nonzero only with --learn-inducing.
+                    wandb_metrics = None
+                    if wandb_on and (it % log_every == 0 or it == n_iters - 1):
+                        wandb_metrics = _grad_norms_by_group(model, likelihood)
+
                     # ---- gradient clipping ---------------------------------
                     # After NaN sanitization, gradients are finite — clipping
                     # caps any remaining large-but-finite values. Helps with
@@ -1437,6 +1568,23 @@ def train_lipid_batch(
                     )
 
                     optimizer.step()
+
+                    # ---- W&B per-iter metrics (log cadence) ------------------
+                    if wandb_metrics is not None:
+                        import wandb
+                        lvn = likelihood.task_noises.detach().log()
+                        wandb_metrics.update({
+                            "loss": float(loss.detach().item()),
+                            "recon": last_recon,
+                            "kl": last_kl,
+                            "noise/log_min": float(lvn.min().item()),
+                            "noise/log_max": float(lvn.max().item()),
+                            "noise/log_mean": float(lvn.mean().item()),
+                            "epoch": current_epoch,
+                            "batch": int(args.get("wandb_batch_index", 0)),
+                        })
+                        wandb_metrics.update(_kernel_hypers_for_log(model))
+                        wandb.log(wandb_metrics, step=wandb_step0 + it)
                     # No manual noise clamp: the likelihood's Interval
                     # constraint maps raw_task_noises through a sigmoid into
                     # [e^NOISE_LOG_MIN, e^NOISE_LOG_MAX], so task_noises is
@@ -1886,6 +2034,25 @@ def main():
     log.info(f"  output_dir    : {out_root}")
     log.info("=" * 72)
 
+    # ---- Weights & Biases (optional) ----
+    # One run for the whole job; train_lipid_batch logs per-iter metrics at a
+    # global step (batch_index * n_iters + it), and the summary is written at
+    # the end. Scoped to the analytic variational path: the VNNGP path
+    # (--variational nngp) has its own loop and returns early, so it would
+    # leave the run unfinished — skip init there.
+    wandb_active = bool(args.get("wandb", False)) and args.get("variational") != "nngp"
+    if args.get("wandb", False) and not wandb_active:
+        log.warning("--wandb is ignored for --variational nngp "
+                    "(W&B covers the analytic variational path only).")
+    args["wandb"] = wandb_active  # propagated into train_lipid_batch via args
+    if wandb_active:
+        import wandb
+        wandb.init(
+            project=args.get("wandb_project", "l3di_maldi_per_lipid"),
+            name=config.exp_name, config=args,
+        )
+        log.info(f"  W&B logging enabled (project={args.get('wandb_project')})")
+
     # ---- config / inducing points (same as lgp_*_experiment.py) ----
     log.info("Computing inducing points + coord normalization …")
     if args.get("inducing_source", "reference") == "data":
@@ -1914,27 +2081,36 @@ def main():
         )
         knn = manifold_ctx["knn"]
         want_maldi_inducing = bool(args.get("inducing_from_maldi_nodes", False))
-        if want_maldi_inducing and manifold_ctx.get("augment_maldi"):
-            # Select the inducing points DIRECTLY from the appended MALDI nodes
-            # (knn.x[n_atlas_nodes:]) so every one is an exact MALDI graph node.
-            from utils import _inducing_from_coords
-            n_atlas = manifold_ctx["n_atlas_nodes"]
-            maldi_nodes = knn.x[n_atlas:].detach().cpu().numpy()
-            sel = _inducing_from_coords(
-                maldi_nodes, config.num_inducing,
+        if want_maldi_inducing:
+            # Blend the inducing points over the UNALTERED (strided) graph:
+            # ~density_frac from the densest graph nodes + the rest from the
+            # measured MALDI voxels that snap onto the graph most cheaply. The
+            # KNN graph itself is NOT modified — this is independent of
+            # --augment-maldi-nodes (graph stays at stride). Both sources resolve
+            # to exact graph nodes, so K_uu stays on the exact-eigenvector path.
+            from utils import inducing_blend_density_maldi, maldi_voxels_standardized
+            graph_coords = knn.x.detach().cpu().numpy()
+            maldi_coords = maldi_voxels_standardized(
+                config.maldi_file, config.section_filter, coord_mean, coord_std,
+            ).numpy()
+            density_frac = float(args.get("inducing_density_frac", 0.8))
+            sel = inducing_blend_density_maldi(
+                graph_coords, maldi_coords, config.num_inducing,
+                density_frac=density_frac,
+                density_k=args.get("knn_k", 15),
                 method=args.get("inducing_method", "kmeans_snap"),
                 seed=args["seed"],
             )
             inducing_points = torch.tensor(sel, dtype=torch.float32)
+            n_dense = int(round(density_frac * config.num_inducing))
             log.info(
-                f"  Inducing points drawn from {maldi_nodes.shape[0]:,} MALDI "
-                f"nodes (method={args.get('inducing_method', 'kmeans_snap')}): "
-                f"{inducing_points.shape[0]} (from {config.num_inducing} requested)"
+                f"  Inducing points blended: ~{n_dense} from densest graph "
+                f"nodes + ~{config.num_inducing - n_dense} from cheapest-to-snap "
+                f"MALDI voxels (graph N={graph_coords.shape[0]:,}, "
+                f"MALDI={maldi_coords.shape[0]:,}): {inducing_points.shape[0]} "
+                f"unique (from {config.num_inducing} requested)"
             )
         else:
-            if want_maldi_inducing:
-                log.warning("--inducing-from-maldi-nodes ignored: requires "
-                            "--augment-maldi-nodes (no MALDI nodes in the graph).")
             # Snap the k-means inducing points to the nearest graph nodes so
             # that every K_uu evaluation uses the exact eigenvector lookup
             # branch (is_on_graph) rather than the numerically fragile Nyström
@@ -2343,7 +2519,8 @@ def main():
         # Stored under "checkpoints/" so it's separate from final
         # per-lipid predictions.
         ckpt_path = out_root / "checkpoints" / f"batch_{batch_i:03d}_inprogress.pt"
-        args_for_batch = dict(args, checkpoint_path=ckpt_path)
+        args_for_batch = dict(args, checkpoint_path=ckpt_path,
+                              wandb_batch_index=batch_i)
 
         t0 = time.time()
         try:
@@ -2609,6 +2786,17 @@ def main():
              f"median={summary['test_corr']['median']:+.4f}")
     log.info(f"         test RMSE(z) mean={summary['test_rmse_z']['mean']:.4f}")
     log.info(f"Outputs in: {out_root}")
+
+    if args.get("wandb", False):
+        import wandb
+        wandb.summary.update({
+            "test_corr_mean": summary["test_corr"]["mean"],
+            "test_corr_median": summary["test_corr"]["median"],
+            "test_rmse_z_mean": summary["test_rmse_z"]["mean"],
+            "test_r2_mean": summary["test_r2"]["mean"],
+            "wall_time_sec": summary["wall_time_sec"],
+        })
+        wandb.finish()
 
 
 if __name__ == "__main__":
