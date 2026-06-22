@@ -182,6 +182,8 @@ run_one() {
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
+    # Learned vs anchored inducing points → distinct output dirs (both families).
+    [ "$LEARN_INDUCING" = "1" ] && TAG="${TAG}-learnind"
     # VNNGP runs get their own tag suffix so they don't clobber the analytic ones.
     if [ "$VARIATIONAL" = "nngp" ]; then
         TAG="${TAG}-vnngp-${NN_METRIC}-nnk${NN_K}-ni${NNGP_NUM_INDUCING}"
