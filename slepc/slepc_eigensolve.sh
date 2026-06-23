@@ -62,10 +62,22 @@ opt_args=()
 [ -n "$ANNOTATIONS_FILE" ]    && opt_args+=(--annotations-file "$ANNOTATIONS_FILE")
 [ "$SHIFT_INVERT" = "1" ]     && opt_args+=(--shift-invert --target "$TARGET" --factor-solver "$FACTOR_SOLVER")
 
-echo "[slepc_eigensolve] NPROC=$NPROC -> $RUN_SLUG (shift_invert=$SHIFT_INVERT)"
+# Resolve the MPI launcher by ABSOLUTE path. The runai job runs us via
+# `gosu appuser bash -c ...` (a non-login shell, see entrypoint.sh), whose PATH
+# may not include /usr/bin where openmpi-bin installs mpirun -- so a bare
+# `mpirun` can fail with "command not found" even though it's in the image.
+# Honor an explicit $MPIRUN, else search PATH, else fall back to /usr/bin.
+MPIRUN="${MPIRUN:-$(command -v mpirun || true)}"
+[ -z "$MPIRUN" ] && [ -x /usr/bin/mpirun ] && MPIRUN=/usr/bin/mpirun
+if [ -z "$MPIRUN" ] || [ ! -x "$MPIRUN" ]; then
+    echo "ERROR: mpirun not found (PATH=$PATH). Install openmpi-bin or set MPIRUN=/abs/path/to/mpirun." >&2
+    exit 127
+fi
+
+echo "[slepc_eigensolve] NPROC=$NPROC -> $RUN_SLUG (shift_invert=$SHIFT_INVERT) mpirun=$MPIRUN"
 
 # Oversubscribe is allowed in case the pod reports fewer slots than cores.
-mpirun --allow-run-as-root -n "$NPROC" \
+"$MPIRUN" --allow-run-as-root -n "$NPROC" \
     python -u "${REPO}/slepc/slepc_eigensolve.py" \
         --template "$TEMPLATE" \
         --stride "$STRIDE" \
