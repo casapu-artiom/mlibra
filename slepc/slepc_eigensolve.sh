@@ -74,11 +74,25 @@ if [ -z "$MPIRUN" ] || [ ! -x "$MPIRUN" ]; then
     exit 127
 fi
 
-echo "[slepc_eigensolve] NPROC=$NPROC -> $RUN_SLUG (shift_invert=$SHIFT_INVERT) mpirun=$MPIRUN"
+# Pin the interpreter to an ABSOLUTE path too. mpirun (OpenMPI) prepends its own
+# bindir to the children's PATH, which can shadow /opt/venv/bin/python with a
+# system/conda python that lacks petsc4py/slepc4py -- ranks then die with
+# "No module named 'petsc4py'" even though the venv has it. Resolving `python`
+# here (post venv-activate) and passing it by full path makes every rank use the
+# venv interpreter. -x forwards PATH + LD_LIBRARY_PATH so the dynamic loader
+# still finds libpetsc/libslepc (+ MUMPS) at import time.
+PYTHON="${PYTHON:-$(command -v python || command -v python3 || true)}"
+if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+    echo "ERROR: python not found (PATH=$PATH). Activate the venv or set PYTHON=/abs/path." >&2
+    exit 127
+fi
+
+echo "[slepc_eigensolve] NPROC=$NPROC -> $RUN_SLUG (shift_invert=$SHIFT_INVERT) mpirun=$MPIRUN python=$PYTHON"
 
 # Oversubscribe is allowed in case the pod reports fewer slots than cores.
 "$MPIRUN" --allow-run-as-root -n "$NPROC" \
-    python -u "${REPO}/slepc/slepc_eigensolve.py" \
+    -x PATH -x LD_LIBRARY_PATH \
+    "$PYTHON" -u "${REPO}/slepc/slepc_eigensolve.py" \
         --template "$TEMPLATE" \
         --stride "$STRIDE" \
         --threshold "$THRESHOLD" \
