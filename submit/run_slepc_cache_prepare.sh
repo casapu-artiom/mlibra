@@ -42,9 +42,9 @@ fi
 # the matrix + the shift-invert (MUMPS) factor, which dominates memory at small
 # stride. NO GPU is requested -- this is the CPU-heavy cache-prep job.
 # -------------------------------------------------------------------------
-CPU=${CPU:-32}
-MEM=${MEM:-384G}
-IMAGE=${IMAGE:-artiomartiom/sdsc:maldi_manifold_latest}
+CPU=${CPU:-16}
+MEM=${MEM:-196G}
+IMAGE=${IMAGE:-artiomartiom/sdsc:withslepc}
 
 # -------------------------------------------------------------------------
 # Paths (S3 mounts on the cluster)
@@ -58,6 +58,12 @@ BUILD_IF_MISSING="${BUILD_IF_MISSING:-1}"   # rank 0 builds the graph (CPU faiss
 FACTOR_SOLVER="${FACTOR_SOLVER:-mumps}"     # parallel direct solver for the shift-invert
 TARGET="${TARGET:-0.0}"                     # shift-invert target (bottom of the spectrum)
 EXP_SUFFIX="${EXP_SUFFIX:-$(date +'%y%m%d-%H%M')}"
+
+# BLAS/OpenMP threads per MPI rank. 1 = pure MPI (the right mapping when ranks
+# == cores: NPROC ranks x 1 thread fills the cores without oversubscription).
+# Raise only for a deliberate hybrid run (fewer ranks x more threads, to speed
+# the dense root of the MUMPS factorization). Forwarded to all three BLAS knobs.
+OMP_THREADS="${OMP_THREADS:-1}"
 
 # -------------------------------------------------------------------------
 # submit_one  <stride> <threshold> <knn_k> <modes> [norm] [cpu]
@@ -80,6 +86,9 @@ submit_one() {
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e REPO="$SRC_PATH" \
         -e NPROC="$cpu" \
+        -e OMP_NUM_THREADS="$OMP_THREADS" \
+        -e OPENBLAS_NUM_THREADS="$OMP_THREADS" \
+        -e MKL_NUM_THREADS="$OMP_THREADS" \
         -e EIGENVECTOR_DIR="$S3_EIGENVECTOR_DIR" \
         -e BUILD_IF_MISSING="$BUILD_IF_MISSING" \
         -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
@@ -100,15 +109,15 @@ submit_one() {
 # Eigenvector caches to pre-compute -- edit these.
 #            stride thr  k    modes  [norm]__sdfsdf
 # -------------------------------------------------------------------------
-submit_one      4   5   15    300    randomwalk
-submit_one      4   5   15    1300   randomwalk
-submit_one      4   5   15    2300   randomwalk
-submit_one      4   40   15    300    randomwalk
-submit_one      4   40   15    1300   randomwalk
-submit_one      4   40   15    2300   randomwalk
-submit_one      4   50   15    300    randomwalk
-submit_one      4   50   15    1300   randomwalk
-submit_one      4   40   15    2300   randomwalk
+# submit_one      4   5   15    300    randomwalk
+# submit_one      4   5   15    1300   randomwalk
+# submit_one      4   5   15    4300   randomwalk
+# submit_one      4   40   15    300    randomwalk
+# submit_one      4   40   15    1300   randomwalk
+#submit_one      4   40   15    4300   randomwalk
+# submit_one      4   50   15    300    randomwalk
+# submit_one      4   50   15    1300   randomwalk
+#submit_one      4   40   15    4300   randomwalk
 
 echo "Submitted $n_submitted shift-invert cache-prep jobs. Suffix: $EXP_SUFFIX"
 echo "Eigvecs -> $S3_EIGENVECTOR_DIR/eigvecs/   logs -> $S3_EIGENVECTOR_DIR/slepc_logs/"

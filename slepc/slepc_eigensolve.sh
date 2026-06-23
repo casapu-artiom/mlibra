@@ -28,6 +28,17 @@ fi
 # --- ranks: default to the cores available in this pod ---
 NPROC="${NPROC:-$(nproc)}"
 
+# --- threads per rank: pin to 1 (pure MPI) ---
+# MUMPS/SLEPc parallelize via the MPI ranks. If the threaded BLAS underneath
+# *also* spawns a thread per core, then NPROC ranks x (cores) threads massively
+# oversubscribes the cores -- they thrash and the factorization crawls (seen as
+# >100%/rank CPU and load average >> ncores). With ranks ~= cores, one BLAS
+# thread per rank is the right mapping. Override (e.g. fewer ranks x more
+# threads) only if you deliberately tune hybrid MPI+OpenMP for the dense root.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+
 # --- graph + solver properties ---
 MODES="${MODES:-300}"
 STRIDE="${STRIDE:-4}"
