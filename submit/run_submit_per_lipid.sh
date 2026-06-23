@@ -236,8 +236,10 @@ MALDI_SUBSAMPLE_METHOD=random   # random | fps ---------------------------------
 # Inducing-point blend — INDEPENDENT of MAN_AUGMALDI (KNN graph is NOT modified):
 # ~INDUCING_DENSITY_FRAC of inducing points from the densest graph nodes, the
 # rest from the measured MALDI voxels that snap onto the (strided) graph most
-# cheaply. 1 = on, 0 = plain k-means-snap inducing.
-MAN_INDUCING_BLEND=1
+# cheaply. 1 = blend on, 0 = plain k-means-snap inducing. Listed so each config
+# is submitted both ways for head-to-head comparison (output dirs differ via the
+# "-blend" tag). Manifold only — euclidean ignores it.
+MAN_INDUCING_BLEND=(0 1)
 INDUCING_DENSITY_FRAC=0.8       # frac from densest graph nodes (rest = cheapest-to-snap MALDI)
 # Learned vs anchored inducing points — listed so each config is submitted both
 # ways for head-to-head comparison (output dirs differ via the "-learnind" tag).
@@ -322,11 +324,13 @@ for fold in "${FOLDS[@]}"; do
                                         # FROM_MALDI_NODES. The inducing blend is
                                         # independent of graph augmentation.
                                         AUGMENT_MALDI_NODES=$augment
-                                        INDUCING_FROM_MALDI_NODES=$MAN_INDUCING_BLEND
-                                        # Sweep anchored vs learned inducing
-                                        # points. LEARN_INDUCING is forwarded as
-                                        # -e LEARN_INDUCING; the "-learnind" TAG
-                                        # suffix keeps the two output dirs apart.
+                                        # Sweep inducing-point blend (on/off) and
+                                        # anchored vs learned. INDUCING_FROM_MALDI_
+                                        # NODES / LEARN_INDUCING are forwarded as
+                                        # -e env vars; the "-blend" / "-learnind"
+                                        # TAG suffixes keep the output dirs apart.
+                                        for blend in "${MAN_INDUCING_BLEND[@]}"; do
+                                        INDUCING_FROM_MALDI_NODES=$blend
                                         for learn_ind in "${MAN_LEARN_INDUCING[@]}"; do
                                         LEARN_INDUCING=$learn_ind
                                         job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
@@ -343,9 +347,10 @@ for fold in "${FOLDS[@]}"; do
                                         # dirs never collide; tag is just for logs.
                                         if [ "$augment" = "1" ]; then aug_tag="augmaldi"; else aug_tag="atlas"; fi
                                         if [ "$learn_ind" = "1" ]; then li_tag="learn"; else li_tag="anchor"; fi
+                                        if [ "$blend" = "1" ]; then blend_tag="blend"; else blend_tag="kmeans"; fi
                                         prefix="${fold_upper}-${ls_tag}"
-                                        printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s stride=%s modes=%s bs=%s bd=%s ls=%s aug=%s ind=%s\n" \
-                                            "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$stride" "$modes" "$bump_scale" "$bump_decay" "$ls_tag" "$aug_tag" "$li_tag"
+                                        printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s stride=%s modes=%s bs=%s bd=%s ls=%s aug=%s ind=%s blend=%s\n" \
+                                            "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$stride" "$modes" "$bump_scale" "$bump_decay" "$ls_tag" "$aug_tag" "$li_tag" "$blend_tag"
                                         # no_ard is euclidean-only; pass a
                                         # placeholder the manifold path ignores.
                                         submit "$job_name" "manifold" "$nu" \
@@ -353,6 +358,7 @@ for fold in "${FOLDS[@]}"; do
                                             "$prefix" "$SLICES_DATASET_FILE" \
                                             "$stride" "$modes" "$fixed_ls" "1"
                                         exp_num=$((exp_num + 1))
+                                        done
                                         done
                                       done
                                     done
