@@ -72,14 +72,14 @@
 : "${KNN_METHOD:=faiss_atlas_weighted}"
 : "${CROSS_REGION_INFLATION:=50.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
-: "${BUMP_SCALE:=20.0}"
+: "${BUMP_SCALE:=1.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${GRAPHBANDWIDTH:=0.1}"
-: "${THRESHOLD:=50}"
+: "${THRESHOLD:=5}"
 # Add the measured MALDI voxels to the graph node set (1=on). Works with
 # KNN_METHOD=faiss and faiss_atlas_weighted (MALDI nodes inherit the region
 # of their nearest atlas node); NOT anatomical_atlas (adjacency-built edges).
-: "${AUGMENT_MALDI_NODES:=1}"
+: "${AUGMENT_MALDI_NODES:=0}"
 # Cap on MALDI voxels added (0 = all). The eigensolve workspace is ~ncv*N, so
 # the full measured set (millions) can OOM the GPU — set e.g. 200000 to bound N.
 : "${MAX_MALDI_NODES:=200000}"
@@ -97,7 +97,7 @@
 # Learn the inducing-point LOCATIONS jointly with the rest (1=on). Default off
 # (points stay anchored where initialized). For the manifold kernel this lets
 # them drift off the graph nodes onto the Nyström path — enable deliberately.
-: "${LEARN_INDUCING:=0}"
+: "${LEARN_INDUCING:=1}"
 # Weights & Biases logging (1=on): loss / KL / hypers / noise / per-group
 # gradient norms (incl. inducing points when LEARN_INDUCING=1). Off by default.
 : "${WANDB:=0}"
@@ -179,6 +179,12 @@ run_one() {
     if [ "$FAMILY" = "manifold" ]; then
         TAG="manifold-nu${NU_}-K${NMODES_}-stride${STRIDE}-${LS_TAG}-bs${BSCALE_}-bd${BDECAY_}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
         [ "$AUGMENT_MALDI_NODES" = "1" ] && TAG="${TAG}-augmaldi${MAX_MALDI_NODES}"
+        # Inducing-point blend (density + cheap-snap MALDI) vs plain k-means-snap.
+        # Encode the density fraction so a sweep over it gets distinct dirs.
+        [ "$INDUCING_FROM_MALDI_NODES" = "1" ] && TAG="${TAG}-blend${INDUCING_DENSITY_FRAC}"
+        # Cross-region edge inflation only applies to faiss_atlas_weighted; encode
+        # it there so a sweep over inflation values gets distinct output dirs.
+        [ "$KMETHOD_" = "faiss_atlas_weighted" ] && TAG="${TAG}-infl${CROSS_REGION_INFLATION}"
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
