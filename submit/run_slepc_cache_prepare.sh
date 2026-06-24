@@ -65,6 +65,15 @@ EXP_SUFFIX="${EXP_SUFFIX:-$(date +'%y%m%d-%H%M')}"
 # the dense root of the MUMPS factorization). Forwarded to all three BLAS knobs.
 OMP_THREADS="${OMP_THREADS:-1}"
 
+# MPI ranks (= NPROC in the pod), DECOUPLED from the core request (CPU). Default
+# one rank per core (pure MPI). Set RANKS=1 with OMP_THREADS=$CPU to fall back to
+# SERIAL MUMPS + threaded BLAS -- the proven path when the DISTRIBUTED (multi-
+# rank) MUMPS factorization hangs/blows up on dense graphs (e.g. t5). Keep
+# RANKS x OMP_THREADS ~= CPU so the cores are filled without oversubscription:
+#   default fast path : (leave unset)            -> RANKS=$CPU, OMP_THREADS=1
+#   serial fallback   : RANKS=1 OMP_THREADS=$CPU -> 1 rank, $CPU BLAS threads
+RANKS="${RANKS:-$CPU}"
+
 # -------------------------------------------------------------------------
 # submit_one  <stride> <threshold> <knn_k> <modes> [norm] [cpu]
 # Always shift-invert; never requests a GPU.
@@ -78,14 +87,14 @@ submit_one() {
     n_submitted=$((n_submitted + 1))
     local job_name="slepcsi-${EXP_SUFFIX}-$(printf '%03d' "$n_submitted")"
 
-    echo ">>> [$n_submitted] $job_name -> $run_slug  (ranks=$cpu, shift-invert)"
+    echo ">>> [$n_submitted] $job_name -> $run_slug  (ranks=$RANKS, cores=$cpu, omp=$OMP_THREADS, shift-invert)"
     run_or_echo runai training submit "$job_name" \
         -i "$IMAGE" \
         --cpu-core-limit "$cpu"   --cpu-core-request   "$cpu" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e REPO="$SRC_PATH" \
-        -e NPROC="$cpu" \
+        -e NPROC="$RANKS" \
         -e OMP_NUM_THREADS="$OMP_THREADS" \
         -e OPENBLAS_NUM_THREADS="$OMP_THREADS" \
         -e MKL_NUM_THREADS="$OMP_THREADS" \

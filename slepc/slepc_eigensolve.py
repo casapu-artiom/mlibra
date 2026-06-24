@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -242,12 +243,65 @@ def solve_slepc(A, num_modes, tol, *, shift_invert, target, factor_solver, ncv):
         pass
 
     E.setFromOptions()
+
+    # ---- shift-invert: make the (silent, expensive) factorization observable --
+    # Shift-invert front-loads ONE big direct factorization of (L - target*I)
+    # before the first Krylov iteration -- the long quiet gap that looks like a
+    # hang. We force it here (EPSSetUp/PCSetUp triggers MUMPS' symbolic + numeric
+    # factorization) and wrap it with three independent signals so it's never
+    # dark again:
+    #   1. a wall-clock heartbeat thread that ticks "still factorizing, Ns" on
+    #      rank 0 (best-effort: only fires if the C call releases the GIL);
+    #   2. MUMPS' own ICNTL(4) phase diagnostics (printed from C, GIL-independent,
+    #      enabled where the solver is configured above); and
+    #   3. a closing line with elapsed time + the factor's REAL RAM/flops from
+    #      MUMPS INFOG -- ground-truth sizing, not an estimate.
+    if shift_invert:
+        log(f"factorizing (shift-invert via {factor_solver}) -- silent phase; "
+            "watch for MUMPS ICNTL(4) stats + the heartbeat below. No "
+            "convergence bar until this completes ...")
+        stop_beat = threading.Event()
+        if RANK == 0:
+            t_beat = time.perf_counter()
+
+            def _heartbeat():
+                # wait() returns True when set -> exits promptly on completion.
+                while not stop_beat.wait(30.0):
+                    print(f"[slepc]   ...still factorizing, "
+                          f"{time.perf_counter()-t_beat:.0f}s elapsed",
+                          flush=True)
+
+            threading.Thread(target=_heartbeat, daemon=True).start()
+
+        t_fact = time.perf_counter()
+        E.setUp()
+        # Idempotent: forces PCSetUp (the factorization) if EPSSetUp deferred it,
+        # so the whole cost is guaranteed to land inside this timed bracket.
+        E.getST().getKSP().getPC().setUp()
+        stop_beat.set()
+        dt_fact = time.perf_counter() - t_fact
+
+        stats = ""
+        if factor_solver == "mumps":
+            try:
+                F = E.getST().getKSP().getPC().getFactorMatrix()
+                # INFOG(21)=peak RAM (MB) on the heaviest rank; (22)=total across
+                # ranks; RINFOG(3)=factorization flops. Real numbers for MEM sizing.
+                stats = (f"  factor RAM: {F.getMumpsInfog(21)} MB/rank peak, "
+                         f"{F.getMumpsInfog(22)} MB total; "
+                         f"{F.getMumpsRinfog(3) / 1e9:.1f} GFLOP")
+            except Exception:
+                pass
+        log(f"factorization complete in {dt_fact:.1f}s{stats}")
+
     t0 = time.perf_counter()
     E.solve()
     if bar is not None:
         bar.close()
     nconv = E.getConverged()
     kind = "shift-invert" if shift_invert else "Krylov-Schur SR"
+    # For shift-invert this is the iteration phase only (factorization timed
+    # separately above); for Krylov-Schur SR it's the whole matrix-free solve.
     log(f"{kind}: iters={E.getIterationNumber()} converged={nconv}/{num_modes} "
         f"({time.perf_counter()-t0:.1f}s)")
     return E, nconv
