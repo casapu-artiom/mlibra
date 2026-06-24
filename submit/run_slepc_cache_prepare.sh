@@ -53,10 +53,17 @@ S3_EIGENVECTOR_DIR="${S3_EIGENVECTOR_DIR:-/s3/mlibra/mlibra-data/artiom/eigenvec
 S3_REFERENCE_FILE="${S3_REFERENCE_FILE:-/s3/mlibra/mlibra-data/reference_image.npy}"
 S3_ANNOTATION_FILE="${S3_ANNOTATION_FILE:-/s3/mlibra/mlibra-data/level_15annot.npy}"
 SRC_PATH="${SRC_PATH:-/myhome/mlibra}"
+BANDWIDTH="${BANDWIDTH:-0.1}"
 
 BUILD_IF_MISSING="${BUILD_IF_MISSING:-1}"   # rank 0 builds the graph (CPU faiss) if absent
 FACTOR_SOLVER="${FACTOR_SOLVER:-mumps}"     # parallel direct solver for the shift-invert
 TARGET="${TARGET:-0.0}"                     # shift-invert target (bottom of the spectrum)
+# Max projected dimension. Caps the Krylov working subspace so per-restart
+# orthogonalization is O(MPD^2*N) instead of O(ncv^2*N) -- the lever that keeps
+# the iteration phase from blowing up when MODES is large. <=0 = SLEPc default
+# (~2*modes). For modes ~2300 try MPD=512; lower = cheaper restarts but more of
+# them (and too low risks non-convergence -> the run fails + deletes the cache).
+MPD="${MPD:-256}"
 EXP_SUFFIX="${EXP_SUFFIX:-$(date +'%y%m%d-%H%M')}"
 
 # BLAS/OpenMP threads per MPI rank. 1 = pure MPI (the right mapping when ranks
@@ -110,6 +117,8 @@ submit_one() {
         -e NORMALIZATION="$norm" \
         -e SHIFT_INVERT="1" \
         -e TARGET="$TARGET" \
+        -e MPD="$MPD" \
+        -e BANDWIDTH="$BANDWIDTH" \
         -e FACTOR_SOLVER="$FACTOR_SOLVER" \
         -- ./slepc/slepc_eigensolve.sh
 }
@@ -120,7 +129,8 @@ submit_one() {
 # -------------------------------------------------------------------------
 # submit_one      4   5   15    300    randomwalk
 # submit_one      4   5   15    1300   randomwalk
-# submit_one      4   5   15    4300   randomwalk
+submit_one      4   5   15    2300   randomwalk
+submit_one      4   5   15    4300   randomwalk
 # submit_one      4   40   15    300    randomwalk
 # submit_one      4   40   15    1300   randomwalk
 #submit_one      4   40   15    4300   randomwalk
