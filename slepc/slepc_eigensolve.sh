@@ -51,6 +51,7 @@ NORMALIZATION="${NORMALIZATION:-randomwalk}"
 TEMPLATE="${TEMPLATE:-reference}"
 TOL="${TOL:-1e-6}"
 NCV="${NCV:--1}"
+MPD="${MPD:--1}"                         # max projected dim; cap for large MODES
 SHIFT_INVERT="${SHIFT_INVERT:-0}"        # 1 -> shift-invert + MUMPS
 TARGET="${TARGET:-0.0}"
 FACTOR_SOLVER="${FACTOR_SOLVER:-mumps}"
@@ -115,6 +116,7 @@ echo "[slepc_eigensolve] NPROC=$NPROC -> $RUN_SLUG (shift_invert=$SHIFT_INVERT) 
         --modes "$MODES" \
         --tol "$TOL" \
         --ncv "$NCV" \
+        --mpd "$MPD" \
         --eigenvector-dir "$EIGENVECTOR_DIR" \
         "${opt_args[@]}" 2>&1 | tee "$LOG_DIR/slepc.log"
 

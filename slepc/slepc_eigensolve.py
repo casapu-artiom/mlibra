@@ -177,15 +177,23 @@ def build_petsc_matrix(op, N: int):
 # ---------------------------------------------------------------------------
 # SLEPc solve
 # ---------------------------------------------------------------------------
-def solve_slepc(A, num_modes, tol, *, shift_invert, target, factor_solver, ncv):
+def solve_slepc(A, num_modes, tol, *, shift_invert, target, factor_solver,
+                ncv, mpd):
     E = SLEPc.EPS().create(comm=COMM)
     E.setOperators(A)
     E.setProblemType(SLEPc.EPS.ProblemType.HEP)
     E.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+    # nev/ncv/mpd: ncv<=0 lets SLEPc choose (~2*nev). For LARGE nev, mpd
+    # (maximum projected dimension) caps the working subspace so the per-restart
+    # orthogonalization cost is O(mpd^2 * N) instead of O(ncv^2 * N) -- the key
+    # knob for computing many modes without the basis-orthogonalization blowup.
+    # It trades more (cheap) restarts for far less work each; mpd<=0 disables it.
+    dim_kw = {"nev": num_modes}
     if ncv is not None and ncv > 0:
-        E.setDimensions(nev=num_modes, ncv=ncv)
-    else:
-        E.setDimensions(nev=num_modes)
+        dim_kw["ncv"] = ncv
+    if mpd is not None and mpd > 0:
+        dim_kw["mpd"] = mpd
+    E.setDimensions(**dim_kw)
     E.setTolerances(tol=tol)
 
     if shift_invert:
@@ -343,6 +351,10 @@ def main():
     # solver
     p.add_argument("--tol", type=float, default=1e-6)
     p.add_argument("--ncv", type=int, default=-1, help="<=0 lets SLEPc choose.")
+    p.add_argument("--mpd", type=int, default=-1,
+                   help="Maximum projected dimension; caps the working subspace "
+                        "to bound per-restart orthogonalization at O(mpd^2*N). "
+                        "Set it (e.g. ~400-600) when modes is large; <=0 disables.")
     p.add_argument("--shift-invert", action="store_true",
                    help="Shift-invert (target) via a parallel direct solver; "
                         "needs PETSc --with-mumps. Default is Krylov-Schur SR.")
@@ -402,7 +414,8 @@ def main():
     A = build_petsc_matrix(op, N)
     E, nconv = solve_slepc(
         A, args.modes, args.tol, shift_invert=args.shift_invert,
-        target=args.target, factor_solver=args.factor_solver, ncv=args.ncv)
+        target=args.target, factor_solver=args.factor_solver, ncv=args.ncv,
+        mpd=args.mpd)
     if nconv == 0:
         raise SystemExit("[slepc] converged 0 eigenpairs -- raise --ncv / --tol.")
     k = min(nconv, args.modes)
