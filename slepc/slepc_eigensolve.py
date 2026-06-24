@@ -73,6 +73,36 @@ def log(msg: str) -> None:
         print(f"[slepc] {msg}", flush=True)
 
 
+def start_heartbeat(label, status_fn=None, interval=30.0):
+    """Rank-0 daemon thread that prints elapsed time (+ optional live status)
+    every `interval`s while an opaque blocking SLEPc/MUMPS call runs, so the long
+    silent phases (the factorization, and each Krylov restart) show a pulse
+    instead of looking hung. Returns a threading.Event -- call .set() to stop it.
+
+    It relies on petsc4py releasing the GIL during the C call (confirmed: the
+    factorization heartbeat ticks). `status_fn` is polled from the thread, so it
+    must only READ cheap shared state (e.g. an int), never touch the EPS object
+    while the main thread is inside solve()."""
+    stop = threading.Event()
+    if RANK != 0:
+        return stop
+    t0 = time.perf_counter()
+
+    def _beat():
+        while not stop.wait(interval):
+            extra = ""
+            if status_fn is not None:
+                try:
+                    extra = status_fn()
+                except Exception:
+                    extra = ""
+            print(f"[slepc]   ...{label}, {time.perf_counter()-t0:.0f}s elapsed"
+                  f"{extra}", flush=True)
+
+    threading.Thread(target=_beat, daemon=True).start()
+    return stop
+
+
 # ---------------------------------------------------------------------------
 # Graph: build (rank 0) if missing, then every rank loads the cache
 # ---------------------------------------------------------------------------
@@ -226,24 +256,34 @@ def solve_slepc(A, num_modes, tol, *, shift_invert, target, factor_solver,
         except Exception:
             bar = None
     seen = {"n": 0}
+    last_line = {"t": 0.0}
 
     def _monitor(eps, its, nconv, eig, err):
-        if bar is None:
-            return
-        try:
-            if nconv > seen["n"]:
-                bar.update(nconv - seen["n"])
-                seen["n"] = nconv
-            # Frontier residual = error of the next mode about to converge.
-            # The low Laplacian spectrum is clustered, so nconv sits flat for
-            # long stretches and jumps in bursts; this gives live progress
-            # (shrinking toward tol) during the flat phases.
-            frontier = ""
-            if err is not None and nconv < len(err):
-                frontier = f" res={float(err[nconv]):.1e}"
-            bar.set_postfix_str(f"iter={its}{frontier}")
-        except Exception:
-            pass
+        # Runs in the main thread, invoked by SLEPc at each restart boundary.
+        seen["n"] = nconv
+        # Frontier residual = error of the next mode about to converge. The low
+        # Laplacian spectrum is clustered, so nconv sits flat for long stretches
+        # and jumps in bursts; the residual shrinking toward tol shows live
+        # progress even while nconv is flat.
+        frontier = ""
+        if err is not None and nconv < len(err):
+            frontier = f" res={float(err[nconv]):.1e}"
+        # Plain newline line, throttled to ~10s. This is the RELIABLE progress
+        # signal: runai captures stdout line-by-line (\n), so it shows up --
+        # unlike the tqdm bar below, whose \r in-place updates a line-buffered
+        # log viewer typically never renders until the bar closes.
+        now = time.perf_counter()
+        if now - last_line["t"] >= 10.0:
+            last_line["t"] = now
+            log(f"solve: restart-iter={its} converged={nconv}/{num_modes}{frontier}")
+        # Pretty tqdm bar too (rank 0) -- nice on a real TTY; harmless otherwise.
+        if bar is not None:
+            try:
+                if nconv > bar.n:
+                    bar.update(nconv - bar.n)
+                bar.set_postfix_str(f"iter={its}{frontier}")
+            except Exception:
+                pass
 
     try:
         E.setMonitor(_monitor)
@@ -268,19 +308,7 @@ def solve_slepc(A, num_modes, tol, *, shift_invert, target, factor_solver,
         log(f"factorizing (shift-invert via {factor_solver}) -- silent phase; "
             "watch for MUMPS ICNTL(4) stats + the heartbeat below. No "
             "convergence bar until this completes ...")
-        stop_beat = threading.Event()
-        if RANK == 0:
-            t_beat = time.perf_counter()
-
-            def _heartbeat():
-                # wait() returns True when set -> exits promptly on completion.
-                while not stop_beat.wait(30.0):
-                    print(f"[slepc]   ...still factorizing, "
-                          f"{time.perf_counter()-t_beat:.0f}s elapsed",
-                          flush=True)
-
-            threading.Thread(target=_heartbeat, daemon=True).start()
-
+        stop_beat = start_heartbeat("still factorizing")
         t_fact = time.perf_counter()
         E.setUp()
         # Idempotent: forces PCSetUp (the factorization) if EPSSetUp deferred it,
@@ -302,8 +330,17 @@ def solve_slepc(A, num_modes, tol, *, shift_invert, target, factor_solver,
                 pass
         log(f"factorization complete in {dt_fact:.1f}s{stats}")
 
+    # The per-restart monitor (above) only updates the bar at restart boundaries,
+    # and the FIRST restart -- building the mpd-sized Krylov basis (mpd back-solves
+    # + orthogonalization) -- can take minutes with the bar parked at 0. Heartbeat
+    # the solve too, reporting elapsed time + the last-known converged count
+    # (seen["n"], updated by the monitor) so the iteration phase shows a pulse.
     t0 = time.perf_counter()
+    stop_beat = start_heartbeat(
+        "still iterating",
+        status_fn=lambda: f", {seen['n']}/{num_modes} modes converged")
     E.solve()
+    stop_beat.set()
     if bar is not None:
         bar.close()
     nconv = E.getConverged()
