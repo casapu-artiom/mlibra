@@ -44,7 +44,8 @@ MODES="${MODES:-300}"
 STRIDE="${STRIDE:-4}"
 THRESHOLD="${THRESHOLD:-5}"
 KNN_K="${KNN_K:-15}"
-KNN_METHOD="${KNN_METHOD:-faiss}"
+KNN_METHOD="${KNN_METHOD:-faiss}"        # faiss | anatomical_atlas | faiss_atlas_weighted
+CROSS_REGION_INFLATION="${CROSS_REGION_INFLATION:-10.0}"  # faiss_atlas_weighted weight
 NLIST="${NLIST:-1}"
 BANDWIDTH="${BANDWIDTH:-1.0}"
 NORMALIZATION="${NORMALIZATION:-randomwalk}"
@@ -110,6 +111,7 @@ echo "[slepc_eigensolve] NPROC=$NPROC -> $RUN_SLUG (shift_invert=$SHIFT_INVERT) 
         --threshold "$THRESHOLD" \
         --knn-k "$KNN_K" \
         --knn-method "$KNN_METHOD" \
+        --cross-region-inflation "$CROSS_REGION_INFLATION" \
         --nlist "$NLIST" \
         --bandwidth "$BANDWIDTH" \
         --normalization "$NORMALIZATION" \

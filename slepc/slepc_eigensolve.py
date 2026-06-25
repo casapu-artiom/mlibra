@@ -104,9 +104,79 @@ def start_heartbeat(label, status_fn=None, interval=30.0):
 
 
 # ---------------------------------------------------------------------------
+# Cache keys -- replicate the lgp experiments EXACTLY so SLEPc output is a
+# drop-in hit. Two keys are needed because faiss_atlas_weighted stores its KNN
+# graph under the plain-faiss key (the atlas reweighting is applied after load)
+# but keys its eigenvectors with the inflation factor.
+# Returns (build_method, graph_cache_key, eig_graph_key):
+#   build_method   - what KnnGraphCache.train_or_load understands ('faiss' /
+#                    'anatomical_atlas'); faiss_atlas_weighted builds plain faiss.
+#   graph_cache_key- where the KNN graph npz lives (shared with vanilla faiss).
+#   eig_graph_key  - the "graph" component of the eigvec key (carries the
+#                    weighting=atlas_x<infl> tag for faiss_atlas_weighted).
+# ---------------------------------------------------------------------------
+def resolve_graph_keys(args):
+    parts = {
+        "template": args.template, "stride": args.stride,
+        "thresh": args.threshold, "method": args.knn_method,
+        "k": args.knn_k, "bbox": None,
+    }
+    # nlist is an IVF index knob, not graph content: keyed only when non-default
+    # (recall ~1.0 at nlist=1), matching the experiments so caches stay shared.
+    if args.nlist != 1:
+        parts["nlist"] = args.nlist
+    if args.knn_method == "anatomical_atlas":
+        parts["atlas"] = "annotation_coarse_d4"
+        parts["conn"] = 3
+
+    if args.knn_method == "faiss_atlas_weighted":
+        base = dict(parts)
+        base["method"] = "faiss"            # graph is the plain-faiss cache
+        graph_cache_key = make_graph_key(base)
+        parts["weighting"] = f"atlas_x{args.cross_region_inflation:g}"
+        eig_graph_key = make_graph_key(parts)
+        return "faiss", graph_cache_key, eig_graph_key
+
+    build_method = args.knn_method
+    cache_key = make_graph_key(parts)
+    return build_method, cache_key, cache_key
+
+
+def apply_atlas_weighting(edge_index, edge_value, args):
+    """faiss_atlas_weighted: reweight (not retopologize) the loaded faiss graph
+    by inflating cross-region edges, exactly as the lgp experiments do, so the
+    resulting Laplacian -- and its eigvec fingerprint -- match. Deterministic:
+    node labels come from crop_or_stride_volume(stride) + threshold, recomputed
+    identically on every rank."""
+    if not args.annotations_file:
+        raise SystemExit("[slepc] faiss_atlas_weighted needs --annotations-file "
+                         "(atlas labels drive cross-region detection).")
+    if not args.reference_file:
+        raise SystemExit("[slepc] faiss_atlas_weighted needs --reference-file "
+                         "(defines the tissue mask / node order).")
+    from utils import crop_or_stride_volume
+    from manifold_gp.utils.anatomical_knn import (
+        labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
+    )
+    reference_image = np.load(args.reference_file)
+    annotation_volume = np.load(args.annotations_file)
+    sub_volume, sub_atlas, _off, _scale = crop_or_stride_volume(
+        reference_image, annotation_volume, args.stride)
+    node_labels = labels_for_nodes_from_sub_atlas(
+        sub_volume, sub_atlas, args.threshold)
+    ei, ev, info = inflate_cross_region_edges(
+        edge_index, edge_value, node_labels,
+        inflation=args.cross_region_inflation, treat_zero_as_cross=True)
+    log(f"faiss_atlas_weighted: inflated cross-region edges "
+        f"x{args.cross_region_inflation:g} "
+        f"({info.get('n_cross', '?')}/{ei.shape[1]} edges reweighted)")
+    return ei, ev
+
+
+# ---------------------------------------------------------------------------
 # Graph: build (rank 0) if missing, then every rank loads the cache
 # ---------------------------------------------------------------------------
-def ensure_graph(knn_dir: Path, key: str, args) -> None:
+def ensure_graph(knn_dir: Path, key: str, args, build_method: str) -> None:
     """Rank 0 builds + caches the KNN graph if it isn't present. Collective:
     all ranks wait on the barrier so they can load it afterwards."""
     npz = Path(knn_dir) / f"{key}.knngraph.npz"
@@ -124,7 +194,7 @@ def ensure_graph(knn_dir: Path, key: str, args) -> None:
             )
         from utils import crop_or_stride_volume, reference_ccf_from_subvolume
         log(f"building graph {key} (stride={args.stride}, thr={args.threshold}, "
-            f"k={args.knn_k}, method={args.knn_method}) on rank 0 ...")
+            f"k={args.knn_k}, build_method={build_method}) on rank 0 ...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         reference_image = np.load(args.reference_file)
         annotation_volume = (np.load(args.annotations_file)
@@ -137,25 +207,30 @@ def ensure_graph(knn_dir: Path, key: str, args) -> None:
             (mm_coords - mm_coords.mean(0)) / mm_coords.std(0)
         ).float().to(device).contiguous()
         KnnGraphCache(cache_dir=knn_dir, verbose=True).train_or_load(
-            key=key, method=args.knn_method, k=args.knn_k, nlist=args.nlist,
+            key=key, method=build_method, k=args.knn_k, nlist=args.nlist,
             coords=coords, volume=sub_volume, threshold=args.threshold,
             atlas_volume=sub_atlas, connectivity=1,
             extra={"template": args.template, "stride": args.stride,
-                   "thresh": args.threshold, "method": args.knn_method,
+                   "thresh": args.threshold, "method": build_method,
                    "k": args.knn_k, "nlist": args.nlist, "bbox": None},
             device=device)
         log("graph build complete.")
     COMM.barrier()
 
 
-def load_operator(knn_dir: Path, key: str, bandwidth: float, normalization: str):
+def load_operator(knn_dir: Path, key: str, bandwidth: float, normalization: str,
+                  args):
     """Every rank loads the cached graph (CPU) and builds the symmetric
-    GraphLaplacianOperator. Returns (op, edge_index, edge_value, N)."""
+    GraphLaplacianOperator. For faiss_atlas_weighted the loaded faiss graph is
+    reweighted (cross-region inflation) before the operator is built, so the
+    Laplacian matches the lgp experiments. Returns (op, edge_index, edge_value, N)."""
     hit = KnnGraphCache(cache_dir=knn_dir, verbose=False).load(key, device="cpu")
     if hit is None:
         raise SystemExit(f"[slepc] graph {key} missing after ensure_graph()")
     knn, edge_index, edge_value, _fp, _meta = hit
     N = int(knn.x.shape[0])
+    if args.knn_method == "faiss_atlas_weighted":
+        edge_index, edge_value = apply_atlas_weighting(edge_index, edge_value, args)
     op = GraphLaplacianOperator(
         edge_value, edge_index, N,
         torch.tensor(bandwidth, dtype=torch.float32),
@@ -379,7 +454,13 @@ def main():
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--threshold", type=float, default=5.0)
     p.add_argument("--knn-k", type=int, default=15)
-    p.add_argument("--knn-method", default="faiss")
+    p.add_argument("--knn-method", default="faiss",
+                   choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted"])
+    p.add_argument("--cross-region-inflation", type=float, default=10.0,
+                   help="faiss_atlas_weighted only: multiply cross-region edge "
+                        "weights (squared distances) by this factor. Encoded in "
+                        "the eigvec key as weighting=atlas_x<infl> so the cache "
+                        "matches the lgp experiments. Ignored by other methods.")
     p.add_argument("--nlist", type=int, default=1)
     p.add_argument("--bandwidth", type=float, default=1.0)
     p.add_argument("--normalization", choices=["symmetric", "randomwalk"],
@@ -414,16 +495,17 @@ def main():
     eigvec_dir = eig_dir / "eigvecs"
 
     # Cache keys -- identical scheme to the rest of the pipeline so the output
-    # is a drop-in cache hit downstream.
-    graph_key = make_graph_key({
-        "template": args.template, "stride": args.stride,
-        "thresh": args.threshold, "method": args.knn_method,
-        "k": args.knn_k, "nlist": args.nlist, "bbox": None})
+    # is a drop-in cache hit downstream. build_method/graph_cache_key drive the
+    # KNN graph cache; eig_graph_key (with the atlas weighting tag, if any) keys
+    # the eigenvectors.
+    build_method, graph_cache_key, eig_graph_key = resolve_graph_keys(args)
     eigvec_key = make_eig_key({
-        "graph": graph_key, "norm": args.normalization,
+        "graph": eig_graph_key, "norm": args.normalization,
         "bw": args.bandwidth, "modes": args.modes})
 
-    log(f"ranks={SIZE}  graph_key={graph_key}")
+    log(f"ranks={SIZE}  build_method={build_method}  "
+        f"graph_cache_key={graph_cache_key}")
+    log(f"eig_graph_key={eig_graph_key}")
     log(f"eigvec_key={eigvec_key}")
 
     # The LaplacianEigensolver helper (for postprocess/save) lives on rank 0
@@ -443,9 +525,9 @@ def main():
             "(use --force-recompute to overwrite).")
         return
 
-    ensure_graph(knn_dir, graph_key, args)
+    ensure_graph(knn_dir, graph_cache_key, args, build_method)
     op, edge_index, edge_value, N = load_operator(
-        knn_dir, graph_key, args.bandwidth, args.normalization)
+        knn_dir, graph_cache_key, args.bandwidth, args.normalization, args)
     log(f"N={N:,}  edges={edge_index.shape[1]:,}")
 
     A = build_petsc_matrix(op, N)
@@ -492,8 +574,12 @@ def main():
         evals_t, evecs_t = solver._postprocess(evals_t, evecs_t, op)
         fp = solver.fingerprint(op, args.bandwidth, args.normalization)
         solver.save(eigvec_dir, eigvec_key, evals_t, evecs_t, fp,
-                    extra={"graph_key": graph_key, "ranks": SIZE,
-                           "method": "slepc",
+                    extra={"graph_key": eig_graph_key,
+                           "graph_cache_key": graph_cache_key, "ranks": SIZE,
+                           "method": "slepc", "knn_method": args.knn_method,
+                           "cross_region_inflation": (
+                               args.cross_region_inflation
+                               if args.knn_method == "faiss_atlas_weighted" else None),
                            "spectral_transform":
                                "shift-invert" if args.shift_invert else "krylov-schur",
                            "stride": args.stride, "threshold": args.threshold,
