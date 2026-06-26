@@ -49,6 +49,11 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         graphbandwidth_prior: Optional[Prior] = None,
         graphbandwidth_constraint: Optional[Interval] = None,
         learn_graphbandwidth: bool = False,
+        # ---- Diffusion scale ----
+        diffusion_scale_init: float = 1.0,
+        diffusion_scale_prior: Optional[Prior] = None,
+        diffusion_scale_constraint: Optional[Interval] = None,
+        learn_diffusion_scale: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -134,6 +139,45 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         #      with learn_graphbandwidth=True only if you recompute eigenpairs.
         if not learn_graphbandwidth:
             self.raw_graphbandwidth.requires_grad_(False)
+
+        # ---- Diffusion scale: a learnable multiplicative factor on the (frozen)
+        #      Laplacian spectrum. Reshapes the Matern spectral density via
+        #      lambda_k -> diffusion_scale * lambda_k WITHOUT recomputing eigenpairs:
+        #      scaling an operator leaves its eigenvectors untouched and only scales
+        #      its eigenvalues, so the frozen `eigvec` stay exactly correct. It is the
+        #      free, multiplicative companion to the lengthscale's *additive* 2*nu/l^2
+        #      floor in S_k = (2*nu/l^2 + diffusion_scale * lambda_k)^-nu. Unlike the
+        #      graphbandwidth it does NOT desync the spectrum from the eigenvectors, so
+        #      it is safe to learn with frozen eigenpairs. It enters ONLY the spectral
+        #      density (the Matern smoothing operator); the OOS Nystrom correction
+        #      (1 - graphbandwidth^2 * lambda)^2 stays tied to the raw spectrum, since
+        #      that term encodes the graph heat-operator, not the Matern operator.
+        #      Init 1.0 (identity); frozen by default so behaviour is unchanged unless
+        #      learn_diffusion_scale=True.
+        if diffusion_scale_constraint is None:
+            diffusion_scale_constraint = Positive()
+
+        self.register_parameter(
+            name="raw_diffusion_scale",
+            parameter=torch.nn.Parameter(torch.zeros(*self.batch_shape, 1, 1)),
+        )
+
+        if diffusion_scale_prior is not None:
+            if not isinstance(diffusion_scale_prior, Prior):
+                raise TypeError(
+                    "Expected gpytorch.priors.Prior but got "
+                    + type(diffusion_scale_prior).__name__
+                )
+            self.register_prior(
+                "diffusion_scale_prior", diffusion_scale_prior,
+                self._diffusion_scale_param, self._diffusion_scale_closure,
+            )
+
+        self.register_constraint("raw_diffusion_scale", diffusion_scale_constraint)
+        self._set_diffusion_scale(torch.tensor(float(diffusion_scale_init)))
+
+        if not learn_diffusion_scale:
+            self.raw_diffusion_scale.requires_grad_(False)
  
     # ----------------------------------------------------------------------
     # Bandwidth plumbing
@@ -194,7 +238,31 @@ class RiemannKernel(gpytorch.kernels.Kernel):
 
     def laplacian(self):
         return GraphLaplacianOperator(self.edge_value, self.edge_index, self.knn.x.shape[0], self.graphbandwidth, self.laplacian_normalization)
-    
+
+    # ----------------------------------------------------------------------
+    # Diffusion-scale plumbing
+    # ----------------------------------------------------------------------
+    def _diffusion_scale_param(self, m) -> Tensor:
+        return m.diffusion_scale
+
+    def _diffusion_scale_closure(self, m, v: Tensor) -> Tensor:
+        return m._set_diffusion_scale(v)
+
+    def _set_diffusion_scale(self, value: Tensor):
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value).to(self.raw_diffusion_scale)
+        self.initialize(
+            raw_diffusion_scale=self.raw_diffusion_scale_constraint.inverse_transform(value)
+        )
+
+    @property
+    def diffusion_scale(self) -> Tensor:
+        return self.raw_diffusion_scale_constraint.transform(self.raw_diffusion_scale)
+
+    @diffusion_scale.setter
+    def diffusion_scale(self, value: Tensor):
+        self._set_diffusion_scale(value)
+
 
     # ----------------------------------------------------------------------
     # Forward + features

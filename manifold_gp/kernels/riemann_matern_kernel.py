@@ -20,7 +20,12 @@ class RiemannMaternKernel(RiemannKernel):
 
     def spectral_density(self):
         safe_eigval = self.eigval.clamp(min=0.0)
-        return (2*self.nu / self.lengthscale.square() + safe_eigval).pow(-self.nu)
+        # diffusion_scale (init 1.0, frozen unless learn_diffusion_scale=True) is a
+        # multiplicative scale on the frozen spectrum: lambda_k -> diffusion_scale*lambda_k.
+        # It needs no eigenpair recompute (scaling an operator leaves eigvecs unchanged),
+        # and is the multiplicative companion to the lengthscale's additive 2*nu/l^2 floor.
+        return (2*self.nu / self.lengthscale.square()
+                + self.diffusion_scale * safe_eigval).pow(-self.nu)
 
     def precision(self):
         return PrecisionMaternOperator(self.laplacian(), self.nu, self.lengthscale)
