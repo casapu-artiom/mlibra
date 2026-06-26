@@ -6,6 +6,8 @@
 #
 # 1) SINGLE RUN (override knobs via env vars):
 #    KERNEL_FAMILY=manifold NU=2 LENGTHSCALE=1.0 ./run_per_lipid.sh
+#    KERNEL_FAMILY=eigenmap EMBED_DIM=10 EIGENVECTOR_DIR=... ./run_per_lipid.sh
+#    KERNEL_FAMILY=spectral EIGENVECTOR_DIR=... ./run_per_lipid.sh
 #
 # 2) SWEEP (uncomment / edit one of the SWEEP_* loops below):
 #    ./run_per_lipid.sh
@@ -17,8 +19,13 @@
 # =============================================================================
 
 # ---- which kernel ----
-: "${KERNEL_FAMILY:=manifold}"          # euclidean | manifold
-: "${KERNEL:=matern}"                   # only used for euclidean
+: "${KERNEL_FAMILY:=manifold}"          # euclidean | manifold | eigenmap | spectral
+: "${KERNEL:=matern}"                   # only used for euclidean / eigenmap
+# eigenmap: project coords into the leading EMBED_DIM Laplacian eigenfunctions,
+# then a Euclidean ARD Matern GP over that embedding (needs EIGENVECTOR_DIR).
+# spectral: weight-space SpectralLatentGP over the manifold spectrum, per lipid
+# (needs EIGENVECTOR_DIR).
+: "${EMBED_DIM:=10}"                     # eigenmap only
 
 # ---- ARD (euclidean kernel only) ----
 # NO_ARD=1 (default) → isotropic single shared lengthscale (passes --no-ard).
@@ -205,6 +212,11 @@ run_one() {
         [ "$PER_TASK_LENGTHSCALE" = "1" ] && TAG="${TAG}-ptls"
         # Learned diffusion scale (multiplicative spectral scale) → distinct dirs.
         [ "$LEARN_DIFFUSION_SCALE" = "1" ] && TAG="${TAG}-learndiff"
+    elif [ "$FAMILY" = "eigenmap" ]; then
+        TAG="eigenmap-r${EMBED_DIM}-${ARD_TAG}-${KERNEL}-nu${NU_}-K${NMODES_}-stride${STRIDE}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+    elif [ "$FAMILY" = "spectral" ]; then
+        TAG="spectral-nu${NU_}-K${NMODES_}-stride${STRIDE}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
+        [ "$LEARN_DIFFUSION_SCALE" = "1" ] && TAG="${TAG}-learndiff"
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
@@ -222,24 +234,11 @@ run_one() {
     echo "  RUN: $EXP_NAME"
     echo "================================================================"
 
+    # Graph + eigensolve args are needed by every family that consumes the
+    # Laplacian spectrum: 'manifold' (Riemann kernel), 'eigenmap' (eigenfunction
+    # embedding) and 'spectral' (weight-space basis). Only 'euclidean' skips them.
     local manifold_args=""
-    if [ "$FAMILY" = "manifold" ]; then
-        # "Fixed" lengthscale mode pins the kernel lengthscale; "learned"
-        # mode omits both flags so the GP trains it from its own default.
-        local ls_args=""
-        if [ "$FIXED_LENGTHSCALE" = "1" ]; then
-            ls_args="--lengthscale-init $LENGTHSCALE_INIT --lengthscale-no-decay"
-        fi
-        # Per-task lengthscale: one learnable lengthscale per lipid (shared graph).
-        if [ "$PER_TASK_LENGTHSCALE" = "1" ]; then
-            ls_args="$ls_args --per-task-lengthscale"
-        fi
-        # Diffusion scale: always pass the init (1.0 = identity); only make it
-        # learnable when asked. No eigenpair recompute either way.
-        local diff_args="--diffusion-scale-init $DIFFUSION_SCALE_INIT"
-        if [ "$LEARN_DIFFUSION_SCALE" = "1" ]; then
-            diff_args="$diff_args --learn-diffusion-scale"
-        fi
+    if [ "$FAMILY" != "euclidean" ]; then
         local augment_args=""
         # Graph augmentation (adds MALDI voxels as graph nodes) — optional and
         # INDEPENDENT of the inducing blend below.
@@ -249,8 +248,6 @@ run_one() {
                 --maldi-subsample-method $MALDI_SUBSAMPLE_METHOD"
         fi
         # Inducing-point blend over the (possibly strided, unaltered) graph.
-        # Does NOT require --augment-maldi-nodes: the graph stays as-is and the
-        # measured MALDI voxels are merely snapped onto it for the 20% share.
         if [ "$INDUCING_FROM_MALDI_NODES" = "1" ]; then
             augment_args="$augment_args --inducing-from-maldi-nodes \
                 --inducing-density-frac $INDUCING_DENSITY_FRAC"
@@ -267,9 +264,27 @@ run_one() {
             --graphbandwidth-init $BW_ \
             --num-modes $NMODES_ \
             --ncv-min $NCV_MIN \
-            --threshold "$THRESHOLD" \
-            $ls_args \
-            $diff_args"
+            --threshold "$THRESHOLD""
+
+        # Diffusion scale is consumed at kernel-build time (Riemann spectral
+        # density), so it applies to 'manifold' and 'spectral'.
+        if [ "$FAMILY" = "manifold" ] || [ "$FAMILY" = "spectral" ]; then
+            manifold_args="$manifold_args --diffusion-scale-init $DIFFUSION_SCALE_INIT"
+            [ "$LEARN_DIFFUSION_SCALE" = "1" ] && \
+                manifold_args="$manifold_args --learn-diffusion-scale"
+        fi
+        # Lengthscale init / per-task lengthscale are applied in the manifold
+        # training branch only.
+        if [ "$FAMILY" = "manifold" ]; then
+            [ "$FIXED_LENGTHSCALE" = "1" ] && \
+                manifold_args="$manifold_args --lengthscale-init $LENGTHSCALE_INIT --lengthscale-no-decay"
+            [ "$PER_TASK_LENGTHSCALE" = "1" ] && \
+                manifold_args="$manifold_args --per-task-lengthscale"
+        fi
+        # Eigenmap embedding dimension.
+        if [ "$FAMILY" = "eigenmap" ]; then
+            manifold_args="$manifold_args --embed-dim $EMBED_DIM"
+        fi
     fi
 
     # Variational-family args. --variational is always passed (defaults to

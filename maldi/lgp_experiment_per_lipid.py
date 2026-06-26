@@ -63,7 +63,7 @@ from tqdm import tqdm
 # Re-use the EXISTING project pieces — no copy-paste.
 from config import MaldiConfig
 from l3di.lgp import IndependentMultitaskGPModel
-from l3di.lgp_manifold import LatentRiemannGP
+from l3di.lgp_manifold import LatentRiemannGP, SpectralLatentGP
 from utils import (
     get_inducing_points,
     get_data_inducing_points,
@@ -103,11 +103,23 @@ def parse_args() -> dict:
     )
 
     # ---- which kernel ----
-    p.add_argument("--kernel-family", choices=["euclidean", "manifold"],
+    p.add_argument("--kernel-family",
+                   choices=["euclidean", "manifold", "eigenmap", "spectral"],
                    required=True,
                    help="'euclidean' → IndependentMultitaskGPModel "
                         "(reuse from l3di.lgp), 'manifold' → "
-                        "LatentRiemannGP (reuse from l3di.lgp_manifold).")
+                        "LatentRiemannGP (reuse from l3di.lgp_manifold), "
+                        "'eigenmap' → project coords into the leading "
+                        "--embed-dim Laplacian eigenfunctions, then a Euclidean "
+                        "ARD Matern GP over that embedding (reuses the euclidean "
+                        "path; needs --eigenvector-dir), 'spectral' → weight-space "
+                        "SpectralLatentGP over the manifold spectrum, one per lipid "
+                        "(needs --eigenvector-dir).")
+    p.add_argument("--embed-dim", dest="embed_dim", type=int, default=10,
+                   help="(--kernel-family eigenmap) number of leading Laplacian "
+                        "eigenfunctions to use as the GP input coordinates. Keep "
+                        "small (diffusion-map regime); ARD lets the kernel weight "
+                        "modes. Default 10.")
 
     # ---- everything common to both experiment scripts ----
     p.add_argument("--exp-name", required=True,
@@ -584,6 +596,24 @@ def load_maldi_columns(maldi_file, filter_expr, lipid_indices,
     coords = torch.from_numpy(df_coords.values.astype(np.float32))
     values = torch.from_numpy(df_lip.values.astype(np.float32))
     return coords, values
+
+
+def embed_eigenmap(kernel, x, r, device, chunk=50000):
+    """Project coordinates into the leading ``r`` UNSCALED Laplacian eigenfunctions.
+
+    ``e(x) = kernel.raw_eigenvectors(x)[:, :r]`` (smoothest r modes, since the
+    eigenpairs are sorted by ascending eigenvalue). Chunked so the
+    ``(chunk, num_modes)`` intermediate stays bounded for million-point inputs.
+    Returns an ``(N, r)`` tensor on CPU.
+    """
+    outs = []
+    with torch.no_grad():
+        for i in range(0, x.shape[0], chunk):
+            # faiss GPU search (inside raw_eigenvectors) requires a contiguous
+            # input, like the reference_nodes the manifold path already snaps.
+            xb = x[i:i + chunk].to(device).contiguous()
+            outs.append(kernel.raw_eigenvectors(xb)[:, :r].cpu())
+    return torch.cat(outs, dim=0)
 
 
 # =============================================================================
@@ -1107,19 +1137,29 @@ def train_lipid_batch(
         )
 
     if manifold_kernel is None:
-        # Euclidean — same as run_final.sh's setup.
-        voxel_size = 0.025
-        # Equivalent to lgp_experiment.minimal_length_scale
-        minimal_length_scale = config.n_pixels * voxel_size / 3.0
-        # ard_num_dims: None → isotropic (--no-ard); 3 → per-axis ARD (default).
-        ard_num_dims = None if args.get("no_ard", False) else 3
+        # Euclidean — same as run_final.sh's setup. For the eigenmap family the
+        # inputs are the r-dim Laplacian-eigenfunction embedding (args["_embed_dim"]),
+        # so the GP runs over r features with per-mode ARD and no physical
+        # length-scale floor (the voxel-size floor is meaningless in eigenspace).
+        embed_dim = int(args.get("_embed_dim", 0))
+        if embed_dim:
+            input_dim = embed_dim
+            minimal_length_scale = 0.0
+            ard_num_dims = None if args.get("no_ard", False) else embed_dim
+        else:
+            voxel_size = 0.025
+            # Equivalent to lgp_experiment.minimal_length_scale
+            minimal_length_scale = config.n_pixels * voxel_size / 3.0
+            input_dim = 3
+            # ard_num_dims: None → isotropic (--no-ard); 3 → per-axis ARD (default).
+            ard_num_dims = None if args.get("no_ard", False) else 3
         model = IndependentMultitaskGPModel(
             inducing_points=inducing_points,
             num_tasks=n_tasks,
             kernel_type=config.kernel,
             nu=config.nu,
             minimal_length_scale=minimal_length_scale,
-            input_dim=3,
+            input_dim=input_dim,
             ard_num_dims=ard_num_dims,
             learn_inducing_locations=learn_inducing,
         ).to(device)
@@ -1769,6 +1809,185 @@ def predict_batched(model, likelihood, x: torch.Tensor, n_tasks: int,
 
 
 # =============================================================================
+# Spectral (weight-space SpectralLatentGP) per-lipid trainer
+# -----------------------------------------------------------------------------
+# SpectralLatentGP learns a diagonal variational posterior over the spectral
+# weights w (one mean+var per Laplacian eigenmode per lipid) with prior
+# N(0, Phi), Phi = the Matern spectral density. It has a custom kl_divergence()
+# and NO variational_strategy, so gpytorch.mlls.VariationalELBO (used by
+# train_lipid_batch) does not apply — hence this dedicated trainer. Prediction
+# reuses predict_batched (forward returns .mean / .variance of shape (N, tasks)).
+#
+# Objective mirrors train_lipid_batch's loss scale: a minibatch estimate of the
+# full-data expected log-likelihood (scaled by n_train/bs) minus the full KL.
+# v1 is ML-II (the per-task noise still has the Interval constraint preventing
+# collapse/explosion); the MAP-II hyperprior used by the analytic path is not
+# folded in here.
+# =============================================================================
+def train_lipid_batch_spectral(
+    *,
+    coords_train: torch.Tensor,   # (N, 3) CPU, z-scored
+    y_train: torch.Tensor,        # (N, B)
+    manifold_kernel,
+    config: MaldiConfig,
+    args: dict,
+    device: str,
+    log: logging.Logger,
+    pbar_desc: str,
+):
+    n_tasks = y_train.shape[1]
+    n_train = y_train.shape[0]
+
+    model = SpectralLatentGP(num_tasks=n_tasks, manifold_kernel=manifold_kernel).to(device)
+    likelihood = _build_task_likelihood(n_tasks, device)
+
+    model.train()
+    likelihood.train()
+    if args.get("lengthscale_no_decay", False):
+        no_decay, decay = [], []
+        for pname, p_ in model.named_parameters():
+            (no_decay if ("raw_lengthscale" in pname or "raw_graphbandwidth" in pname
+                          or "raw_diffusion_scale" in pname)
+             else decay).append(p_)
+        optimizer = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": 1e-3},
+             {"params": no_decay, "weight_decay": 0.0},
+             {"params": list(likelihood.parameters()), "weight_decay": 0.0}],
+            lr=config.learning_rate,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            list(model.parameters()) + list(likelihood.parameters()),
+            lr=config.learning_rate, weight_decay=1e-3,
+        )
+
+    bs = min(int(config.batch_size), n_train)
+    iters_per_epoch = max(1, n_train // bs)
+    n_iters = int(config.epochs) * iters_per_epoch
+    log_every = max(1, n_iters // 20)
+    grad_clip = float(args.get("grad_clip", 10.0))
+    skip_frac = float(args.get("bad_grad_skip_frac", 0.01))
+    two_pi = math.log(2.0 * math.pi)
+
+    # ---- resume from in-progress checkpoint ----
+    ckpt_path = args.get("checkpoint_path", None)
+    iter_start = 0
+    if ckpt_path is not None and Path(ckpt_path).exists():
+        try:
+            ckpt = torch.load(ckpt_path, map_location=device)
+            if ckpt.get("n_tasks") == n_tasks:
+                model.load_state_dict(ckpt["model_state"])
+                _restore_noise(likelihood, ckpt, device)
+                iter_start = int(ckpt.get("iter", 0))
+                log.info(f"  [{pbar_desc}] resumed spectral @ iter "
+                         f"{iter_start}/{n_iters}")
+        except Exception as ex:
+            log.warning(f"  [{pbar_desc}] could not load spectral ckpt: {ex}")
+
+    log.info(f"  [{pbar_desc}] spectral fit: n_train={n_train:,} bs={bs} "
+             f"epochs={args['epochs']} iters={n_iters} n_tasks={n_tasks} "
+             f"num_modes={model.num_modes}")
+
+    train_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(coords_train, y_train),
+        batch_size=bs, shuffle=True,
+        num_workers=int(args.get("dataloader_workers", 2)),
+        pin_memory=device.startswith("cuda"),
+        persistent_workers=int(args.get("dataloader_workers", 2)) > 0,
+        drop_last=True,
+    )
+
+    ckpt_every = int(args.get("checkpoint_every_epochs", 5))
+    pbar = tqdm(total=n_iters, initial=iter_start, desc=pbar_desc,
+                leave=False, dynamic_ncols=True)
+    bad_grad_count = 0
+    it = iter_start
+    last_loss = float("nan")
+
+    def _save_spectral_ckpt(iter_idx, epoch):
+        if ckpt_path is None:
+            return
+        try:
+            tmp = Path(str(ckpt_path) + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model_state": model.state_dict(),
+                        "likelihood_state": likelihood.state_dict(),
+                        "iter": iter_idx, "epoch": epoch, "n_tasks": n_tasks}, tmp)
+            os.replace(tmp, ckpt_path)
+        except Exception as ex:
+            log.warning(f"  [{pbar_desc}] spectral ckpt failed: {ex}")
+
+    start_epoch = iter_start // iters_per_epoch
+    for epoch in range(start_epoch, int(config.epochs)):
+        for coord_b, y_b in train_loader:
+            coord_b = coord_b.to(device, non_blocking=True)
+            y_b = y_b.to(device, non_blocking=True)
+            optimizer.zero_grad()
+            gp_out = model(coord_b)
+            mean_z = gp_out.mean                       # (b, tasks)
+            var_z = gp_out.variance.clamp(min=0)       # (b, tasks)
+            sigma2 = likelihood.task_noises.clamp(min=1e-8)   # (tasks,)
+            # Expected Gaussian log-likelihood under the diagonal posterior.
+            ell = -0.5 * (
+                two_pi + torch.log(sigma2)
+                + ((y_b - mean_z) ** 2 + var_z) / sigma2
+            ).sum()
+            kl = model.kl_divergence()
+            loss = -(n_train / bs) * ell + kl
+
+            if not torch.isfinite(loss):
+                bad_grad_count += 1
+                _record_error(config, "nonfinite_loss", it,
+                              f"loss={loss.item()}", bad_grad_count, log)
+                _maybe_bail_on_nan_streak(bad_grad_count, it, args, skip_frac, log, pbar)
+                it += 1
+                pbar.update(1)
+                continue
+
+            loss.backward()
+            # NaN/Inf gradient handling (mirror train_lipid_batch).
+            n_bad = n_tot = 0
+            for p_ in list(model.parameters()) + list(likelihood.parameters()):
+                if p_.grad is None:
+                    continue
+                bad = ~torch.isfinite(p_.grad)
+                n_bad += int(bad.sum().item())
+                n_tot += p_.grad.numel()
+            if n_bad:
+                bad_grad_count += 1
+                frac = n_bad / max(1, n_tot)
+                if frac >= skip_frac:
+                    _record_error(config, "grad_skip", it,
+                                  f"frac={frac:.4f}", bad_grad_count, log)
+                    _maybe_bail_on_nan_streak(bad_grad_count, it, args, skip_frac, log, pbar)
+                    it += 1
+                    pbar.update(1)
+                    continue
+                for p_ in list(model.parameters()) + list(likelihood.parameters()):
+                    if p_.grad is not None:
+                        torch.nan_to_num_(p_.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                _record_error(config, "grad_zero", it, f"frac={frac:.4f}",
+                              bad_grad_count, log)
+                _maybe_bail_on_nan_streak(bad_grad_count, it, args, skip_frac, log, pbar)
+            else:
+                bad_grad_count = 0
+
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(likelihood.parameters()), grad_clip)
+            optimizer.step()
+            last_loss = float(loss.item())
+            it += 1
+            pbar.update(1)
+            if it % log_every == 0:
+                log.info(f"  [{pbar_desc}] it {it}/{n_iters} loss={last_loss:.3f} "
+                         f"kl={float(kl.item()):.3f}")
+        if ckpt_every and ((epoch + 1) % ckpt_every == 0):
+            _save_spectral_ckpt(it, epoch + 1)
+    pbar.close()
+    return model, likelihood, "ok"
+
+
+# =============================================================================
 # Variational Nearest-Neighbour GP (VNNGP, Wu et al. 2022) — isolated path
 # -----------------------------------------------------------------------------
 # Single-output, Euclidean Matern. Inducing points = (a dense subset of) the
@@ -2087,11 +2306,16 @@ def main():
     log.info(f"  got {inducing_points.shape[0]} inducing points")
     inducing_points = inducing_points.to(args["device"])
 
-    # ---- manifold setup (only if needed) ----
+    # ---- manifold setup (manifold / eigenmap / spectral all need the graph
+    # + eigenpairs: 'manifold' uses the Riemann kernel directly, 'eigenmap'
+    # uses the eigenfunctions as input features, 'spectral' uses them as the
+    # weight-space basis) ----
+    needs_graph = args["kernel_family"] in ("manifold", "eigenmap", "spectral")
     manifold_ctx = None
-    if args["kernel_family"] == "manifold":
+    if needs_graph:
         if args.get("eigenvector_dir") is None:
-            log.error("--eigenvector-dir is required for --kernel-family=manifold")
+            log.error(f"--eigenvector-dir is required for "
+                      f"--kernel-family={args['kernel_family']}")
             sys.exit(2)
         log.info("Building manifold kernel (graph + eigenvectors) …")
         manifold_ctx = setup_manifold_kernel(
@@ -2259,6 +2483,36 @@ def main():
         log.info(f"  brain grid: {brain_nodes_z.shape[0]:,} voxels")
     else:
         brain_nodes_z = manifold_ctx["reference_nodes"]
+
+    # =====================================================================
+    # Eigenmap: replace the 3D coordinates with the standardized leading-r
+    # Laplacian-eigenfunction embedding, then fall through to the EUCLIDEAN
+    # analytic path (the GP is a standard ARD Matern over e(x)). The embedding
+    # is fixed (precomputed); the ARD kernel learns per-mode weighting.
+    # =====================================================================
+    if args["kernel_family"] == "eigenmap":
+        r = int(args["embed_dim"])
+        kern = manifold_ctx["kernel"]
+        dev = args["device"]
+        log.info(f"Eigenmap: embedding coordinates into leading {r} "
+                 f"eigenfunctions (of {kern.num_modes} modes) …")
+        emb_tr = embed_eigenmap(kern, coords_tr_z, r, dev)        # CPU (N_tr, r)
+        emb_mean = emb_tr.mean(0)
+        emb_std = emb_tr.std(0).clamp(min=1e-6)
+        torch.save({"emb_mean": emb_mean, "emb_std": emb_std, "r": r},
+                   out_root / "eigenmap_embed.pt")
+        # Train stays on CPU (DataLoader moves minibatches to GPU); the rest go
+        # to GPU for one-shot chunked prediction. Standardize with train stats.
+        coords_tr_z = (emb_tr - emb_mean) / emb_std
+        coords_te_z = ((embed_eigenmap(kern, coords_te_z, r, dev) - emb_mean)
+                       / emb_std).to(dev)
+        brain_nodes_z = ((embed_eigenmap(kern, brain_nodes_z, r, dev) - emb_mean)
+                         / emb_std).to(dev)
+        inducing_points = ((embed_eigenmap(kern, inducing_points, r, dev) - emb_mean)
+                           / emb_std).to(dev)
+        args["_embed_dim"] = r
+        log.info(f"  embedded: train {tuple(coords_tr_z.shape)}, "
+                 f"inducing {tuple(inducing_points.shape)}")
 
     # =====================================================================
     # VNNGP path (isolated). Euclidean only; fits one lipid at a time and
@@ -2542,18 +2796,35 @@ def main():
 
         t0 = time.time()
         try:
-            model, likelihood, train_status = train_lipid_batch(
-                coords_train=coords_tr_z,
-                y_train=y_tr_z_batch,
-                inducing_points=inducing_points,
-                config=config,
-                args=args_for_batch,
-                manifold_kernel=(manifold_ctx["kernel"]
-                                 if manifold_ctx is not None else None),
-                device=args["device"],
-                log=log,
-                pbar_desc=f"batch {batch_i+1}/{n_batches}",
-            )
+            if args["kernel_family"] == "spectral":
+                model, likelihood, train_status = train_lipid_batch_spectral(
+                    coords_train=coords_tr_z,
+                    y_train=y_tr_z_batch,
+                    manifold_kernel=manifold_ctx["kernel"],
+                    config=config,
+                    args=args_for_batch,
+                    device=args["device"],
+                    log=log,
+                    pbar_desc=f"batch {batch_i+1}/{n_batches}",
+                )
+            else:
+                # 'manifold' uses the Riemann kernel; 'euclidean' and 'eigenmap'
+                # take the kernel-free path (eigenmap's inputs are already the
+                # eigenfunction embedding).
+                mk = (manifold_ctx["kernel"]
+                      if (manifold_ctx is not None
+                          and args["kernel_family"] == "manifold") else None)
+                model, likelihood, train_status = train_lipid_batch(
+                    coords_train=coords_tr_z,
+                    y_train=y_tr_z_batch,
+                    inducing_points=inducing_points,
+                    config=config,
+                    args=args_for_batch,
+                    manifold_kernel=mk,
+                    device=args["device"],
+                    log=log,
+                    pbar_desc=f"batch {batch_i+1}/{n_batches}",
+                )
             if train_status == "early_stopped_from_ckpt":
                 # Training diverged but we recovered the last checkpoint
                 # so we can still save predictions. Mark the run as

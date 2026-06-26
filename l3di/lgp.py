@@ -95,7 +95,7 @@ class IndependentMultitaskGPModel(ApproximateGP):
 
         # The mean and covariance modules should be marked as batch
         # so we learn a different set of hyperparameters
-        self.mean_module = LinearMean(input_size=3, batch_shape=torch.Size([num_tasks]))
+        self.mean_module = LinearMean(input_size=input_dim, batch_shape=torch.Size([num_tasks]))
         self.kernel_type = kernel_type
         self.nu = nu
         if kernel_type == "rbf":
@@ -114,8 +114,12 @@ class IndependentMultitaskGPModel(ApproximateGP):
                 # lengthscale to size-3, and the non-ARD MaternCovariance path then
                 # rejects it ("cannot handle multiple lengthscales").
                 if ard_num_dims and ard_num_dims > 1:
+                    # Per-axis floor: constrain only the first dimension (matches the
+                    # original size-3 [minimal_length_scale, 0, 0]); generalized to any
+                    # ard_num_dims so non-3D inputs (e.g. the eigenmap embedding) work.
+                    floor_vec = [minimal_length_scale] + [0.0] * (ard_num_dims - 1)
                     lengthscale_constraint = gpytorch.constraints.GreaterThan(
-                        torch.tensor([minimal_length_scale, 0, 0], dtype=torch.float32))
+                        torch.tensor(floor_vec, dtype=torch.float32))
                 else:
                     lengthscale_constraint = gpytorch.constraints.GreaterThan(minimal_length_scale)
                 self.covar_module = ScaleKernel(

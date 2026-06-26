@@ -409,8 +409,9 @@ class SpectralLatentGP(gpytorch.models.GP):
         U_star = self.kernel.raw_eigenvectors(x)
         
         # 2. Compute Mean: (Batch, m) @ (m, tasks) -> (Batch, tasks)
-        # Broadcasting the constant (tasks,) works automatically here
-        mean_z = torch.matmul(U_star, self.q_mu.T) + self.mean_module.constant
+        # ConstantMean(batch_shape=[tasks]).constant is (tasks, 1); flatten to
+        # (tasks,) so it broadcasts over the Batch dim of mean_z (Batch, tasks).
+        mean_z = torch.matmul(U_star, self.q_mu.T) + self.mean_module.constant.view(-1)
         
         # 3. Compute Variance: (Batch, m) @ (m, tasks) -> (Batch, tasks)
         var_z = torch.matmul(U_star.pow(2), self.q_log_diag_S.exp().T)
