@@ -119,6 +119,17 @@
 # kernel (its batched kernel is already per-task). Encoded in the TAG as -ptls.
 : "${PER_TASK_LENGTHSCALE:=0}"
 
+# ---- Diffusion scale (manifold kernel) -----------------------------------
+# Multiplicative scale on the (frozen) Laplacian spectrum: lambda_k ->
+# DIFFUSION_SCALE * lambda_k in the Matern spectral density. Needs NO eigenpair
+# recompute (scaling an operator leaves its eigenvectors unchanged), so it is a
+# cheap, learnable companion to the lengthscale (which only sets the additive
+# 2*nu/l^2 floor). LEARN_DIFFUSION_SCALE=1 makes it trainable; otherwise it is
+# pinned at DIFFUSION_SCALE_INIT (1.0 = identity, i.e. unchanged behaviour).
+# When learned, encoded in the TAG as -learndiff.
+: "${DIFFUSION_SCALE_INIT:=1.0}"
+: "${LEARN_DIFFUSION_SCALE:=0}"
+
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
@@ -192,6 +203,8 @@ run_one() {
         [ "$KMETHOD_" = "faiss_atlas_weighted" ] && TAG="${TAG}-infl${CROSS_REGION_INFLATION}"
         # Per-task vs shared lengthscale → distinct output dirs.
         [ "$PER_TASK_LENGTHSCALE" = "1" ] && TAG="${TAG}-ptls"
+        # Learned diffusion scale (multiplicative spectral scale) → distinct dirs.
+        [ "$LEARN_DIFFUSION_SCALE" = "1" ] && TAG="${TAG}-learndiff"
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
@@ -221,6 +234,12 @@ run_one() {
         if [ "$PER_TASK_LENGTHSCALE" = "1" ]; then
             ls_args="$ls_args --per-task-lengthscale"
         fi
+        # Diffusion scale: always pass the init (1.0 = identity); only make it
+        # learnable when asked. No eigenpair recompute either way.
+        local diff_args="--diffusion-scale-init $DIFFUSION_SCALE_INIT"
+        if [ "$LEARN_DIFFUSION_SCALE" = "1" ]; then
+            diff_args="$diff_args --learn-diffusion-scale"
+        fi
         local augment_args=""
         # Graph augmentation (adds MALDI voxels as graph nodes) — optional and
         # INDEPENDENT of the inducing blend below.
@@ -249,7 +268,8 @@ run_one() {
             --num-modes $NMODES_ \
             --ncv-min $NCV_MIN \
             --threshold "$THRESHOLD" \
-            $ls_args"
+            $ls_args \
+            $diff_args"
     fi
 
     # Variational-family args. --variational is always passed (defaults to
