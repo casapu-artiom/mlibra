@@ -11,6 +11,12 @@
 : "${N_EPOCHS:=10}"
 : "${LEARNING_RATE:=0.001}"
 : "${GRAPHBANDWIDTH:=0.07}"
+# Diffusion scale (manifold kernel): multiplicative scale on the frozen Laplacian
+# spectrum (lambda_k -> DIFFUSION_SCALE_INIT * lambda_k in the Matern spectral
+# density). No eigenpair recompute. LEARN_DIFFUSION_SCALE=1 trains it; otherwise
+# pinned at the init (1.0 = identity). Adds -learndiff to EXP_NAME when learned.
+: "${DIFFUSION_SCALE_INIT:=1.0}"
+: "${LEARN_DIFFUSION_SCALE:=0}"
 : "${NU:=2}"
 : "${KNN_K:=15}"
 : "${BUMP_SCALE:=1.0}"
@@ -69,6 +75,14 @@ fi
 
 EXP_NAME="$EXP_PREFIX-MANIFOLD-$SAMPLING_TAG-$LATENT_DIM-$STRIDE-$TEMPLATE_NAME-$THRESHOLD-$INDUCING_SOURCE-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$CROSS_REGION_INFLATION-$KNN_K-$LAPLACIAN_NORM-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH"
 
+# Diffusion scale: always pass the init (1.0 = identity); learn it only when asked,
+# and tag the run dir so learned vs frozen runs don't clobber each other.
+DIFF_ARGS="--diffusion-scale-init $DIFFUSION_SCALE_INIT"
+if [ "$LEARN_DIFFUSION_SCALE" = "1" ]; then
+    DIFF_ARGS="$DIFF_ARGS --learn-diffusion-scale"
+    EXP_NAME="$EXP_NAME-learndiff"
+fi
+
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
@@ -99,6 +113,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --bump-scale $BUMP_SCALE \
     --bump-decay $BUMP_DECAY \
     --graphbandwidth-init $GRAPHBANDWIDTH \
+    $DIFF_ARGS \
     --knn-method $KNN_METHOD \
     --cross-region-inflation $CROSS_REGION_INFLATION \
     --knn-k $KNN_K \

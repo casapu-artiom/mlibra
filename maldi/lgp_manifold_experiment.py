@@ -103,6 +103,13 @@ def parse_args():
                              "For 3D coords a small FIXED value (~8) already gives recall "
                              "~1.0 at every N; 'sqrt' over-scans (grows with N for no gain).")
     parser.add_argument("--graphbandwidth-init", dest="graphbandwidth_init", type=float, default=1.0, help="Initial graph bandwidth.")
+    parser.add_argument("--diffusion-scale-init", dest="diffusion_scale_init", type=float, default=1.0,
+                        help="Initial multiplicative scale on the Laplacian spectrum "
+                             "(lambda_k -> diffusion_scale*lambda_k in the Matern spectral density). 1.0 = identity.")
+    parser.add_argument("--learn-diffusion-scale", dest="learn_diffusion_scale", action='store_true',
+                        help="Make the diffusion scale learnable. Reshapes the spectral density WITHOUT "
+                             "recomputing eigenpairs (scaling an operator leaves its eigenvectors unchanged); "
+                             "frozen at --diffusion-scale-init otherwise.")
     parser.add_argument("--bump-scale", dest="bump_scale", type=float, default=3.0, help="Bump function param.")
     parser.add_argument("--bump-decay", dest="bump_decay", type=float, default=0.05, help="Bump function param.")
     parser.add_argument("--num-modes", dest="num_modes", type=int, default=200, help="Number of eigenvectors to use.")
@@ -410,6 +417,8 @@ def setup_experiment(args):
             bump_decay=bump_decay,
             laplacian_normalization=laplacian_norm,
             graphbandwidth_init=graphbandwidth_init,
+            diffusion_scale_init=args.get("diffusion_scale_init", 1.0),
+            learn_diffusion_scale=args.get("learn_diffusion_scale", False),
         ).to(config.device)
         ls_init = args.get("lengthscale_init", None)
         if ls_init is not None:
