@@ -317,6 +317,18 @@ def parse_args() -> dict:
                         "For 3D coords a small FIXED value (~8) gives recall ~1.0 at "
                         "every N; 'sqrt' over-scans (grows with N for no gain).")
     p.add_argument("--graphbandwidth-init", type=float, default=0.1)
+    p.add_argument("--diffusion-scale-init", dest="diffusion_scale_init",
+                   type=float, default=1.0,
+                   help="Initial multiplicative scale on the Laplacian spectrum "
+                        "(lambda_k -> diffusion_scale*lambda_k in the Matern spectral "
+                        "density). 1.0 = identity.")
+    p.add_argument("--learn-diffusion-scale", dest="learn_diffusion_scale",
+                   action="store_true",
+                   help="Make the diffusion scale learnable. Reshapes the spectral "
+                        "density WITHOUT recomputing eigenpairs (scaling an operator "
+                        "leaves its eigenvectors unchanged), so it is a cheap, "
+                        "eigenpairs-free companion to the lengthscale. Frozen at "
+                        "--diffusion-scale-init otherwise.")
     p.add_argument("--bump-scale", type=float, default=20.0)
     p.add_argument("--bump-decay", type=float, default=0.01)
     p.add_argument("--num-modes", type=int, default=1300)
@@ -777,6 +789,8 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         bump_scale=args["bump_scale"], bump_decay=args["bump_decay"],
         laplacian_normalization=args["laplacian_norm"],
         graphbandwidth_init=args["graphbandwidth_init"],
+        diffusion_scale_init=args.get("diffusion_scale_init", 1.0),
+        learn_diffusion_scale=args.get("learn_diffusion_scale", False),
     ).to(args["device"])
     manifold_kernel.eval()
 
@@ -1122,6 +1136,8 @@ def train_lipid_batch(
                     bump_scale=mk.bump_scale, bump_decay=mk.bump_decay,
                     laplacian_normalization=mk.laplacian_normalization,
                     graphbandwidth_init=float(mk.graphbandwidth),
+                    diffusion_scale_init=float(mk.diffusion_scale),
+                    learn_diffusion_scale=args.get("learn_diffusion_scale", False),
                 ).to(device)
                 for _ in range(n_tasks)
             ]
@@ -1163,7 +1179,8 @@ def train_lipid_batch(
         # doesn't pull the (log-)scale toward its init independent of the data.
         no_decay, decay = [], []
         for pname, p_ in model.named_parameters():
-            (no_decay if ("raw_lengthscale" in pname or "raw_graphbandwidth" in pname)
+            (no_decay if ("raw_lengthscale" in pname or "raw_graphbandwidth" in pname
+                          or "raw_diffusion_scale" in pname)
              else decay).append(p_)
         optimizer = torch.optim.AdamW(
             [{"params": decay, "weight_decay": 1e-3},
