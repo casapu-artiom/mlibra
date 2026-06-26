@@ -50,6 +50,7 @@ import torch                        # noqa: E402
 
 from manifold_gp.utils.nearest_neighbors import (   # noqa: E402
     KnnGraphCache, make_key as make_graph_key,
+    resolve_nlist, resolve_nprobe,
 )
 from manifold_gp.utils.compute_eigenvectors import (  # noqa: E402
     LaplacianEigensolver, make_key as make_eig_key,
@@ -115,6 +116,42 @@ def start_heartbeat(label, status_fn=None, interval=30.0):
 #   eig_graph_key  - the "graph" component of the eigvec key (carries the
 #                    weighting=atlas_x<infl> tag for faiss_atlas_weighted).
 # ---------------------------------------------------------------------------
+def node_count(args) -> int:
+    """Node count N for (template, stride, threshold) -- the same crop/stride +
+    threshold the experiments use, so resolve_nlist('sqrt', N) yields the
+    identical nlist (and thus the identical cache key). Cheap (no faiss)."""
+    from utils import crop_or_stride_volume, reference_ccf_from_subvolume
+    reference_image = np.load(args.reference_file)
+    annotation_volume = (np.load(args.annotations_file)
+                         if args.annotations_file else None)
+    sub_volume, _sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
+        reference_image, annotation_volume, args.stride)
+    mm_coords = reference_ccf_from_subvolume(
+        sub_volume, voxel_offset, voxel_scale_mm, args.threshold)
+    return int(mm_coords.shape[0])
+
+
+def resolve_ivf(args):
+    """Resolve --nlist/--nprobe ('sqrt' or int) to ints, mutating args in place so
+    the rest of the code (keys + graph build) sees plain ints. 'sqrt' needs N,
+    computed once on rank 0 from the reference volume and broadcast so every rank
+    keys identically. Mirrors lgp_experiment_per_lipid: nlist=round(sqrt(N)),
+    nprobe=round(sqrt(nlist))."""
+    needs_n = any(isinstance(v, str) and v.strip().lower() == "sqrt"
+                  for v in (args.nlist, args.nprobe))
+    n = 0
+    if needs_n:
+        if not args.reference_file:
+            raise SystemExit("[slepc] --nlist/--nprobe sqrt needs --reference-file "
+                             "(to compute N for the sqrt resolution).")
+        if RANK == 0:
+            n = node_count(args)
+        if hasattr(COMM, "tompi4py"):
+            n = COMM.tompi4py().bcast(n, root=0)
+    args.nlist = resolve_nlist(args.nlist, n)
+    args.nprobe = resolve_nprobe(args.nprobe, args.nlist)
+
+
 def resolve_graph_keys(args):
     parts = {
         "template": args.template, "stride": args.stride,
@@ -207,7 +244,8 @@ def ensure_graph(knn_dir: Path, key: str, args, build_method: str) -> None:
             (mm_coords - mm_coords.mean(0)) / mm_coords.std(0)
         ).float().to(device).contiguous()
         KnnGraphCache(cache_dir=knn_dir, verbose=True).train_or_load(
-            key=key, method=build_method, k=args.knn_k, nlist=args.nlist,
+            key=key, method=build_method, k=args.knn_k,
+            nlist=args.nlist, nprobe=args.nprobe,
             coords=coords, volume=sub_volume, threshold=args.threshold,
             atlas_volume=sub_atlas, connectivity=1,
             extra={"template": args.template, "stride": args.stride,
@@ -461,7 +499,14 @@ def main():
                         "weights (squared distances) by this factor. Encoded in "
                         "the eigvec key as weighting=atlas_x<infl> so the cache "
                         "matches the lgp experiments. Ignored by other methods.")
-    p.add_argument("--nlist", type=int, default=1)
+    p.add_argument("--nlist", default="1",
+                   help="FAISS IVF nlist: an int, or 'sqrt' for round(sqrt(N)). "
+                        "Resolved with the same N as the experiments and keyed "
+                        "only when !=1, so 'sqrt' caches match the lgp runs.")
+    p.add_argument("--nprobe", default="1",
+                   help="FAISS IVF nprobe: an int, or 'sqrt' for round(sqrt(nlist))."
+                        " Not keyed (recall ~1.0 with adequate nprobe), but drives "
+                        "graph build recall -- pair with nlist=sqrt for the CPU path.")
     p.add_argument("--bandwidth", type=float, default=1.0)
     p.add_argument("--normalization", choices=["symmetric", "randomwalk"],
                    default="randomwalk")
@@ -493,6 +538,12 @@ def main():
     eig_dir = Path(args.eigenvector_dir)
     knn_dir = eig_dir / "knn"
     eigvec_dir = eig_dir / "eigvecs"
+
+    # Resolve IVF nlist/nprobe ('sqrt' -> ints) BEFORE the keys, since 'sqrt'
+    # depends on N and nlist is part of the graph key. Mutates args to plain ints.
+    resolve_ivf(args)
+    if args.nlist != 1 or args.nprobe != 1:
+        log(f"FAISS IVF: nlist={args.nlist} nprobe={args.nprobe}")
 
     # Cache keys -- identical scheme to the rest of the pipeline so the output
     # is a drop-in cache hit downstream. build_method/graph_cache_key drive the

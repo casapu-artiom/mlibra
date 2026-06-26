@@ -46,7 +46,8 @@ THRESHOLD="${THRESHOLD:-5}"
 KNN_K="${KNN_K:-15}"
 KNN_METHOD="${KNN_METHOD:-faiss}"        # faiss | anatomical_atlas | faiss_atlas_weighted
 CROSS_REGION_INFLATION="${CROSS_REGION_INFLATION:-10.0}"  # faiss_atlas_weighted weight
-NLIST="${NLIST:-1}"
+NLIST="${NLIST:-1}"                      # FAISS IVF nlist: int or 'sqrt'
+NPROBE="${NPROBE:-1}"                     # FAISS IVF nprobe: int or 'sqrt'
 BANDWIDTH="${BANDWIDTH:-1.0}"
 NORMALIZATION="${NORMALIZATION:-randomwalk}"
 TEMPLATE="${TEMPLATE:-reference}"
@@ -113,6 +114,7 @@ echo "[slepc_eigensolve] NPROC=$NPROC -> $RUN_SLUG (shift_invert=$SHIFT_INVERT) 
         --knn-method "$KNN_METHOD" \
         --cross-region-inflation "$CROSS_REGION_INFLATION" \
         --nlist "$NLIST" \
+        --nprobe "$NPROBE" \
         --bandwidth "$BANDWIDTH" \
         --normalization "$NORMALIZATION" \
         --modes "$MODES" \
