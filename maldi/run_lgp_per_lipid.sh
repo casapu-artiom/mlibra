@@ -113,6 +113,11 @@
 # modes never clobber each other's output dir.
 : "${FIXED_LENGTHSCALE:=1}"
 : "${LENGTHSCALE_INIT:=8.0}"
+# Per-task lengthscale (manifold only, 1=on): each lipid in the batch gets its
+# OWN learnable lengthscale (PerTaskRiemannWrapper) instead of one shared across
+# the batch; the eigenpairs/graph are still shared. No effect on the euclidean
+# kernel (its batched kernel is already per-task). Encoded in the TAG as -ptls.
+: "${PER_TASK_LENGTHSCALE:=0}"
 
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -185,6 +190,8 @@ run_one() {
         # Cross-region edge inflation only applies to faiss_atlas_weighted; encode
         # it there so a sweep over inflation values gets distinct output dirs.
         [ "$KMETHOD_" = "faiss_atlas_weighted" ] && TAG="${TAG}-infl${CROSS_REGION_INFLATION}"
+        # Per-task vs shared lengthscale → distinct output dirs.
+        [ "$PER_TASK_LENGTHSCALE" = "1" ] && TAG="${TAG}-ptls"
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
@@ -209,6 +216,10 @@ run_one() {
         local ls_args=""
         if [ "$FIXED_LENGTHSCALE" = "1" ]; then
             ls_args="--lengthscale-init $LENGTHSCALE_INIT --lengthscale-no-decay"
+        fi
+        # Per-task lengthscale: one learnable lengthscale per lipid (shared graph).
+        if [ "$PER_TASK_LENGTHSCALE" = "1" ]; then
+            ls_args="$ls_args --per-task-lengthscale"
         fi
         local augment_args=""
         # Graph augmentation (adds MALDI voxels as graph nodes) — optional and
