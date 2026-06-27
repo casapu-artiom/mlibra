@@ -17,6 +17,13 @@
 # pinned at the init (1.0 = identity). Adds -learndiff to EXP_NAME when learned.
 : "${DIFFUSION_SCALE_INIT:=1.0}"
 : "${LEARN_DIFFUSION_SCALE:=0}"
+# Product ARD-Matern (manifold kernel): multiply the (geodesic) Riemann kernel by an
+# ambient per-axis Euclidean Matern, k = k_geo * k_eucl-ARD, to regain the directional
+# anisotropy the Riemann kernel structurally lacks. PRODUCT_ARD_MATERN=1 enables it;
+# PRODUCT_ARD_NU is the Euclidean factor's smoothness. Off by default (adds -prodard
+# to EXP_NAME only when on, so existing dir names are unchanged).
+: "${PRODUCT_ARD_MATERN:=0}"
+: "${PRODUCT_ARD_NU:=2.5}"
 : "${NU:=2}"
 : "${KNN_K:=15}"
 : "${BUMP_SCALE:=1.0}"
@@ -89,6 +96,14 @@ elif [ "$DIFFUSION_SCALE_INIT" != "1.0" ]; then
     EXP_NAME="$EXP_NAME-diff$DIFFUSION_SCALE_INIT"
 fi
 
+# Product ARD-Matern: enable only when asked; encode it (with its nu) in the dir name
+# so a sweep over it gets distinct dirs. Off (default) adds no flag and no suffix.
+PROD_ARGS=""
+if [ "$PRODUCT_ARD_MATERN" = "1" ]; then
+    PROD_ARGS="--product-ard-matern --product-ard-nu $PRODUCT_ARD_NU"
+    EXP_NAME="$EXP_NAME-prodard$PRODUCT_ARD_NU"
+fi
+
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
@@ -120,6 +135,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --bump-decay $BUMP_DECAY \
     --graphbandwidth-init $GRAPHBANDWIDTH \
     $DIFF_ARGS \
+    $PROD_ARGS \
     --knn-method $KNN_METHOD \
     --cross-region-inflation $CROSS_REGION_INFLATION \
     --knn-k $KNN_K \
