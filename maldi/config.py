@@ -45,6 +45,10 @@ class MaldiConfig:
     do_brain_reconstruction: bool = False
     reconstruction_lipids: list = None
     reconstruction_lipids_by_index: bool = False
+    # Full parsed-CLI args dict (every experiment param, incl. manifold/diffusion
+    # knobs the typed fields above don't carry). Kept so to_dict()/W&B log the
+    # COMPLETE config, not just the hand-listed subset.
+    raw_args: dict = None
 
     @staticmethod
     def from_args(args):
@@ -132,6 +136,13 @@ class MaldiConfig:
             logging.info(f"Creating experiment {exp_path}")
             exp_path.mkdir(parents=True, exist_ok=True)
             np.save(exp_path / "args.npy", args)
+            # Also drop a human-readable snapshot of EVERY experiment param next to
+            # args.npy, so the output dir is self-describing without unpickling .npy.
+            try:
+                with open(exp_path / "config.json", "w") as _f:
+                    json.dump(args, _f, indent=2, default=str)
+            except Exception as _e:  # noqa: BLE001
+                logging.warning(f"could not write config.json: {_e}")
 
         return MaldiConfig(mode=mode,
                            dataset_path=dataset_path,
@@ -164,45 +175,37 @@ class MaldiConfig:
                            use_diffusion=use_diffusion,
                            do_brain_reconstruction=do_brain_reconstruction,
                            reconstruction_lipids=reconstruction_lipids,
-                           reconstruction_lipids_by_index=reconstruction_lipids_by_index)
+                           reconstruction_lipids_by_index=reconstruction_lipids_by_index,
+                           raw_args=dict(args))
 
     def to_dict(self):
         """
-        Convert the configuration to a dictionary.
+        Convert the configuration to a dictionary for logging (W&B / config.json).
+
+        Starts from EVERY parsed CLI arg (so the manifold/diffusion knobs — which
+        the typed dataclass fields don't carry — are all included), then overlays
+        the derived/canonical fields (resolved seed, exp_path, filters, ...).
 
         Returns:
-            dict: Dictionary representation of the configuration.
+            dict: Complete, JSON/W&B-safe representation of the configuration.
         """
-        return {
-            "mode": self.mode,
-            "dataset_path": str(self.dataset_path),
-            "maldi_file": str(self.maldi_file),
+        d = dict(self.raw_args or {})
+        d.update({
             "exp_name": self.exp_name,
-            "available_lipids_file": self.available_lipids_file,
-            "output_path": str(self.output_path),
             "exp_path": str(self.exp_path),
             "checkpoint_path": str(self.checkpoint_path),
-            "num_inducing": self.num_inducing,
-            "seed": self.seed,
-            "epochs": self.epochs,
-            "latent_dim": self.latent_dim,
+            "seed": self.seed,                 # resolved (-1 -> random)
             "device": self.device,
-            "kernel": self.kernel,
-            "slices_dataset_file": self.slices_dataset_file,
-            "template_name": self.template_name,
-            "reference_file": self.reference_file,
-            "annotations_file": self.annotations_file,
-            "log_transform": self.log_transform,
-            "nu": self.nu,
-            "n_pixels": self.n_pixels,
-            "learning_rate": self.learning_rate,
+            "num_inducing": self.num_inducing,
             "section_filter": self.section_filter,
             "test_filter": self.test_filter,
             "selected_lipids_names": self.selected_lipids_names,
             "use_diffusion": self.use_diffusion,
             "do_brain_reconstruction": self.do_brain_reconstruction,
             "reconstruction_lipids": self.reconstruction_lipids,
-        }
+            "reconstruction_lipids_by_index": self.reconstruction_lipids_by_index,
+        })
+        return {k: (str(v) if isinstance(v, Path) else v) for k, v in d.items()}
 
 def extract_filters(left_out_slice):
     # left out slice is a list of dictionary entries with sample and section, that is read from a json file.

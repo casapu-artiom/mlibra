@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 : "${BATCH_SIZE:=256}"
-: "${N_EPOCHS:=20}"
+: "${N_EPOCHS:=100}"
 : "${LEARNING_RATE:=0.001}"
 : "${SEED:=416465}"
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -8,7 +8,7 @@
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
-: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/difficult.json}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${MODEL:=mlp}"
 : "${RIDGE_ALHPA:=1.0}"
@@ -18,15 +18,18 @@
 : "${XGB_MAX_DEPTH:=6}"
 : "${XGB_LR:=0}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
-: "${EXP_PREFIX:=DIFFICULT}"
+: "${EXP_PREFIX:=FOLD-3}"
 
 cd $SRC_PATH
 #pip install -e .
 
-EXP_NAME="$EXP_PREFIX-BASELINES-MLP-$BATCH_SIZE"
+# Encode the actual MODEL (mlp/ridge/xgb) so a sweep over models gets distinct dirs
+# instead of all landing in the hardcoded ...-MLP-... path and clobbering each other.
+MODEL_TAG=$(echo "$MODEL" | tr '[:lower:]' '[:upper:]')
+EXP_NAME="$EXP_PREFIX-BASELINES-$MODEL_TAG-$BATCH_SIZE"
 
 python $SRC_PATH/maldi/experiment_baselines.py \
-    --exp-name $EXP_NAME \
+    --exp-name "$EXP_NAME" \
     --dataset-path $DATA_PATH \
     --maldi-file $MALDI_FILE \
     --output-dir $OUTPUT_DIR \

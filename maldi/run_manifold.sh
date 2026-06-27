@@ -73,14 +73,20 @@ else
     SAMPLING_FLAG=""             # Leave empty so Python falls back to its default
 fi
 
-EXP_NAME="$EXP_PREFIX-MANIFOLD-$SAMPLING_TAG-$LATENT_DIM-$STRIDE-$TEMPLATE_NAME-$THRESHOLD-$INDUCING_SOURCE-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$CROSS_REGION_INFLATION-$KNN_K-$LAPLACIAN_NORM-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH"
+# NOTE: every swept hyperparameter MUST appear here, or two configs collapse to the
+# same output dir and clobber each other's checkpoints/test/args.npy. K<modes> is
+# included because the submit sweep varies NUM_MODES at a fixed stride.
+EXP_NAME="$EXP_PREFIX-MANIFOLD-$SAMPLING_TAG-$LATENT_DIM-$STRIDE-K$NUM_MODES-$TEMPLATE_NAME-$THRESHOLD-$INDUCING_SOURCE-$NUM_INDUCING_POINTS-$BATCH_SIZE-$KNN_METHOD-$CROSS_REGION_INFLATION-$KNN_K-$LAPLACIAN_NORM-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH"
 
-# Diffusion scale: always pass the init (1.0 = identity); learn it only when asked,
-# and tag the run dir so learned vs frozen runs don't clobber each other.
+# Diffusion scale: always pass the init (1.0 = identity); learn it only when asked.
+# Encode the INIT VALUE in the tag (not just a boolean) so a sweep over inits gets
+# distinct dirs. Frozen-at-1.0 (the default) adds no suffix => unchanged dir names.
 DIFF_ARGS="--diffusion-scale-init $DIFFUSION_SCALE_INIT"
 if [ "$LEARN_DIFFUSION_SCALE" = "1" ]; then
     DIFF_ARGS="$DIFF_ARGS --learn-diffusion-scale"
-    EXP_NAME="$EXP_NAME-learndiff"
+    EXP_NAME="$EXP_NAME-learndiff$DIFFUSION_SCALE_INIT"
+elif [ "$DIFFUSION_SCALE_INIT" != "1.0" ]; then
+    EXP_NAME="$EXP_NAME-diff$DIFFUSION_SCALE_INIT"
 fi
 
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \

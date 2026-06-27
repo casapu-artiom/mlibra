@@ -2,23 +2,23 @@
 # Run the GPLFR (collapsed linear decoder) experiment on a MALDI CV fold.
 # Mirrors run_baseline.sh but targets gplfr_experiment.py.
 : "${BATCH_SIZE:=2000}"
-: "${N_EPOCHS:=100}"
-: "${LEARNING_RATE:=0.001}"
+: "${N_EPOCHS:=50}"
+: "${LEARNING_RATE:=0.005}"
 : "${SEED:=416465}"
-: "${LATENT_DIM:=8}"
-: "${NUM_INDUCING:=200}"
+: "${LATENT_DIM:=32}"
+: "${NUM_INDUCING:=1000}"
 : "${INVERSE_TEMPERATURE:=0.1}"
 : "${KERNEL:=matern}"
-: "${NU:=1.5}"
+: "${NU:=2.5}"
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
 : "${OUTPUT_DIR:=/home/casap/mlibra/output}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
-: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
-: "${EXP_PREFIX:=FOLD-3}"
+: "${EXP_PREFIX:=FOLD-2}"
 
 cd $SRC_PATH
 

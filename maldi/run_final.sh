@@ -14,10 +14,10 @@
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
-: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
-: "${EXP_PREFIX:=FOLD-3}"
+: "${EXP_PREFIX:=FOLD-2}"
 
 if [ "$NO_RSAMPLE" = "true" ] || [ "$NO_RSAMPLE" = "1" ]; then
     SAMPLING_TAG="MEAN"         # Update this to whatever you want the name to be without rsample
