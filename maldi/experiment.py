@@ -1224,6 +1224,17 @@ class MaldiExperiment:
             logging.info("Train and test numpy predictions do not exist, saving predictions to file")
             predict_original_scale = self.predict_original_scale_(train_predictions, test_predictions)
 
+        # Per-lipid held-out metrics table (read by lgp_report.py). Best-effort:
+        # never let metrics caching abort an otherwise-finished run.
+        try:
+            from lgp_metrics import write_metrics
+            for _split in ("test", "train"):
+                write_metrics(self.config.exp_path, _split,
+                              lipid_names=self.config.selected_lipids_names)
+            logging.info("Wrote per-lipid metrics.csv")
+        except Exception as _e:  # noqa: BLE001
+            logging.warning(f"metrics.csv generation failed: {_e}")
+
         if self.config.use_diffusion:
             logging.info("Using diffusion model for the experiment")
             from l3di.simple_ddpm1d import SimpleDDPM1D, SimpleUNet1D

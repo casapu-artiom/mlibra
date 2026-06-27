@@ -707,6 +707,17 @@ def main():
 
         logging.info("Per-split outputs written.")
 
+    # Per-lipid held-out metrics table (read by lgp_report.py). Runs in both the
+    # training and --skip-training paths (the npy already exist either way).
+    try:
+        from lgp_metrics import write_metrics
+        for _split in ("test", "train"):
+            write_metrics(config.exp_path, _split,
+                          lipid_names=config.selected_lipids_names)
+        logging.info("Wrote per-lipid metrics.csv")
+    except Exception as _e:  # noqa: BLE001
+        logging.warning(f"metrics.csv generation failed: {_e}")
+
     recon_lipids = args.get("reconstruction_lipids", None)
     lipid_filter = None
     if recon_lipids:
