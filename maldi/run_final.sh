@@ -9,6 +9,8 @@
 : "${KERNEL:=matern}"
 : "${MODE:=lgp}"
 : "${NO_RSAMPLE:=false}"
+: "${LEARN_INDUCING:=false}"   # true -> learn inducing-point locations (else fixed)
+: "${ARD:=false}"              # true -> per-axis ARD lengthscales (else isotropic)
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
 : "${OUTPUT_DIR:=/home/casap/mlibra/output}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
@@ -27,7 +29,19 @@ else
     SAMPLING_FLAG=""             # Leave empty so Python falls back to its default
 fi
 
-EXP_NAME="$EXP_PREFIX-LGPALL-$SAMPLING_TAG-$LATENT_DIM-$INDUCING_SOURCE-$NUM_INDUCING_POINTS-$BATCH_SIZE"
+if [ "$LEARN_INDUCING" = "true" ] || [ "$LEARN_INDUCING" = "1" ]; then
+    LEARN_INDUCING_FLAG="--learn-inducing"; LI_TAG="learnind"
+else
+    LEARN_INDUCING_FLAG="";               LI_TAG="fixind"
+fi
+
+if [ "$ARD" = "true" ] || [ "$ARD" = "1" ]; then
+    ARD_FLAG="--ard"; ARD_TAG="ard"
+else
+    ARD_FLAG="";      ARD_TAG="iso"
+fi
+
+EXP_NAME="$EXP_PREFIX-LGPALL-$SAMPLING_TAG-$LATENT_DIM-$INDUCING_SOURCE-$NUM_INDUCING_POINTS-$BATCH_SIZE-$LI_TAG-$ARD_TAG"
 
 cd $SRC_PATH
 #pip install -e .
@@ -53,4 +67,5 @@ python $SRC_PATH/maldi/lgp_experiment.py \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
     --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
+    $LEARN_INDUCING_FLAG $ARD_FLAG \
     $SAMPLING_FLAG "$@"

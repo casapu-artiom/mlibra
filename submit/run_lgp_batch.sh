@@ -26,7 +26,7 @@ GPU=0.5
 
 N_EPOCHS=10
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_7"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_16"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -37,12 +37,12 @@ S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_availabl
 SRC_PATH="/myhome/mlibra"
 
 submit() {
-    local job_name=$1 slices=$2 prefix=$3 norsample=$4
-	shift 4
+    local job_name=$1 slices=$2 prefix=$3 norsample=$4 inducing_source=$5
+	shift 5
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
-        -i artiomartiom/sdsc:maldi_manifold_latest \
+        -i artiomartiom/sdsc:withfaiss \
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
@@ -58,27 +58,46 @@ submit() {
         -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
         -e SRC_PATH="$SRC_PATH" \
         -e N_EPOCHS="$N_EPOCHS" \
+        -e LATENT_DIM=5 \
         -e NUM_INDUCING_POINTS=1000 \
+        -e INDUCING_SOURCE="$inducing_source" \
         -e NUM_MODES=2000 \
         -e NO_RSAMPLE="$norsample" \
+        -e LEARN_INDUCING="${LEARN_INDUCING:-false}" \
+        -e ARD="${ARD:-false}" \
         -- ./maldi/run_final.sh "${extra_args[@]}"
 }
 
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 #FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8" "difficult")           # lowercase, dashed
-FOLDS=("fold-3")           # lowercase, dashed
-NO_RSAMPLES=("false" "true")
+FOLDS=("fold-2")           # lowercase, dashed
+NO_RSAMPLES=("true" "false")
+LOG_TRANSFORM=("" "--log-transform")
+IND_SOURCES=("reference")
+LEARN_INDUCINGS=("false" "true")   # sweep: fixed vs learned inducing locations
+ARDS=("false" "true")              # sweep: isotropic vs per-axis ARD lengthscales
 exp_num=1
 for fold in "${FOLDS[@]}"; do
     for norsample in "${NO_RSAMPLES[@]}"; do
-        # fold-3  -> FOLD-3  (used as wandb EXP_PREFIX)
-        # fold-3  -> fold_3  (used in the splits filename)
-        fold_upper=${fold^^}
-        fold_file=${fold//-/_}
-        SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
-        run_or_echo submit "gp-lgp-${EXP_SUFFIX}-${exp_num}" "${SLICES_DATASET_FILE}" "${fold_upper}" "${norsample}"
-        exp_num=$((exp_num + 1))
+        for log_transform in "${LOG_TRANSFORM[@]}"; do
+            for ind_src in "${IND_SOURCES[@]}"; do
+                for learn_inducing in "${LEARN_INDUCINGS[@]}"; do
+                    for ard in "${ARDS[@]}"; do
+                        # fold-3  -> FOLD-3  (used as wandb EXP_PREFIX)
+                        # fold-3  -> fold_3  (used in the splits filename)
+                        fold_upper=${fold^^}
+                        fold_file=${fold//-/_}
+                        SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
+                        # submit() forwards LEARN_INDUCING / ARD as -e env vars to run_final.sh.
+                        LEARN_INDUCING="$learn_inducing"
+                        ARD="$ard"
+                        run_or_echo submit "gp-lgp-${EXP_SUFFIX}-${exp_num}" "${SLICES_DATASET_FILE}" "${fold_upper}" "${norsample}" "${ind_src}" "${log_transform}"
+                        exp_num=$((exp_num + 1))
+                    done
+                done
+            done
+        done
     done
 done
 

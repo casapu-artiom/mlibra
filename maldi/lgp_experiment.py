@@ -47,6 +47,10 @@ def parse_args():
     parser.add_argument("--log-transform", dest="log_transform", action='store_true', help="Apply log transformation to the data.")
     parser.add_argument("--nu", type=float, default=1.5, help="Parameter for the GP model.")
     parser.add_argument("--n-pixels", dest="n_pixels", type=int, default=10, help="Number of pixels to consider in the experiment.")
+    parser.add_argument("--learn-inducing", dest="learn_inducing", action='store_true',
+                        help="Learn the inducing-point LOCATIONS jointly with the rest (default: fixed).")
+    parser.add_argument("--ard", dest="ard", action='store_true',
+                        help="Per-axis ARD lengthscales (ard_num_dims=3) instead of one isotropic lengthscale.")
     parser.add_argument("--learning-rate", dest="learning_rate", type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=2000, help="Batch size for training")
     parser.add_argument("--load-args", dest="load_args", action='store_true', help="Load arguments from a file instead of command line.")
@@ -94,6 +98,12 @@ def setup_experiment(args):
         nu=config.nu,
         minimal_length_scale=minimal_length_scale,
         input_dim=3,
+        ard_num_dims=(3 if args.get("ard", False) else None),
+        learn_inducing_locations=args.get("learn_inducing", False),
+    )
+    logging.info(
+        f"GP: ard_num_dims={3 if args.get('ard', False) else None} "
+        f"learn_inducing_locations={args.get('learn_inducing', False)}"
     )
     logging.info("GP model created successfully")
 
