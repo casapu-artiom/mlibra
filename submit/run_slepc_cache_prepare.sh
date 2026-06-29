@@ -200,165 +200,24 @@ submit_one() {
 # submit_one    4   50  15    1300   randomwalk
 
 # ---- mixing methods in one batch is fine (method is per-call) -------------
-submit_one    4   5   15    2300   randomwalk  faiss
+submit_one    4   5   15    2300   randomwalk  faiss 0
 submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  10
 submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  50
-submit_one    4   40   15    2300   randomwalk  faiss
+submit_one    4   40   15    2300   randomwalk  faiss 0
 submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  10
 submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  50
-submit_one    4   50   15    2300   randomwalk  faiss
+submit_one    4   50   15    2300   randomwalk  faiss 0
 submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  10
 submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  50
-
-# MISSING (146):
-#   [ ] method=faiss  k=15  thr=5  modes=50  stride=2
-#   [ ] method=faiss  k=15  thr=5  modes=50  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss  k=15  thr=5  modes=50  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss  k=15  thr=5  modes=64  stride=2
-#   [ ] method=faiss  k=15  thr=5  modes=64  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss  k=15  thr=5  modes=64  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss  k=15  thr=5  modes=100  stride=2
-#   [ ] method=faiss  k=15  thr=5  modes=100  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss  k=15  thr=5  modes=100  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss  k=15  thr=5  modes=300  stride=2
-#   [ ] method=faiss  k=15  thr=5  modes=300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss  k=15  thr=5  modes=300  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss  k=15  thr=5  modes=1300  stride=2
-#   [ ] method=faiss  k=15  thr=5  modes=1300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss  k=15  thr=5  modes=1300  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss  k=15  thr=5  modes=2300  stride=2
-#   [ ] method=faiss  k=15  thr=5  modes=2300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss  k=15  thr=5  modes=2300  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss  k=15  thr=40  modes=50  stride=2
-#   [ ] method=faiss  k=15  thr=40  modes=50  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss  k=15  thr=40  modes=50  stride=4  nlist=sqrt(541)
-#   [ ] method=faiss  k=15  thr=40  modes=64  stride=2
-#   [ ] method=faiss  k=15  thr=40  modes=64  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss  k=15  thr=40  modes=64  stride=4  nlist=sqrt(541)
-#   [ ] method=faiss  k=15  thr=40  modes=100  stride=2
-#   [ ] method=faiss  k=15  thr=40  modes=100  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss  k=15  thr=40  modes=100  stride=4  nlist=sqrt(541)
-#   [ ] method=faiss  k=15  thr=40  modes=300  stride=2
-#   [ ] method=faiss  k=15  thr=40  modes=300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss  k=15  thr=40  modes=300  stride=4  nlist=sqrt(541)
-#   [ ] method=faiss  k=15  thr=40  modes=1300  stride=2
-#   [ ] method=faiss  k=15  thr=40  modes=1300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss  k=15  thr=40  modes=1300  stride=4  nlist=sqrt(541)
-#   [ ] method=faiss  k=15  thr=40  modes=2300  stride=2
-#   [ ] method=faiss  k=15  thr=40  modes=2300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss  k=15  thr=40  modes=2300  stride=4  nlist=sqrt(541)
-#   [ ] method=faiss  k=15  thr=50  modes=50  stride=2
-#   [ ] method=faiss  k=15  thr=50  modes=50  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss  k=15  thr=50  modes=50  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss  k=15  thr=50  modes=64  stride=2
-#   [ ] method=faiss  k=15  thr=50  modes=64  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss  k=15  thr=50  modes=64  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss  k=15  thr=50  modes=100  stride=2
-#   [ ] method=faiss  k=15  thr=50  modes=100  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss  k=15  thr=50  modes=100  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss  k=15  thr=50  modes=300  stride=2
-#   [ ] method=faiss  k=15  thr=50  modes=300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss  k=15  thr=50  modes=300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss  k=15  thr=50  modes=1300  stride=2
-#   [ ] method=faiss  k=15  thr=50  modes=1300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss  k=15  thr=50  modes=1300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss  k=15  thr=50  modes=2300  stride=2
-#   [ ] method=faiss  k=15  thr=50  modes=2300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss  k=15  thr=50  modes=2300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=50  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=50  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=50  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=50  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=64  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=64  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=64  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=64  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=100  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=100  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=100  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=100  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=1300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=1300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=1300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=1300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=2300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=2300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=2300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=2300  stride=2  nlist=sqrt(2061)
-#   [ ] method=faiss_w x10  k=15  thr=5  modes=2300  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss_w x50  k=15  thr=5  modes=2300  stride=4  nlist=sqrt(729)
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=50  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=50  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=50  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=50  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=64  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=64  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=64  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=64  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=100  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=100  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=100  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=100  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=1300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=1300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=1300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=1300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=2300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=2300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=40  modes=2300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x50  k=15  thr=40  modes=2300  stride=2  nlist=sqrt(1530)
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=50  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=50  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=4
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=50  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=64  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=64  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=4
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=64  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=100  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=100  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=4
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=100  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=4
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=1300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=1300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=4
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=1300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=2300  stride=2
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=2
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=2300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=2  nlist=sqrt(1252)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=4
-#   [ ] method=faiss_w x10  k=15  thr=50  modes=2300  stride=4  nlist=sqrt(443)
-#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=4  nlist=sqrt(443) 
-
-# so I'd like to run_slepc_cache_prepare on what is missing .. 
+submit_one    2   5   15    300   randomwalk  faiss 0
+submit_one    2   5   15    300   randomwalk  faiss_atlas_weighted  10
+submit_one    2   5   15    300   randomwalk  faiss_atlas_weighted  50
+submit_one    2   40   15    300   randomwalk  faiss 0
+submit_one    2   40   15    300   randomwalk  faiss_atlas_weighted  10
+submit_one    2   40   15    300   randomwalk  faiss_atlas_weighted  50
+submit_one    2   50   15    300   randomwalk  faiss 0
+submit_one    2   50   15    300   randomwalk  faiss_atlas_weighted  10
+submit_one    2   50   15    300   randomwalk  faiss_atlas_weighted  50
 
 echo "Submitted $n_submitted shift-invert cache-prep jobs. Suffix: $EXP_SUFFIX"
 echo "Eigvecs -> $S3_EIGENVECTOR_DIR/eigvecs/   logs -> $S3_EIGENVECTOR_DIR/slepc_logs/"

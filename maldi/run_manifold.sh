@@ -5,6 +5,11 @@
 # At stride=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
 : "${NCV_MIN:=-1}"
 : "${INDUCING_SOURCE:=data}"
+# Density/MALDI inducing blend over the UNALTERED strided graph. When enabled it
+# OVERRIDES INDUCING_SOURCE: ~INDUCING_DENSITY_FRAC of the points come from the
+# densest graph nodes, the rest from cheapest-to-snap measured MALDI voxels.
+: "${INDUCING_FROM_MALDI_NODES:=0}"
+: "${INDUCING_DENSITY_FRAC:=0.8}"
 : "${LATENT_DIM:=5}"
 : "${STRIDE:=8}"
 : "${BATCH_SIZE:=1000}"
@@ -104,6 +109,16 @@ if [ "$PRODUCT_ARD_MATERN" = "1" ]; then
     EXP_NAME="$EXP_NAME-prodard$PRODUCT_ARD_NU"
 fi
 
+# Inducing density/MALDI blend: enable only when asked; encode the density frac
+# in the dir name so a sweep over it gets distinct dirs (it overrides
+# INDUCING_SOURCE, so the dir name reflects the blend rather than the source).
+# Off (default) adds no flag and no suffix => unchanged dir names.
+INDUCING_BLEND_ARGS=""
+if [ "$INDUCING_FROM_MALDI_NODES" = "1" ]; then
+    INDUCING_BLEND_ARGS="--inducing-from-maldi-nodes --inducing-density-frac $INDUCING_DENSITY_FRAC"
+    EXP_NAME="$EXP_NAME-blend$INDUCING_DENSITY_FRAC"
+fi
+
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
@@ -122,6 +137,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --slices-dataset-file $SLICES_DATASET_FILE \
     --num-inducing $NUM_INDUCING_POINTS \
     --inducing-source "$INDUCING_SOURCE" \
+    $INDUCING_BLEND_ARGS \
     --per-task-lengthscale \
     --lengthscale-init 1.0 \
     --num-modes $NUM_MODES \

@@ -100,6 +100,8 @@ submit() {
         -e N_EPOCHS="$N_EPOCHS" \
         -e NUM_INDUCING_POINTS=2000 \
         -e INDUCING_SOURCE="$ind_source" \
+        -e INDUCING_FROM_MALDI_NODES="${INDUCING_FROM_MALDI_NODES:-0}" \
+        -e INDUCING_DENSITY_FRAC="${INDUCING_DENSITY_FRAC:-0.8}" \
         -e NUM_MODES="$num_modes" \
         -e NCV_MIN="${NCV_MIN:--1}" \
         -e THRESHOLD="$threshold" \
@@ -139,7 +141,12 @@ BUMP_DECAYS=(0.01)
 # BUMP_DECAYS=(0.1 1.0
 NU=(2)
 THRESHOLDS=(5)
-IND_SOURCES=("reference")
+# Inducing-point placement setups swept together:
+#   reference - k-means over the reference tissue image
+#   data      - k-means/fps/random over measured MALDI voxels
+#   blend     - density/MALDI blend over the strided graph (overrides the
+#               source); INDUCING_DENSITY_FRAC fixed at 0.8 (80/20).
+IND_SOURCES=("reference" "data" "blend")
 # Diffusion-scale sweep (manifold kernel). Each entry is "LEARN:INIT":
 #   LEARN = 0/1   -> is the multiplicative spectral scale learnable?
 #   INIT  = float -> its initial value (1.0 = identity; no eigenpair recompute).
@@ -186,6 +193,19 @@ for fold in "${FOLDS[@]}"; do
                                 for nu in ${NU[@]}; do
                                     for threshold in ${THRESHOLDS[@]}; do
                                         for ind_src in "${IND_SOURCES[@]}"; do
+                                            # Translate the inducing setup into the two
+                                            # knobs run_manifold.sh reads. 'blend' turns on
+                                            # the density/MALDI blend (which OVERRIDES the
+                                            # source); 'reference'/'data' are plain k-means.
+                                            if [ "$ind_src" = "blend" ]; then
+                                                INDUCING_FROM_MALDI_NODES=1
+                                                INDUCING_DENSITY_FRAC=0.8
+                                                ind_source_arg=data   # ignored under blend
+                                            else
+                                                INDUCING_FROM_MALDI_NODES=0
+                                                INDUCING_DENSITY_FRAC=0.8
+                                                ind_source_arg=$ind_src
+                                            fi
                                             if [ "$knn_method" = "faiss_atlas_weighted" ]; then
                                                 infl_list=("${MAN_INFLATIONS[@]}")
                                             else
@@ -202,11 +222,11 @@ for fold in "${FOLDS[@]}"; do
                                                 job_name="gp-manifold-${EXP_SUFFIX}-${exp_num}"
 
                                                 # Map exp_num -> config, so you can read it back from terminal/logs
-                                                printf "  exp %2d: fold=%-10s stride=%s modes=%s gb=%-5s bs=%-4s bd=%s diff=%s(learn=%s) prodard=%s(nu=%s)\n" \
-                                                    "$exp_num" "$fold" "$stride" "$num_modes" "$gb" "$bs" "$bd" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
+                                                printf "  exp %2d: fold=%-10s stride=%s modes=%s ind=%-9s gb=%-5s bs=%-4s bd=%s diff=%s(learn=%s) prodard=%s(nu=%s)\n" \
+                                                    "$exp_num" "$fold" "$stride" "$num_modes" "$ind_src" "$gb" "$bs" "$bd" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
 
                                                 run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" "$infl" "$threshold" \
-                                                    "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$ind_src" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
+                                                    "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$ind_source_arg" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
 
                                                 exp_num=$((exp_num + 1))
                                                done

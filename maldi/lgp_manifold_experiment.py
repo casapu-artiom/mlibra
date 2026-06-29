@@ -35,6 +35,9 @@ from utils import (
     crop_or_stride_volume,
     reference_ccf_from_subvolume,
     augment_nodes_with_maldi,
+    inducing_blend_density_maldi,
+    maldi_voxels_standardized,
+    coord_norm_from_reference,
 )
 
 def parse_args():
@@ -61,6 +64,19 @@ def parse_args():
                         choices=["kmeans_snap", "fps", "random"],
                         help="(--inducing-source data) on-data selection: 'kmeans_snap' "
                              "(default), 'fps' (max coverage), 'random'.")
+    parser.add_argument("--inducing-from-maldi-nodes", dest="inducing_from_maldi_nodes",
+                        action="store_true",
+                        help="Blend the inducing points over the UNALTERED strided "
+                             "graph: ~--inducing-density-frac from the densest graph "
+                             "nodes + the rest from the measured MALDI voxels that snap "
+                             "onto the graph most cheaply. Every inducing point is an "
+                             "exact graph node. Independent of --augment-maldi-nodes (the "
+                             "KNN graph is NOT modified). Overrides --inducing-source.")
+    parser.add_argument("--inducing-density-frac", dest="inducing_density_frac",
+                        type=float, default=0.8,
+                        help="(--inducing-from-maldi-nodes) fraction of inducing points "
+                             "drawn from the densest graph nodes; the remainder come from "
+                             "cheapest-to-snap MALDI nodes. Default 0.8 (80/20 blend).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
     parser.add_argument("--latent-dim", dest="latent_dim", type=int, default=10, help="Dimensionality of the latent space.")
@@ -157,8 +173,17 @@ def setup_experiment(args):
     # Inducing points (later snapped to graph nodes). 'data' draws from the
     # measured training voxels (sparse-data aware); 'reference' is k-means over
     # the tissue image. Both use the *global* coord_mean / coord_std.
+    #
+    # --inducing-from-maldi-nodes overrides --inducing-source: the points are
+    # (re)selected by the density/MALDI blend AFTER the graph is built, so we
+    # skip the discarded initial selection here and only fetch the (identical)
+    # coord normalization directly -- no wasted k-means, no even-count
+    # requirement, and config.num_inducing stays at the requested value.
     logging.info("Calculating coordinate normalization factors and inducing points...")
-    if args.get("inducing_source", "reference") == "data":
+    if bool(args.get("inducing_from_maldi_nodes", False)):
+        coord_mean, coord_std = coord_norm_from_reference(config.reference_file)
+        inducing_points = None   # replaced by the blend once the graph exists
+    elif args.get("inducing_source", "reference") == "data":
         inducing_points, coord_mean, coord_std = get_data_inducing_points(
             config.maldi_file, config.section_filter, config.num_inducing,
             config.reference_file, method=args.get("inducing_method", "kmeans_snap"),
@@ -169,7 +194,8 @@ def setup_experiment(args):
         inducing_points, coord_mean, coord_std = get_inducing_points(
             config.exp_path, config.dataset_path, config.num_inducing,
         )
-    logging.info(f"Got {inducing_points.shape[0]} inducing points")
+    if inducing_points is not None:
+        logging.info(f"Got {inducing_points.shape[0]} inducing points")
 
     # 3. Atlas: download (if needed), coarsen annotations, then crop or stride.
     template_name = config.template_name
@@ -340,6 +366,33 @@ def setup_experiment(args):
         graph_key = make_graph_key(graph_key_parts)
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
+
+    # Optionally REPLACE the inducing points with a density/MALDI blend over the
+    # UNALTERED (strided) graph: ~density_frac from the densest graph nodes + the
+    # rest from the measured MALDI voxels that snap onto the graph most cheaply.
+    # The KNN graph is NOT modified (independent of --augment-maldi-nodes); both
+    # sources resolve to exact graph nodes. Overrides --inducing-source. The snap
+    # step below is then a no-op (the blend already returns exact graph nodes).
+    if bool(args.get("inducing_from_maldi_nodes", False)):
+        density_frac = float(args.get("inducing_density_frac", 0.8))
+        graph_coords = knn.x.detach().cpu().numpy()
+        maldi_coords = maldi_voxels_standardized(
+            config.maldi_file, config.section_filter, coord_mean, coord_std,
+        ).numpy()
+        sel = inducing_blend_density_maldi(
+            graph_coords, maldi_coords, config.num_inducing,
+            density_frac=density_frac,
+            density_k=knn_k,
+            method=args.get("inducing_method", "kmeans_snap"),
+            seed=args["seed"],
+        )
+        inducing_points = torch.tensor(sel, dtype=torch.float32)
+        n_dense = int(round(density_frac * config.num_inducing))
+        logging.info(
+            f"Inducing points blended: ~{n_dense} from densest graph nodes + "
+            f"~{config.num_inducing - n_dense} from cheapest-to-snap MALDI voxels "
+            f"(graph N={graph_coords.shape[0]:,}, MALDI={maldi_coords.shape[0]:,})"
+        )
 
     # Snap the inducing points to the nearest graph nodes.
     with torch.no_grad():

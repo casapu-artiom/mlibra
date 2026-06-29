@@ -55,10 +55,10 @@ FAISS_CPU_RECON=${FAISS_CPU_RECON:-$FAISS_CPU}
 # the cached one -- required to actually time graph construction on CPU.
 FORCE_RECOMPUTE_GRAPH=${FORCE_RECOMPUTE_GRAPH:-0}
 
-# FAISS IVF sizing. Default 1 = exact flat (current behaviour). For the fast,
-# recall~1.0 CPU path use nlist=sqrt(N) with a small FIXED nprobe (~8): in 3D
-# recall saturates at nprobe~8 regardless of N, so 'sqrt' nprobe just over-scans.
-#   N_LIST=sqrt N_PROBE=8 FAISS_CPU=1 ./submit/run_submit_per_lipid.sh
+# FAISS IVF sizing. Default = the fast, recall~1.0 CPU path: nlist=sqrt(N) with a
+# small FIXED nprobe (~8). In 3D recall saturates at nprobe~8 regardless of N, so
+# 'sqrt' nprobe would just over-scan. Use N_LIST=1 to force the exact flat index.
+#   N_LIST=1 ./submit/run_submit_per_lipid.sh   # exact flat (old behaviour)
 N_LIST=${N_LIST:-sqrt}
 N_PROBE=${N_PROBE:-8}
 
@@ -68,11 +68,29 @@ N_PROBE=${N_PROBE:-8}
 # our 10-lipid subset in a single GP fit.
 EPOCHS=10
 LIPID_BATCH_SIZE=10
-NUM_INDUCING=1000
-LEARNING_RATE=0.005
+NUM_INDUCING=2000
+LEARNING_RATE=0.05
 BATCH_SIZE=2048
 STRIDE_BUMP=20.0   # bump_scale — default; overridden per-job by MAN_BUMP_PAIRS
 STRIDE_DECAY=0.01  # bump_decay — default; overridden per-job by MAN_BUMP_PAIRS
+
+# ---- diffusion scale (manifold kernel) ------------------------------------
+# Learnable multiplicative scale on the (frozen) Laplacian spectrum
+# (lambda_k -> DIFFUSION_SCALE_INIT * lambda_k in the Matern spectral density).
+# Needs NO eigenpair recompute, so it is a cheap, learnable companion to the
+# lengthscale. LEARN_DIFFUSION_SCALE=1 trains it; otherwise it is pinned at the
+# init (1.0 = identity, unchanged behaviour). Encoded in the run dir as
+# -learndiff when learned.
+#   LEARN_DIFFUSION_SCALE=1 ./submit/run_submit_per_lipid.sh
+DIFFUSION_SCALE_INIT=${DIFFUSION_SCALE_INIT:-1.0}
+LEARN_DIFFUSION_SCALE=${LEARN_DIFFUSION_SCALE:-1}
+
+# Cosine/correlation kernel (manifold only). NORMALIZE_FEATURES=1 L2-normalizes
+# the Riemann feature rows so the prior variance is constant (diagonal=1) and the
+# sqrt(degree) sampling-density artifact is quotiented out; magnitude moves to the
+# ScaleKernel outputscale. Encoded in the run dir as -cos. Off by default.
+#   NORMALIZE_FEATURES=1 ./submit/run_submit_per_lipid.sh
+NORMALIZE_FEATURES=${NORMALIZE_FEATURES:-0}
 
 # ---- subset of lipids to train -------------------------------------------
 # A small subset is what makes a 30-job sweep practical. The file lives
@@ -82,7 +100,7 @@ LIPIDS_FILE="/myhome/mlibra/maldi/data/lipid_subset.txt"
 # ---- S3-mounted paths inside the container --------------------------------
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_batch_11"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_batch_15"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -162,6 +180,10 @@ submit() {
         -e INDUCING_FROM_MALDI_NODES="${INDUCING_FROM_MALDI_NODES:-$AUGMENT_MALDI_NODES}" \
         -e INDUCING_DENSITY_FRAC="${INDUCING_DENSITY_FRAC:-0.8}" \
         -e LEARN_INDUCING="${LEARN_INDUCING:-0}" \
+        -e PER_TASK_LENGTHSCALE="${PER_TASK_LENGTHSCALE:-0}" \
+        -e NORMALIZE_FEATURES="${NORMALIZE_FEATURES:-0}" \
+        -e DIFFUSION_SCALE_INIT="${DIFFUSION_SCALE_INIT:-1.0}" \
+        -e LEARN_DIFFUSION_SCALE="${LEARN_DIFFUSION_SCALE:-0}" \
         -e WANDB="${WANDB:-0}" \
         -e WANDB_PROJECT="${WANDB_PROJECT:-l3di_maldi_per_lipid}" \
         -e FAISS_CPU_GRAPH="$FAISS_CPU_GRAPH" \
@@ -202,7 +224,7 @@ RUN_EUCLIDEAN=1   # 0 = skip the euclidean loop entirely
 
 # ---- Manifold sweep -------------------------------------------------------
 MAN_NU=(2)
-MAN_THRESHOLDS=(5 40)
+MAN_THRESHOLDS=(5)
 MAN_LAPLACIAN_NORMS=("randomwalk")
 MAN_GRAPH_BANDWIDTHS=(0.1)
 MAN_KNN_K=(15)
@@ -211,7 +233,7 @@ MAN_INFLATIONS=(10 50)   # only used when knn_method=faiss_atlas_weighted
 # ---- (stride : num_modes) pairs to sweep (manifold only) ------------------
 # Coarser strides need fewer eigenmodes to span the graph; finer strides need
 # more. Each entry is "STRIDE:NUM_MODES" and gets its own job.
-MAN_STRIDE_MODES=("4:1300")
+MAN_STRIDE_MODES=("4:2300")
 
 # ---- (bump_scale : bump_decay) pairs to sweep (manifold only) -------------
 # The bump function shapes the kernel's local support on the graph. Each entry
@@ -219,11 +241,17 @@ MAN_STRIDE_MODES=("4:1300")
 # -bs<scale>-bd<decay> so output dirs never collide. Add more pairs to sweep.
 MAN_BUMP_PAIRS=("1.0:0.01")
 
-# ---- lengthscale modes (manifold only) 
+# ---- lengthscale modes (manifold only)
 # 1 → fixed lengthscale (--lengthscale-init 8.0 --lengthscale-no-decay)
 # 0 → learned lengthscale (no flags; GP trains it).
 # Both modes are submitted so they can be compared head-to-head.
-MAN_FIXED_LS=(1)
+MAN_FIXED_LS=(0 1)
+
+# ---- per-task lengthscale (manifold only) ---------------------------------
+# 1 → each lipid gets its OWN learnable lengthscale (PerTaskRiemannWrapper);
+# 0 → one lengthscale shared across the batch. List both, e.g. (0 1), to
+# compare head-to-head (output dirs differ via the "-ptls" tag). Default (0).
+MAN_PER_TASK_LS=(0 1)
 
 # ---- MALDI-node augmentation (manifold only) ------------------------------
 # MALDI graph augmentation: add the measured MALDI voxels to the graph NODE SET
@@ -239,12 +267,12 @@ MALDI_SUBSAMPLE_METHOD=random   # random | fps ---------------------------------
 # cheaply. 1 = blend on, 0 = plain k-means-snap inducing. Listed so each config
 # is submitted both ways for head-to-head comparison (output dirs differ via the
 # "-blend" tag). Manifold only — euclidean ignores it.
-MAN_INDUCING_BLEND=(0 1)
+MAN_INDUCING_BLEND=(1)
 INDUCING_DENSITY_FRAC=0.8       # frac from densest graph nodes (rest = cheapest-to-snap MALDI)
 # Learned vs anchored inducing points — listed so each config is submitted both
 # ways for head-to-head comparison (output dirs differ via the "-learnind" tag).
 # 0 = anchored (stay on graph nodes), 1 = optimize inducing-point locations.
-MAN_LEARN_INDUCING=(0 1)
+MAN_LEARN_INDUCING=(0)
 WANDB=1                        # log loss/KL/hypers/noise/grad-norms (incl. inducing) to W&B
 WANDB_PROJECT=l3di_maldi_per_lipid
 RUN_MANIFOLD=1
@@ -263,6 +291,7 @@ for fold in "${FOLDS[@]}"; do
             for learn_ind in "${MAN_LEARN_INDUCING[@]}"; do
             AUGMENT_MALDI_NODES=0   # euclidean ignores it; reset for clean logs
             INDUCING_FROM_MALDI_NODES=0   # manifold-only; reset for clean logs
+            PER_TASK_LENGTHSCALE=0  # manifold-only; reset for clean logs
             LEARN_INDUCING=$learn_ind   # sweep anchored vs learned inducing
             job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
             if [ "$no_ard" = "1" ]; then ard_tag="no-ard"; else ard_tag="ard"; fi
@@ -324,11 +353,14 @@ for fold in "${FOLDS[@]}"; do
                                         # FROM_MALDI_NODES. The inducing blend is
                                         # independent of graph augmentation.
                                         AUGMENT_MALDI_NODES=$augment
-                                        # Sweep inducing-point blend (on/off) and
-                                        # anchored vs learned. INDUCING_FROM_MALDI_
-                                        # NODES / LEARN_INDUCING are forwarded as
-                                        # -e env vars; the "-blend" / "-learnind"
-                                        # TAG suffixes keep the output dirs apart.
+                                        # Sweep per-task lengthscale, inducing-point
+                                        # blend (on/off) and anchored vs learned.
+                                        # PER_TASK_LENGTHSCALE / INDUCING_FROM_MALDI_
+                                        # NODES / LEARN_INDUCING are forwarded as -e
+                                        # env vars; the "-ptls" / "-blend" /
+                                        # "-learnind" TAG suffixes keep dirs apart.
+                                        for ptls in "${MAN_PER_TASK_LS[@]}"; do
+                                        PER_TASK_LENGTHSCALE=$ptls
                                         for blend in "${MAN_INDUCING_BLEND[@]}"; do
                                         INDUCING_FROM_MALDI_NODES=$blend
                                         for learn_ind in "${MAN_LEARN_INDUCING[@]}"; do
@@ -348,9 +380,10 @@ for fold in "${FOLDS[@]}"; do
                                         if [ "$augment" = "1" ]; then aug_tag="augmaldi"; else aug_tag="atlas"; fi
                                         if [ "$learn_ind" = "1" ]; then li_tag="learn"; else li_tag="anchor"; fi
                                         if [ "$blend" = "1" ]; then blend_tag="blend"; else blend_tag="kmeans"; fi
+                                        if [ "$ptls" = "1" ]; then ptls_tag="ptls"; else ptls_tag="shared"; fi
                                         prefix="${fold_upper}-${ls_tag}"
-                                        printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s stride=%s modes=%s bs=%s bd=%s ls=%s aug=%s ind=%s blend=%s\n" \
-                                            "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$stride" "$modes" "$bump_scale" "$bump_decay" "$ls_tag" "$aug_tag" "$li_tag" "$blend_tag"
+                                        printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s stride=%s modes=%s bs=%s bd=%s ls=%s aug=%s ind=%s blend=%s ptls=%s\n" \
+                                            "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$stride" "$modes" "$bump_scale" "$bump_decay" "$ls_tag" "$aug_tag" "$li_tag" "$blend_tag" "$ptls_tag"
                                         # no_ard is euclidean-only; pass a
                                         # placeholder the manifold path ignores.
                                         submit "$job_name" "manifold" "$nu" \
@@ -358,6 +391,7 @@ for fold in "${FOLDS[@]}"; do
                                             "$prefix" "$SLICES_DATASET_FILE" \
                                             "$stride" "$modes" "$fixed_ls" "1"
                                         exp_num=$((exp_num + 1))
+                                        done
                                         done
                                         done
                                       done
