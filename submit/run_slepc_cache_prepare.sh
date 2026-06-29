@@ -43,7 +43,7 @@ fi
 # stride. NO GPU is requested -- this is the CPU-heavy cache-prep job.
 # -------------------------------------------------------------------------
 CPU=${CPU:-16}
-MEM=${MEM:-196G}
+MEM=${MEM:-260G}
 IMAGE=${IMAGE:-artiomartiom/sdsc:withslepc}
 
 # -------------------------------------------------------------------------
@@ -200,24 +200,24 @@ submit_one() {
 # submit_one    4   50  15    1300   randomwalk
 
 # ---- mixing methods in one batch is fine (method is per-call) -------------
-submit_one    4   5   15    2300   randomwalk  faiss 0
-submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  10
-submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  50
-submit_one    4   40   15    2300   randomwalk  faiss 0
-submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  10
-submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  50
-submit_one    4   50   15    2300   randomwalk  faiss 0
-submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  10
-submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  50
+# submit_one    4   5   15    2300   randomwalk  faiss 0
+# submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  10
+# submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  50
+# submit_one    4   40   15    2300   randomwalk  faiss 0
+# submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  10
+# submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  50
+# submit_one    4   50   15    2300   randomwalk  faiss 0
+# submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  10
+# submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  50
 submit_one    2   5   15    300   randomwalk  faiss 0
 submit_one    2   5   15    300   randomwalk  faiss_atlas_weighted  10
 submit_one    2   5   15    300   randomwalk  faiss_atlas_weighted  50
 submit_one    2   40   15    300   randomwalk  faiss 0
 submit_one    2   40   15    300   randomwalk  faiss_atlas_weighted  10
 submit_one    2   40   15    300   randomwalk  faiss_atlas_weighted  50
-submit_one    2   50   15    300   randomwalk  faiss 0
-submit_one    2   50   15    300   randomwalk  faiss_atlas_weighted  10
-submit_one    2   50   15    300   randomwalk  faiss_atlas_weighted  50
+# submit_one    2   50   15    300   randomwalk  faiss 0
+# submit_one    2   50   15    300   randomwalk  faiss_atlas_weighted  10
+# submit_one    2   50   15    300   randomwalk  faiss_atlas_weighted  50
 
 echo "Submitted $n_submitted shift-invert cache-prep jobs. Suffix: $EXP_SUFFIX"
 echo "Eigvecs -> $S3_EIGENVECTOR_DIR/eigvecs/   logs -> $S3_EIGENVECTOR_DIR/slepc_logs/"

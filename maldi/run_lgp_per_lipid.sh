@@ -19,13 +19,13 @@
 # =============================================================================
 
 # ---- which kernel ----
-: "${KERNEL_FAMILY:=manifold}"          # euclidean | manifold | eigenmap | spectral
+: "${KERNEL_FAMILY:=eigenmap}"          # euclidean | manifold | eigenmap | spectral
 : "${KERNEL:=matern}"                   # only used for euclidean / eigenmap
 # eigenmap: project coords into the leading EMBED_DIM Laplacian eigenfunctions,
 # then a Euclidean ARD Matern GP over that embedding (needs EIGENVECTOR_DIR).
 # spectral: weight-space SpectralLatentGP over the manifold spectrum, per lipid
 # (needs EIGENVECTOR_DIR).
-: "${EMBED_DIM:=10}"                     # eigenmap only
+: "${EMBED_DIM:=300}"                     # eigenmap only
 
 # ---- ARD (euclidean kernel only) ----
 # NO_ARD=1 (default) → isotropic single shared lengthscale (passes --no-ard).
@@ -34,7 +34,7 @@
 : "${NO_ARD:=1}"
 
 # ---- GP hyperparameters ----
-: "${NU:=2}"
+: "${NU:=2.5}"
 : "${NUM_INDUCING:=1000}"
 : "${INDUCING_SOURCE:=reference}"
 : "${LIPID_BATCH_SIZE:=10}"
@@ -83,7 +83,7 @@
 # feature rows so the prior variance is constant (diagonal=1) and the
 # sqrt(degree) sampling-density artifact is quotiented out; magnitude then lives
 # in the ScaleKernel outputscale. Encoded in the TAG as -cos. Off by default.
-: "${NORMALIZE_FEATURES:=1}"
+: "${NORMALIZE_FEATURES:=0}"
 : "${BUMP_SCALE:=1.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${GRAPHBANDWIDTH:=0.1}"
@@ -149,11 +149,11 @@
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
-: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${TEMPLATE_NAME:=reference}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
-: "${EXP_PREFIX:=FOLD-3}"
+: "${EXP_PREFIX:=FOLD-2}"
 
 #cd $SRC_PATH
 

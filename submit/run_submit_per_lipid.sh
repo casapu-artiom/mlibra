@@ -117,7 +117,7 @@ EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 # to lgp_experiment_per_lipid.py.
 submit() {
     local job_name=$1
-    local family=$2        # euclidean | manifold
+    local family=$2        # euclidean | manifold | eigenmap | spectral
     local nu=$3
     local knn_method=$4
     local knn_k=$5
@@ -168,6 +168,7 @@ submit() {
         -e STRIDE="$stride" \
         -e FIXED_LENGTHSCALE="$fixed_ls" \
         -e NO_ARD="$no_ard" \
+        -e EMBED_DIM="${EMBED_DIM:-10}" \
         -e THRESHOLD="$threshold" \
         -e NUM_INDUCING="$NUM_INDUCING" \
         -e LIPID_BATCH_SIZE="$LIPID_BATCH_SIZE" \
@@ -276,6 +277,28 @@ MAN_LEARN_INDUCING=(0)
 WANDB=1                        # log loss/KL/hypers/noise/grad-norms (incl. inducing) to W&B
 WANDB_PROJECT=l3di_maldi_per_lipid
 RUN_MANIFOLD=1
+
+# ---- Eigenmap sweep -------------------------------------------------------
+# 'eigenmap' projects coordinates into the leading EIGENMAP_EMBED_DIMS Laplacian
+# eigenfunctions and fits a Euclidean ARD Matern GP over that embedding. It
+# consumes the SAME graph/eigensolve stack as the manifold family, so it reuses
+# the manifold graph knobs (knn_method / knn_k / laplacian_norm / graphbandwidth
+# / threshold) and the first MAN_STRIDE_MODES entry. The euclidean-side knobs
+# (nu / ard) are what actually vary here.
+EIGENMAP_NU=(1.5)
+EIGENMAP_EMBED_DIMS=(10)
+# ARD modes over the eigenfunction embedding: 1 → isotropic (--no-ard),
+# 0 → per-axis ARD (one lengthscale per eigenfunction dim).
+EIGENMAP_NO_ARD=(0)
+RUN_EIGENMAP=1
+
+# ---- Spectral sweep -------------------------------------------------------
+# 'spectral' fits a weight-space SpectralLatentGP over the manifold spectrum,
+# one per lipid. Like eigenmap it reuses the manifold graph/eigensolve knobs;
+# nu and the diffusion scale (DIFFUSION_SCALE_INIT / LEARN_DIFFUSION_SCALE,
+# shared with the manifold config above) are the meaningful axes.
+SPECTRAL_NU=(2)
+RUN_SPECTRAL=1
 
 
 exp_num=1
@@ -404,6 +427,63 @@ for fold in "${FOLDS[@]}"; do
                     done
                 done
             done
+        done
+    fi
+
+    # ---- EIGENMAP loop ----------------------------------------------------
+    # Reuses the manifold graph/eigensolve knobs (first entry of each MAN_*
+    # array); only nu / embed_dim / ard vary. fixed_ls is manifold-only, so a
+    # placeholder is passed.
+    if [ "$RUN_EIGENMAP" = "1" ]; then
+        em_sm="${MAN_STRIDE_MODES[0]}"
+        em_stride="${em_sm%%:*}"; em_modes="${em_sm##*:}"
+        em_km="${MAN_KNN_METHODS[0]}"
+        if [ "$em_km" = "faiss_atlas_weighted" ]; then em_infl="${MAN_INFLATIONS[0]}"; else em_infl=1; fi
+        AUGMENT_MALDI_NODES=0          # manifold-only; reset for clean logs
+        INDUCING_FROM_MALDI_NODES=0    # manifold-only; reset for clean logs
+        PER_TASK_LENGTHSCALE=0         # manifold-only; reset for clean logs
+        LEARN_INDUCING=0
+        for nu in "${EIGENMAP_NU[@]}"; do
+          for ed in "${EIGENMAP_EMBED_DIMS[@]}"; do
+            for no_ard in "${EIGENMAP_NO_ARD[@]}"; do
+              EMBED_DIM=$ed   # read by submit() and forwarded as -e EMBED_DIM
+              job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
+              if [ "$no_ard" = "1" ]; then ard_tag="no-ard"; else ard_tag="ard"; fi
+              printf "  exp %2d: %-22s nu=%-4s r=%s ard=%s stride=%s modes=%s fold=%s\n" \
+                  "$exp_num" "eigenmap" "$nu" "$ed" "$ard_tag" "$em_stride" "$em_modes" "$fold"
+              submit "$job_name" "eigenmap" "$nu" \
+                  "$em_km" "${MAN_KNN_K[0]}" "${MAN_LAPLACIAN_NORMS[0]}" "${MAN_GRAPH_BANDWIDTHS[0]}" \
+                  "$em_infl" "${MAN_THRESHOLDS[0]}" \
+                  "$fold_upper" "$SLICES_DATASET_FILE" "$em_stride" "$em_modes" "0" "$no_ard"
+              exp_num=$((exp_num + 1))
+            done
+          done
+        done
+    fi
+
+    # ---- SPECTRAL loop ----------------------------------------------------
+    # Weight-space SpectralLatentGP over the manifold spectrum. Reuses the same
+    # manifold graph/eigensolve knobs; nu and the diffusion scale (shared with
+    # the manifold config) are the meaningful axes. fixed_ls / no_ard are not
+    # used by the spectral path — placeholders are passed.
+    if [ "$RUN_SPECTRAL" = "1" ]; then
+        sp_sm="${MAN_STRIDE_MODES[0]}"
+        sp_stride="${sp_sm%%:*}"; sp_modes="${sp_sm##*:}"
+        sp_km="${MAN_KNN_METHODS[0]}"
+        if [ "$sp_km" = "faiss_atlas_weighted" ]; then sp_infl="${MAN_INFLATIONS[0]}"; else sp_infl=1; fi
+        AUGMENT_MALDI_NODES=0          # manifold-only; reset for clean logs
+        INDUCING_FROM_MALDI_NODES=0    # manifold-only; reset for clean logs
+        PER_TASK_LENGTHSCALE=0         # manifold-only; reset for clean logs
+        LEARN_INDUCING=0
+        for nu in "${SPECTRAL_NU[@]}"; do
+            job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
+            printf "  exp %2d: %-22s nu=%-4s stride=%s modes=%s fold=%s\n" \
+                "$exp_num" "spectral" "$nu" "$sp_stride" "$sp_modes" "$fold"
+            submit "$job_name" "spectral" "$nu" \
+                "$sp_km" "${MAN_KNN_K[0]}" "${MAN_LAPLACIAN_NORMS[0]}" "${MAN_GRAPH_BANDWIDTHS[0]}" \
+                "$sp_infl" "${MAN_THRESHOLDS[0]}" \
+                "$fold_upper" "$SLICES_DATASET_FILE" "$sp_stride" "$sp_modes" "0" "1"
+            exp_num=$((exp_num + 1))
         done
     fi
 done
