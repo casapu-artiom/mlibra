@@ -384,6 +384,9 @@ def setup_experiment(args):
         extra=eigvec_key_parts,
         force_recompute=bool(args.get("force_recompute_eigvecs", False)),
         device=config.device,
+        # Reuse a cache with more modes if one exists (eigenpairs are nested;
+        # the extra modes are simply trimmed off on load).
+        allow_larger_modes=True,
     )
     print(f"eigvec shape:          {tuple(eigvec.shape)}")  # (N_nodes, num_modes)
     print(f"eigval shape:          {tuple(eigval.shape)}")

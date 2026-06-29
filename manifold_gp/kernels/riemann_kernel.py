@@ -44,6 +44,7 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         num_modes: int = 100,
         bump_scale: float = 1.0,
         bump_decay: float = 0.01,
+        normalize_features: bool = False,
         # ---- Bandwidth ----
         graphbandwidth_init: float = 1.0,
         graphbandwidth_prior: Optional[Prior] = None,
@@ -97,6 +98,19 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         self.num_modes = num_modes
         self.bump_scale = bump_scale
         self.bump_decay = bump_decay
+
+        # When True, L2-normalize the feature rows before forming the kernel, i.e.
+        # use the cosine / correlation kernel k~(x,y) = <Phi(x),Phi(y)> /
+        # (||Phi(x)|| ||Phi(y)||) = cos<(Phi(x),Phi(y)). This forces a constant
+        # unit prior variance (diagonal = 1) by quotienting out the per-point
+        # feature norm ||Phi(x)||^2 = k(x,x) — which under symmetric Laplacian
+        # normalization carries a sqrt(degree)~sqrt(density) sampling artifact.
+        # The covariance geometry becomes the ANGULAR spectral distance. Rank is
+        # preserved (row-scaling a low-rank matrix stays <= num_modes), so the
+        # LowRank/Root operator structure is unchanged. Off by default so the raw
+        # kernel behaviour is untouched; the magnitude is then carried by the
+        # outputscale (ScaleKernel) instead of the diagonal.
+        self.normalize_features = normalize_features
 
         # When True, gradient-carrying inputs (i.e. LEARNED inducing-point
         # parameters) are routed through the differentiable feature map
@@ -276,7 +290,18 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         x1_eq_x2 = torch.equal(x1, x2)
         z1 = self.features(x1)
         z2 = z1 if x1_eq_x2 else self.features(x2)
- 
+
+        # Cosine / correlation kernel: unit-normalize the feature rows so the
+        # kernel is <Phi/||Phi||, Phi/||Phi||>. Done here (not in features()) so
+        # it covers every return path below and both the exact and differentiable
+        # feature maps uniformly. eps guards the zero-norm rows (points outside
+        # all bump support, Phi(x)=0): F.normalize divides by max(||z||, eps), so
+        # they stay ~0 (self-covariance 0, i.e. "no support => no information")
+        # rather than NaN.
+        if self.normalize_features:
+            z1 = normalize(z1, dim=-1, eps=1e-12)
+            z2 = z1 if x1_eq_x2 else normalize(z2, dim=-1, eps=1e-12)
+
         if diag:
             return (z1 * z2).sum(-1)
         if x1_eq_x2:
@@ -289,17 +314,24 @@ class RiemannKernel(gpytorch.kernels.Kernel):
     def spectral_density(self):
         raise NotImplementedError()
  
-    def features(self, x: Tensor) -> Tensor:
-        # Learned-inducing mode: route gradient-carrying inputs (the inducing-
-        # point parameters) through the differentiable feature map. Data/test
-        # inputs do not require grad, so they keep the exact lookup below. The
-        # two maps are mutually consistent (the Nyström correction is designed
-        # to extend the on-graph eigenvectors), exactly as features() already
-        # mixes exact + Nyström rows within a single call.
-        if self.differentiable_inducing and x.requires_grad:
-            return self.features_differentiable(x)
+    def _interpolated_eigenvectors(self, x: Tensor):
+        """UNSCALED interpolated eigenfunctions U(x) ``(B, num_modes)``.
 
+        On-graph rows are the exact eigenvector rows; out-of-sample rows within
+        bump support use the Nyström extension (× bump gate); rows beyond support
+        stay zero. This is the spectral-density-free core shared by ``features``
+        (which re-applies the per-row scale) and ``raw_eigenvectors`` (which
+        returns U directly). Returns ``(U, within_global)`` where
+        ``within_global`` indexes the OOS rows that received a Nyström value
+        (``None`` if there are none) so ``features`` can apply the OOS scale.
+        """
         laplacian_ = self.laplacian()
+
+        # faiss GPU search requires a contiguous input; minibatches gathered by a
+        # shuffled DataLoader (the spectral / eigenmap paths) can be non-contiguous.
+        # No-op when already contiguous, so the manifold path is unaffected.
+        if not x.is_contiguous():
+            x = x.contiguous()
 
         # Check if x is a *subset* of knn.x by nearest-neighbor lookup,
         # not torch.equal (which requires identical tensors).
@@ -307,37 +339,26 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         edge_value_nn, edge_index_nn = self.knn.search(x, 1)
         is_on_graph = (edge_value_nn[:, 0] < 1e-8)   # dist² < 1e-8 → on the graph
 
-        spectral_density = self.spectral_density()
-        spectral_density = (spectral_density / spectral_density.sum().clamp(min=1e-12))
-        scale = (spectral_density * self.eigvec.shape[0]).sqrt()  # (num_modes,)
-
-        features = torch.zeros(x.shape[0], self.num_modes, device=x.device)
+        U = torch.zeros(x.shape[0], self.num_modes, device=x.device)
+        within_global = None
 
         # ---- In-sample rows: look up exact eigenvector by node index ----
         if is_on_graph.any():
             node_idx = edge_index_nn[is_on_graph, 0]   # which graph node
-            features[is_on_graph] = scale * self.eigvec[node_idx]
+            U[is_on_graph] = self.eigvec[node_idx]
 
         # ---- Out-of-sample rows: Nyström extension ----
         oos = ~is_on_graph
         if oos.any():
             x_oos = x[oos]
-            ev, ei = edge_value_nn[oos], edge_index_nn[oos]
             # Full k-NN for Nyström (not just k=1)
             ev_k, ei_k = self.knn.search(x_oos, self.nearest_neighbors)
             within = ev_k[:, 0].sqrt() < self.bump_scale * self.graphbandwidth.squeeze()
             if within.any():
-                # Use original spectral density formula for OOS
-                sd_oos = self.spectral_density().div(
-                    (1 - self.graphbandwidth.square() * self.eigval).square().clamp(min=1e-6)
-                )
-                sd_oos = (sd_oos / sd_oos.sum().clamp(min=1e-12)) * self.eigvec.shape[0]
-                scale_oos = sd_oos.sqrt()
                 oos_idx = oos.nonzero(as_tuple=True)[0]
                 within_global = oos_idx[within]
-                features[within_global] = (
-                    scale_oos
-                    * laplacian_.out_of_sample(
+                U[within_global] = (
+                    laplacian_.out_of_sample(
                         self.eigvec,
                         ev_k[within],
                         ei_k[within],
@@ -348,6 +369,46 @@ class RiemannKernel(gpytorch.kernels.Kernel):
                         self.bump_decay,
                     ).unsqueeze(-1)
                 )
+
+        return U, within_global
+
+    def raw_eigenvectors(self, x: Tensor) -> Tensor:
+        """Interpolated UNSCALED Laplacian eigenfunctions φ_k(x) ``(B, num_modes)``.
+
+        The spectral-density-free basis used by the weight-space SpectralLatentGP
+        and the eigenmap embedding. ``features(x)`` is this multiplied by the
+        per-mode spectral-density scale.
+        """
+        U, _ = self._interpolated_eigenvectors(x)
+        return U
+
+    def features(self, x: Tensor) -> Tensor:
+        # Learned-inducing mode: route gradient-carrying inputs (the inducing-
+        # point parameters) through the differentiable feature map. Data/test
+        # inputs do not require grad, so they keep the exact lookup below. The
+        # two maps are mutually consistent (the Nyström correction is designed
+        # to extend the on-graph eigenvectors), exactly as features() already
+        # mixes exact + Nyström rows within a single call.
+        if self.differentiable_inducing and x.requires_grad:
+            return self.features_differentiable(x)
+
+        U, within_global = self._interpolated_eigenvectors(x)
+
+        spectral_density = self.spectral_density()
+        spectral_density = (spectral_density / spectral_density.sum().clamp(min=1e-12))
+        scale = (spectral_density * self.eigvec.shape[0]).sqrt()  # (num_modes,)
+
+        # On-graph rows (and beyond-support zero rows) take the in-sample scale.
+        features = U * scale
+
+        # Out-of-sample rows within bump support use the OOS spectral density.
+        if within_global is not None:
+            sd_oos = self.spectral_density().div(
+                (1 - self.graphbandwidth.square() * self.eigval).square().clamp(min=1e-6)
+            )
+            sd_oos = (sd_oos / sd_oos.sum().clamp(min=1e-12)) * self.eigvec.shape[0]
+            scale_oos = sd_oos.sqrt()
+            features[within_global] = U[within_global] * scale_oos
 
         return features
 

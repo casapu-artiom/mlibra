@@ -16,11 +16,11 @@ Two modes:
 Examples
 --------
 # Does the K=15, thr in {5,40,50}, 2300-mode, stride-4 set exist for plain
-# faiss AND atlas-weighted x{10,50}?  (nlist=sqrt was resolved to e.g. 700)
+# faiss AND atlas-weighted x{10,50}?  (--nlist sqrt is resolved per stride/thr)
 python maldi/check_eigencache.py \
     --eigenvector-dir /s3/mlibra/mlibra-data/artiom/eigenvectors \
     --knn-k 15 --threshold 5 40 50 --num-modes 2300 --stride 4 \
-    --nlist 700 --method faiss faiss_atlas_weighted --inflation 10 50
+    --nlist sqrt --method faiss faiss_atlas_weighted --inflation 10 50
 
 # Just show me everything that's cached:
 python maldi/check_eigencache.py \
@@ -29,8 +29,9 @@ python maldi/check_eigencache.py \
 Notes
 -----
 * nlist is keyed only when != 1 (recall ~1.0 at nlist=1, so the pipeline keeps
-  those caches shared). If your runs used --nlist sqrt, pass the *resolved*
-  integer here (or use --list to see what's actually on disk).
+  those caches shared). Pass --nlist 1 or --nlist sqrt; 'sqrt' is resolved to
+  round(sqrt(N)) per (stride, threshold) from --reference-file, matching the
+  pipeline. Use --list to see what's actually on disk.
 * inflation only applies to faiss_atlas_weighted; it's ignored for plain faiss.
 """
 from __future__ import annotations
@@ -47,8 +48,46 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from manifold_gp.utils.nearest_neighbors import make_key as make_graph_key  # noqa: E402
-from manifold_gp.utils.compute_eigenvectors import make_key as make_eig_key  # noqa: E402
+from manifold_gp.utils.nearest_neighbors import (  # noqa: E402
+    make_key as make_graph_key, resolve_nlist,
+)
+from manifold_gp.utils.compute_eigenvectors import (  # noqa: E402
+    make_key as make_eig_key, resolve_modes_key,
+)
+
+
+# ---------------------------------------------------------------------------
+# nlist='sqrt' resolution -- N depends on (stride, threshold), resolved the same
+# way slepc_eigensolve.node_count does so the keys match. Memoized per pair.
+# ---------------------------------------------------------------------------
+_N_CACHE: dict = {}
+
+
+def node_count(reference_file, annotations_file, stride, threshold) -> int:
+    import numpy as np
+    from maldi.utils import (crop_or_stride_volume,
+                             reference_ccf_from_subvolume)
+    reference_image = np.load(reference_file)
+    annotation_volume = np.load(annotations_file) if annotations_file else None
+    sub_volume, _, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
+        reference_image, annotation_volume, stride)
+    mm_coords = reference_ccf_from_subvolume(
+        sub_volume, voxel_offset, voxel_scale_mm, threshold)
+    return int(mm_coords.shape[0])
+
+
+def resolve_nlist_spec(spec, *, stride, threshold, reference_file,
+                       annotations_file) -> int:
+    """'1' -> 1, 'sqrt' -> round(sqrt(N(stride,threshold))). Memoized."""
+    if str(spec).strip().lower() != "sqrt":
+        return resolve_nlist(spec, 0)
+    if not reference_file:
+        sys.exit("ERROR: --nlist sqrt needs --reference-file to compute N.")
+    ck = (stride, threshold)
+    if ck not in _N_CACHE:
+        _N_CACHE[ck] = node_count(reference_file, annotations_file,
+                                  stride, threshold)
+    return resolve_nlist("sqrt", _N_CACHE[ck])
 
 
 # ---------------------------------------------------------------------------
@@ -129,15 +168,19 @@ def main():
                         "Defaults to $EIGENVECTOR_DIR.")
     p.add_argument("--list", action="store_true",
                    help="Inventory the cache dir instead of checking a grid.")
+    p.add_argument("--allow-larger", action="store_true",
+                   help="Count a combo as satisfiable (REUSABLE) when a cache "
+                        "with the same graph but MORE modes exists -- matches "
+                        "the lgp experiments' allow_larger_modes reuse.")
 
     # Grid axes -- each accepts multiple values; the script takes the product.
     p.add_argument("--knn-k", type=int, nargs="+", default=[15])
     p.add_argument("--threshold", type=float, nargs="+", default=[5.0])
     p.add_argument("--num-modes", type=int, nargs="+", default=[2300])
     p.add_argument("--stride", type=int, nargs="+", default=[4])
-    p.add_argument("--nlist", type=int, nargs="+", default=[1],
-                   help="IVF nlist (keyed only when !=1). Pass the resolved int "
-                        "if your runs used --nlist sqrt.")
+    p.add_argument("--nlist", nargs="+", default=["1"], choices=["1", "sqrt"],
+                   help="IVF nlist: '1' (exact flat, not keyed) or 'sqrt' "
+                        "(round(sqrt(N)), keyed). 'sqrt' needs --reference-file.")
     p.add_argument("--method", nargs="+", default=["faiss"],
                    choices=["faiss", "faiss_atlas_weighted", "anatomical_atlas"])
     p.add_argument("--inflation", type=float, nargs="+", default=[10.0],
@@ -148,6 +191,14 @@ def main():
                    choices=["randomwalk", "symmetric"])
     p.add_argument("--bandwidth", type=float, default=1.0)
     p.add_argument("--template", default="reference")
+
+    # Only needed to resolve --nlist sqrt (N = nodes for stride+threshold).
+    p.add_argument("--reference-file",
+                   default=os.environ.get("REFERENCE_FILE",
+                                          "/s3/mlibra/mlibra-data/reference_image.npy"))
+    p.add_argument("--annotations-file",
+                   default=os.environ.get("ANNOTATIONS_FILE",
+                                          "/s3/mlibra/mlibra-data/level_15annot.npy"))
     args = p.parse_args()
 
     eigvec_dir = Path(args.eigenvector_dir) / "eigvecs"
@@ -184,20 +235,24 @@ def main():
     # it's a no-op (and would create bogus duplicates) for the others.
     combos = []
     seen = set()
-    for method, k, thr, modes, stride, nlist, infl in itertools.product(
+    for method, k, thr, modes, stride, nlist_spec, infl in itertools.product(
             args.method, args.knn_k, args.threshold, args.num_modes,
             args.stride, args.nlist, args.inflation):
         if method != "faiss_atlas_weighted":
             infl = None  # not part of the key; collapse the inflation axis
+        nlist = resolve_nlist_spec(
+            nlist_spec, stride=stride, threshold=thr,
+            reference_file=args.reference_file,
+            annotations_file=args.annotations_file)
         sig = (method, k, thr, modes, stride, nlist, infl)
         if sig in seen:
             continue
         seen.add(sig)
         combos.append(dict(method=method, knn_k=k, threshold=thr,
                            num_modes=modes, stride=stride, nlist=nlist,
-                           inflation=infl))
+                           nlist_spec=nlist_spec, inflation=infl))
 
-    present, missing = [], []
+    present, reusable, missing = [], [], []
     for c in combos:
         key = eigvec_key(
             template=args.template, norm=args.norm, bandwidth=args.bandwidth,
@@ -205,8 +260,18 @@ def main():
             knn_k=c["knn_k"], method=c["method"], nlist=c["nlist"],
             inflation=(c["inflation"] if c["inflation"] is not None else 0.0))
         npz, meta = cache_paths(eigvec_dir, key)
-        ok = npz.exists() and meta.exists()
-        (present if ok else missing).append((c, key, npz))
+        if npz.exists() and meta.exists():
+            present.append((c, key, None))
+        elif args.allow_larger:
+            # Same graph/norm/bw, more modes? resolve_modes_key returns that
+            # sibling's key (else the original), exactly as the experiments reuse.
+            alt = resolve_modes_key(eigvec_dir, key, c["num_modes"])
+            if alt != key:
+                reusable.append((c, key, alt))
+            else:
+                missing.append((c, key, None))
+        else:
+            missing.append((c, key, None))
 
     def label(c):
         m = c["method"]
@@ -215,26 +280,38 @@ def main():
         bits = [f"method={m}", f"k={c['knn_k']}", f"thr={c['threshold']:g}",
                 f"modes={c['num_modes']}", f"stride={c['stride']}"]
         if c["nlist"] != 1:
-            bits.append(f"nlist={c['nlist']}")
+            bits.append(f"nlist={c['nlist_spec']}({c['nlist']})")
         return "  ".join(bits)
 
     print(f"Eigvec cache dir: {eigvec_dir}")
     print(f"Checked {len(combos)} combination(s) "
           f"(norm={args.norm}, bw={args.bandwidth:g}, template={args.template})\n")
 
+    def alt_modes(alt_key):
+        m = re.search(r"_modes=(\d+)_norm=", alt_key)
+        return m.group(1) if m else "?"
+
     print(f"PRESENT ({len(present)}):")
-    for c, key, npz in present:
+    for c, key, _ in present:
         print(f"  [x] {label(c)}")
     if not present:
         print("  (none)")
 
+    if args.allow_larger:
+        print(f"\nREUSABLE via larger-modes cache ({len(reusable)}):")
+        for c, key, alt in reusable:
+            print(f"  [~] {label(c)}  <- modes={alt_modes(alt)} cache")
+        if not reusable:
+            print("  (none)")
+
     print(f"\nMISSING ({len(missing)}):")
-    for c, key, npz in missing:
+    for c, key, _ in missing:
         print(f"  [ ] {label(c)}")
     if not missing:
         print("  (none)")
 
-    # Non-zero exit if anything is missing -- handy in shell guards.
+    # Non-zero exit only if something is truly unobtainable. With --allow-larger,
+    # a REUSABLE combo counts as obtainable (the experiments will reuse it).
     sys.exit(1 if missing else 0)
 
 

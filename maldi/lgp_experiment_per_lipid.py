@@ -308,6 +308,11 @@ def parse_args() -> dict:
                          "pure faiss; only the edge weights change."))
     p.add_argument("--laplacian-norm", default="randomwalk",
                    choices=["symmetric", "randomwalk"])
+    p.add_argument("--normalize-features", dest="normalize_features", action="store_true",
+                   help="Use the cosine/correlation Riemann kernel: L2-normalize the feature "
+                        "rows so the prior variance is constant (diagonal=1) and the "
+                        "sqrt(degree) sampling artifact is quotiented out; magnitude is then "
+                        "carried by the ScaleKernel outputscale.")
     p.add_argument("--stride", type=int, default=4)
     p.add_argument("--augment-maldi-nodes", dest="augment_maldi_nodes", action="store_true",
                    help="Add the measured MALDI voxels to the graph node set so every "
@@ -809,6 +814,9 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         graphbandwidth=args["graphbandwidth_init"],
         laplacian_normalization=args["laplacian_norm"],
         extra=eigvec_key_parts, device=args["device"],
+        # Reuse a cache with more modes if one exists (eigenpairs are nested;
+        # the extra modes are simply trimmed off on load).
+        allow_larger_modes=True,
     )
 
     # Kernel
@@ -818,6 +826,7 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         nearest_neighbors=args["knn_k"], num_modes=args["num_modes"],
         bump_scale=args["bump_scale"], bump_decay=args["bump_decay"],
         laplacian_normalization=args["laplacian_norm"],
+        normalize_features=args.get("normalize_features", False),
         graphbandwidth_init=args["graphbandwidth_init"],
         diffusion_scale_init=args.get("diffusion_scale_init", 1.0),
         learn_diffusion_scale=args.get("learn_diffusion_scale", False),
@@ -1175,6 +1184,7 @@ def train_lipid_batch(
                     nearest_neighbors=mk.nearest_neighbors, num_modes=mk.num_modes,
                     bump_scale=mk.bump_scale, bump_decay=mk.bump_decay,
                     laplacian_normalization=mk.laplacian_normalization,
+                    normalize_features=mk.normalize_features,
                     graphbandwidth_init=float(mk.graphbandwidth),
                     diffusion_scale_init=float(mk.diffusion_scale),
                     learn_diffusion_scale=args.get("learn_diffusion_scale", False),

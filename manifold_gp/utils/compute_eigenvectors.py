@@ -61,6 +61,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -522,6 +523,7 @@ class LaplacianEigensolver:
         extra: Optional[Dict[str, Any]] = None,
         force_recompute: bool = False,
         device=None,
+        allow_larger_modes: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Try cache, fall back to compute, then save.
 
@@ -543,21 +545,35 @@ class LaplacianEigensolver:
           device:          optional device to place loaded tensors on. If you
                            pass the kernel's device here, you avoid an extra
                            .to() at the call site.
+          allow_larger_modes: on an exact-key miss, reuse a sibling cache with
+                           the same graph but MORE modes (trimmed to num_modes).
+                           Eigenpairs are nested, so this is exact, not an
+                           approximation. Only affects the load path -- a true
+                           miss still computes and saves under the requested key.
         """
         wanted = self.fingerprint(laplacian_op, graphbandwidth,
                                   laplacian_normalization)
 
         if not force_recompute:
-            hit = self.load(cache_dir, key, device=device)
+            # Resolve the load key separately from `key`: if we end up computing,
+            # we still save under the originally requested `key` (so we never
+            # overwrite the larger sibling we borrowed from).
+            load_key = key
+            if allow_larger_modes:
+                load_key = resolve_modes_key(cache_dir, key, self.num_modes)
+                if load_key != key and self.verbose:
+                    print(f"[eigensolver] reusing larger-modes cache "
+                          f"{load_key} for request {key}")
+            hit = self.load(cache_dir, load_key, device=device)
             if hit is not None:
                 evals, evecs, cached_fp, _meta = hit
                 ok, why = cached_fp.matches(wanted)
                 if ok:
                     if self.verbose:
-                        print(f"[eigensolver] HIT  {cache_dir}/{key}")
+                        print(f"[eigensolver] HIT  {cache_dir}/{load_key}")
                     # Trim if the cache has more modes than we need now.
                     return evals[: self.num_modes], evecs[:, : self.num_modes]
-                msg = f"[eigensolver] cache mismatch for key={key!r}: {why}"
+                msg = f"[eigensolver] cache mismatch for key={load_key!r}: {why}"
                 if self.strict_fingerprint:
                     raise RuntimeError(msg + " (strict_fingerprint=True)")
                 logging.warning(msg + " -- recomputing.")
@@ -598,6 +614,55 @@ def make_key(parts: Dict[str, Any]) -> str:
             v = f"{v:.6g}"
         pieces.append(f"{k}={v}")
     return "_".join(pieces).replace("/", "-").replace(" ", "")
+
+
+# make_key sorts fields alphabetically, so for the eigvec key
+# ({bw, graph, modes, norm}) the modes field is always `_modes=<int>_norm=` --
+# graph sorts before modes, norm after. That lets us swap just the mode count.
+_MODES_FIELD_RE = re.compile(r"_modes=(\d+)_norm=")
+
+
+def resolve_modes_key(cache_dir: Path, key: str, num_modes: int) -> str:
+    """Find an existing eigvec cache that can serve `num_modes`, else return key.
+
+    Eigenpairs are nested: a cache computed with M >= num_modes modes contains
+    the requested ones as its leading columns, and both `EigenFingerprint.matches`
+    (cached.num_modes >= requested) and `compute_or_load` (trims to num_modes on
+    load) already handle that. The only thing standing in the way is that the
+    mode count is baked into the cache *key* (the filename), so an exact-modes
+    lookup walks right past a bigger, fully-usable cache sitting next to it.
+
+    This returns the key of the *smallest* sibling cache (same graph / norm / bw)
+    whose mode count is >= num_modes -- smallest so we load and trim the least.
+    If the exact key already exists, or no suitable larger sibling is found, the
+    original `key` is returned unchanged, so callers fall through to their normal
+    compute-and-save path (saving under the requested key, as before).
+    """
+    cache_dir = Path(cache_dir)
+    npz, meta = LaplacianEigensolver._paths(cache_dir, key)
+    if npz.exists() and meta.exists():
+        return key  # exact hit -- nothing to resolve
+
+    m = _MODES_FIELD_RE.search(key)
+    if m is None:
+        return key  # unexpected key shape; leave it alone
+
+    # The key with its mode count blanked out -- the "same graph" signature.
+    neutral = _MODES_FIELD_RE.sub("_modes=*_norm=", key)
+    best_key, best_modes = None, None
+    for cand_npz in cache_dir.glob("*.eigpairs.npz"):
+        cand = cand_npz.name[: -len(".eigpairs.npz")]
+        cm = _MODES_FIELD_RE.search(cand)
+        if cm is None or _MODES_FIELD_RE.sub("_modes=*_norm=", cand) != neutral:
+            continue
+        cand_modes = int(cm.group(1))
+        if cand_modes < num_modes:
+            continue
+        if not (cache_dir / f"{cand}.eigpairs.meta.json").exists():
+            continue  # need both halves to load
+        if best_modes is None or cand_modes < best_modes:
+            best_key, best_modes = cand, cand_modes
+    return best_key if best_key is not None else key
 
 
 # ---------------------------------------------------------------------------
