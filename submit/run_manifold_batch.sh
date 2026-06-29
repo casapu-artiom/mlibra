@@ -47,10 +47,10 @@ FORCE_RECOMPUTE_GRAPH=${FORCE_RECOMPUTE_GRAPH:-0}
 N_LIST=${N_LIST:-sqrt}
 N_PROBE=${N_PROBE:-8}
 
-N_EPOCHS=10
+N_EPOCHS=20
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_cpu_test"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_16"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -65,8 +65,8 @@ SRC_PATH="/myhome/mlibra"
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 submit() {
-    local job_name=$1 template=$2 ref=$3 annot=$4 infl=$5 threshold=$6 knn=$7 knn_k=$8 laplacian_norm=$9 nu=${10} graphbandwidth=${11} bumpscale=${12} bumpdecay=${13} prefix=${14} slice=${15} stride=${16} num_modes=${17} ind_source=${18}
-	shift 18
+    local job_name=$1 template=$2 ref=$3 annot=$4 infl=$5 threshold=$6 knn=$7 knn_k=$8 laplacian_norm=$9 nu=${10} graphbandwidth=${11} bumpscale=${12} bumpdecay=${13} prefix=${14} slice=${15} stride=${16} num_modes=${17} ind_source=${18} diffusion_init=${19} learn_diffusion=${20} product_ard=${21} product_ard_nu=${22}
+	shift 22
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
@@ -91,10 +91,14 @@ submit() {
         -e NU="$nu" \
 		-e SRC_PATH="$SRC_PATH" \
         -e GRAPHBANDWIDTH="$graphbandwidth" \
+        -e DIFFUSION_SCALE_INIT="$diffusion_init" \
+        -e LEARN_DIFFUSION_SCALE="$learn_diffusion" \
+        -e PRODUCT_ARD_MATERN="$product_ard" \
+        -e PRODUCT_ARD_NU="$product_ard_nu" \
         -e BUMP_SCALE="$bumpscale" \
         -e BUMP_DECAY="$bumpdecay" \
         -e N_EPOCHS="$N_EPOCHS" \
-        -e NUM_INDUCING_POINTS=1000 \
+        -e NUM_INDUCING_POINTS=2000 \
         -e INDUCING_SOURCE="$ind_source" \
         -e NUM_MODES="$num_modes" \
         -e NCV_MIN="${NCV_MIN:--1}" \
@@ -126,22 +130,35 @@ submit() {
 FOLDS=("fold-2")           # lowercase, dashed
 KNN_K=(15)
 MAN_KNN_METHODS=("faiss_atlas_weighted")
-MAN_INFLATIONS=(50)   # only used when knn_method=faiss_atlas_weighted
+MAN_INFLATIONS=(10 50)   # only used when knn_method=faiss_atlas_weighted
 LAPLACIAN_NORMS=("randomwalk")
 GRAPH_BANDWIDTHS=(0.1)
-BUMP_SCALES=(20.0)
+BUMP_SCALES=(1.0)
 BUMP_DECAYS=(0.01)
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.1 1.0
 NU=(2)
 THRESHOLDS=(5)
 IND_SOURCES=("reference")
+# Diffusion-scale sweep (manifold kernel). Each entry is "LEARN:INIT":
+#   LEARN = 0/1   -> is the multiplicative spectral scale learnable?
+#   INIT  = float -> its initial value (1.0 = identity; no eigenpair recompute).
+# LEARN=1 runs get a -learndiff suffix in EXP_NAME, so learned vs frozen don't
+# clobber each other. e.g. ("0:1.0" "1:1.0" "1:2.0") = baseline + two learned starts.
+DIFFUSION_SCALES=("0:1.0" "1:1.0")
+
+# Product ARD-Matern sweep (manifold kernel). Each entry is "ENABLE:NU":
+#   ENABLE = 0/1   -> multiply the Riemann kernel by an ambient ARD Euclidean Matern?
+#   NU     = float -> the Euclidean factor's smoothness (only used when ENABLE=1).
+# ENABLE=1 runs get a -prodard<NU> suffix in EXP_NAME, so they don't clobber the
+# plain-geodesic runs. e.g. ("0:2.5" "1:2.5") = geodesic-only + product baseline.
+PRODUCT_ARD=("0:2.5")
 
 # (stride, num_modes) pairs swept together:
 #   (1) stride=4, num_modes=1300
 #   (2) stride=8, num_modes=6000
 #STRIDE_NUM_MODES=("4:1300" "8:6000")
-STRIDE_NUM_MODES=("4:1300")
+STRIDE_NUM_MODES=("4:50" "4:100" "4:300" "4:1300" "4:2300")
 
 # Fixed across the whole sweep
 TEMPLATE="reference"
@@ -175,17 +192,25 @@ for fold in "${FOLDS[@]}"; do
                                                 infl_list=(1)
                                             fi
                                             for infl in "${infl_list[@]}"; do
+                                              for diff in "${DIFFUSION_SCALES[@]}"; do
+                                                learn_diffusion=${diff%%:*}
+                                                diffusion_init=${diff##*:}
+                                               for prod in "${PRODUCT_ARD[@]}"; do
+                                                product_ard=${prod%%:*}
+                                                product_ard_nu=${prod##*:}
 
                                                 job_name="gp-manifold-${EXP_SUFFIX}-${exp_num}"
 
                                                 # Map exp_num -> config, so you can read it back from terminal/logs
-                                                printf "  exp %2d: fold=%-10s stride=%s modes=%s gb=%-5s bs=%-4s bd=%s\n" \
-                                                    "$exp_num" "$fold" "$stride" "$num_modes" "$gb" "$bs" "$bd"
+                                                printf "  exp %2d: fold=%-10s stride=%s modes=%s gb=%-5s bs=%-4s bd=%s diff=%s(learn=%s) prodard=%s(nu=%s)\n" \
+                                                    "$exp_num" "$fold" "$stride" "$num_modes" "$gb" "$bs" "$bd" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
 
                                                 run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" "$infl" "$threshold" \
-                                                    "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$ind_src"
+                                                    "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$ind_src" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
 
                                                 exp_num=$((exp_num + 1))
+                                               done
+                                              done
                                             done
                                         done
                                     done

@@ -59,7 +59,7 @@ submit() {
         -e SRC_PATH="$SRC_PATH" \
         -e N_EPOCHS="$N_EPOCHS" \
         -e LATENT_DIM=5 \
-        -e NUM_INDUCING_POINTS=1000 \
+        -e NUM_INDUCING_POINTS=2000 \
         -e INDUCING_SOURCE="$inducing_source" \
         -e NUM_MODES=2000 \
         -e NO_RSAMPLE="$norsample" \
@@ -75,8 +75,8 @@ FOLDS=("fold-2")           # lowercase, dashed
 NO_RSAMPLES=("true" "false")
 LOG_TRANSFORM=("" "--log-transform")
 IND_SOURCES=("reference")
-LEARN_INDUCINGS=("false" "true")   # sweep: fixed vs learned inducing locations
-ARDS=("false" "true")              # sweep: isotropic vs per-axis ARD lengthscales
+LEARN_INDUCINGS=("true")   # sweep: fixed vs learned inducing locations
+ARDS=("true")              # sweep: isotropic vs per-axis ARD lengthscales
 exp_num=1
 for fold in "${FOLDS[@]}"; do
     for norsample in "${NO_RSAMPLES[@]}"; do

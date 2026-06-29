@@ -58,6 +58,20 @@ BANDWIDTH="${BANDWIDTH:-0.1}"
 BUILD_IF_MISSING="${BUILD_IF_MISSING:-1}"   # rank 0 builds the graph (CPU faiss) if absent
 FACTOR_SOLVER="${FACTOR_SOLVER:-mumps}"     # parallel direct solver for the shift-invert
 TARGET="${TARGET:-0.0}"                     # shift-invert target (bottom of the spectrum)
+# KNN graph method (global; one method per run). faiss_atlas_weighted builds the
+# plain-faiss graph then inflates cross-region edges by the PER-JOB inflation arg
+# to submit_one -- matches the lgp per-lipid runs, so the eigvec cache (keyed
+# weighting=atlas_x<infl>) is a drop-in hit. The inflation arg is ignored for
+# faiss / anatomical_atlas (pass 0, the default).
+KNN_METHOD="${KNN_METHOD:-faiss}"           # faiss | anatomical_atlas | faiss_atlas_weighted
+# FAISS IVF sizing -- int or 'sqrt'. nlist='sqrt' = round(sqrt(N)), resolved with
+# the SAME N as the per-lipid runs and keyed only when nlist!=1, so this cache is
+# a drop-in hit for the per-lipid pipeline (which also defaults to N_LIST=sqrt).
+# nprobe is a FIXED 8: in 3D recall saturates at nprobe~8 regardless of N, and
+# nprobe is never cache-keyed -- so all producers must agree on it to bake the
+# same graph. Use N_LIST=1 for the exact flat index (the old behaviour).
+N_LIST="${N_LIST:-sqrt}"
+N_PROBE="${N_PROBE:-8}"
 # Max projected dimension. Caps the Krylov working subspace so per-restart
 # orthogonalization is O(MPD^2*N) instead of O(ncv^2*N) -- the lever that keeps
 # the iteration phase from blowing up when MODES is large. <=0 = SLEPc default
@@ -82,15 +96,45 @@ OMP_THREADS="${OMP_THREADS:-1}"
 RANKS="${RANKS:-$CPU}"
 
 # -------------------------------------------------------------------------
-# submit_one  <stride> <threshold> <knn_k> <modes> [norm] [cpu]
-# Always shift-invert; never requests a GPU.
+# submit_one  <stride> <threshold> <knn_k> <modes> [norm] [knn_method] [inflation] [nlist] [cpu]
+#   knn_method - faiss | anatomical_atlas | faiss_atlas_weighted
+#                (default = global $KNN_METHOD, itself defaulting to faiss).
+#   inflation  - cross_region_inflation for faiss_atlas_weighted; 0 (default)
+#                for the non-weighted methods, which ignore it.
+#   nlist      - FAISS IVF nlist (int or 'sqrt'); default = global $N_LIST.
+#                Keyed in the eigvec cache only when != 1 (the exact flat index).
+# Always shift-invert; no GPU.
 # -------------------------------------------------------------------------
 n_submitted=0
 submit_one() {
     local stride=$1 threshold=$2 knn_k=$3 modes=$4
-    local norm=${5:-randomwalk} cpu=${6:-$CPU}
+    local norm=${5:-randomwalk} knn_method=${6:-${KNN_METHOD:-faiss}}
+    local inflation=${7:-0} nlist=${8:-$N_LIST} cpu=${9:-$CPU}
 
-    local run_slug="str${stride}_t${threshold}_k${knn_k}_bw1p0_${norm}_nm${modes}_si"
+    # Guard: weighting only makes sense with inflation > 1 (it multiplies the
+    # cross-region squared distance to DOWN-weight those edges). 0 would instead
+    # zero the distance -> maximal cross-region coupling -- almost certainly a
+    # forgotten arg, so fail fast rather than cache a nonsensical graph.
+    if [ "$knn_method" = "faiss_atlas_weighted" ] && awk "BEGIN{exit !($inflation<=0)}"; then
+        echo "ERROR: faiss_atlas_weighted needs an inflation arg > 0 (got $inflation)." \
+             "Pass it as the 7th submit_one arg, e.g. submit_one 4 5 15 2300 randomwalk faiss_atlas_weighted 50" >&2
+        exit 1
+    fi
+
+    # Method/weighting tag so log dirs + job slugs don't collide across methods.
+    local mtag=""
+    if [ "$knn_method" = "faiss_atlas_weighted" ]; then
+        mtag="_faw${inflation/./p}"
+    elif [ "$knn_method" != "faiss" ]; then
+        mtag="_${knn_method}"
+    fi
+    # nlist tag so two calls differing only in nlist don't share a log dir/slug.
+    # Untagged for the 'sqrt' default to keep existing slugs unchanged.
+    local ltag=""
+    if [ "$nlist" != "sqrt" ]; then
+        ltag="_nl${nlist}"
+    fi
+    local run_slug="str${stride}_t${threshold}_k${knn_k}_bw1p0_${norm}_nm${modes}${mtag}${ltag}_si"
     n_submitted=$((n_submitted + 1))
     local job_name="slepcsi-${EXP_SUFFIX}-$(printf '%03d' "$n_submitted")"
 
@@ -113,6 +157,10 @@ submit_one() {
         -e STRIDE="$stride" \
         -e THRESHOLD="$threshold" \
         -e KNN_K="$knn_k" \
+        -e KNN_METHOD="$knn_method" \
+        -e NLIST="$nlist" \
+        -e NPROBE="$N_PROBE" \
+        -e CROSS_REGION_INFLATION="$inflation" \
         -e MODES="$modes" \
         -e NORMALIZATION="$norm" \
         -e SHIFT_INVERT="1" \
@@ -125,18 +173,192 @@ submit_one() {
 
 # -------------------------------------------------------------------------
 # Eigenvector caches to pre-compute -- edit these.
-#            stride thr  k    modes  [norm]__sdfsdf
+#
+#   submit_one  <stride> <threshold> <knn_k> <modes> [norm] [knn_method] [inflation]
+#
+# norm defaults to randomwalk, knn_method to faiss, inflation to 0 (unused unless
+# knn_method=faiss_atlas_weighted). Examples below cover every method.
 # -------------------------------------------------------------------------
-# submit_one      4   5   15    300    randomwalk
-# submit_one      4   5   15    1300   randomwalk
-submit_one      4   5   15    2300   randomwalk
-submit_one      4   5   15    4300   randomwalk
-# submit_one      4   40   15    300    randomwalk
-# submit_one      4   40   15    1300   randomwalk
-#submit_one      4   40   15    4300   randomwalk
-# submit_one      4   50   15    300    randomwalk
-# submit_one      4   50   15    1300   randomwalk
-#submit_one      4   40   15    4300   randomwalk
+
+# # ---- plain faiss (Euclidean kNN); inflation/method args omitted -----------
+# submit_one      4   5   15    2300   randomwalk
+# submit_one      4   5   15    4300   randomwalk
+
+# ---- faiss_atlas_weighted: sweep the cross-region inflation weight ---------
+# (needs --reference-file + --annotations-file, both already passed). Each
+# inflation gets its own weighting=atlas_x<infl> eigvec cache -> a drop-in hit
+# for the matching per-lipid GP run.
+# submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  10
+# submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  50
+# submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  100
+
+# ---- anatomical_atlas (per-region kNN + grid-adjacent cross-region edges) --
+# submit_one    4   5   15    2300   randomwalk  anatomical_atlas
+
+# ---- other thresholds / mode counts (plain faiss) -------------------------
+# submit_one    4   40  15    1300   randomwalk
+# submit_one    4   50  15    1300   randomwalk
+
+# ---- mixing methods in one batch is fine (method is per-call) -------------
+submit_one    4   5   15    2300   randomwalk  faiss
+submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  10
+submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  50
+submit_one    4   40   15    2300   randomwalk  faiss
+submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  10
+submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  50
+submit_one    4   50   15    2300   randomwalk  faiss
+submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  10
+submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  50
+
+# MISSING (146):
+#   [ ] method=faiss  k=15  thr=5  modes=50  stride=2
+#   [ ] method=faiss  k=15  thr=5  modes=50  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss  k=15  thr=5  modes=50  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss  k=15  thr=5  modes=64  stride=2
+#   [ ] method=faiss  k=15  thr=5  modes=64  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss  k=15  thr=5  modes=64  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss  k=15  thr=5  modes=100  stride=2
+#   [ ] method=faiss  k=15  thr=5  modes=100  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss  k=15  thr=5  modes=100  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss  k=15  thr=5  modes=300  stride=2
+#   [ ] method=faiss  k=15  thr=5  modes=300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss  k=15  thr=5  modes=300  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss  k=15  thr=5  modes=1300  stride=2
+#   [ ] method=faiss  k=15  thr=5  modes=1300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss  k=15  thr=5  modes=1300  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss  k=15  thr=5  modes=2300  stride=2
+#   [ ] method=faiss  k=15  thr=5  modes=2300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss  k=15  thr=5  modes=2300  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss  k=15  thr=40  modes=50  stride=2
+#   [ ] method=faiss  k=15  thr=40  modes=50  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss  k=15  thr=40  modes=50  stride=4  nlist=sqrt(541)
+#   [ ] method=faiss  k=15  thr=40  modes=64  stride=2
+#   [ ] method=faiss  k=15  thr=40  modes=64  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss  k=15  thr=40  modes=64  stride=4  nlist=sqrt(541)
+#   [ ] method=faiss  k=15  thr=40  modes=100  stride=2
+#   [ ] method=faiss  k=15  thr=40  modes=100  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss  k=15  thr=40  modes=100  stride=4  nlist=sqrt(541)
+#   [ ] method=faiss  k=15  thr=40  modes=300  stride=2
+#   [ ] method=faiss  k=15  thr=40  modes=300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss  k=15  thr=40  modes=300  stride=4  nlist=sqrt(541)
+#   [ ] method=faiss  k=15  thr=40  modes=1300  stride=2
+#   [ ] method=faiss  k=15  thr=40  modes=1300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss  k=15  thr=40  modes=1300  stride=4  nlist=sqrt(541)
+#   [ ] method=faiss  k=15  thr=40  modes=2300  stride=2
+#   [ ] method=faiss  k=15  thr=40  modes=2300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss  k=15  thr=40  modes=2300  stride=4  nlist=sqrt(541)
+#   [ ] method=faiss  k=15  thr=50  modes=50  stride=2
+#   [ ] method=faiss  k=15  thr=50  modes=50  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss  k=15  thr=50  modes=50  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss  k=15  thr=50  modes=64  stride=2
+#   [ ] method=faiss  k=15  thr=50  modes=64  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss  k=15  thr=50  modes=64  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss  k=15  thr=50  modes=100  stride=2
+#   [ ] method=faiss  k=15  thr=50  modes=100  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss  k=15  thr=50  modes=100  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss  k=15  thr=50  modes=300  stride=2
+#   [ ] method=faiss  k=15  thr=50  modes=300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss  k=15  thr=50  modes=300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss  k=15  thr=50  modes=1300  stride=2
+#   [ ] method=faiss  k=15  thr=50  modes=1300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss  k=15  thr=50  modes=1300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss  k=15  thr=50  modes=2300  stride=2
+#   [ ] method=faiss  k=15  thr=50  modes=2300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss  k=15  thr=50  modes=2300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=50  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=50  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=50  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=50  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=64  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=64  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=64  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=64  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=100  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=100  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=100  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=100  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=1300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=1300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=1300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=1300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=2300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=2300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=2300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=2300  stride=2  nlist=sqrt(2061)
+#   [ ] method=faiss_w x10  k=15  thr=5  modes=2300  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss_w x50  k=15  thr=5  modes=2300  stride=4  nlist=sqrt(729)
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=50  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=50  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=50  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=50  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=64  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=64  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=64  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=64  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=100  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=100  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=100  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=100  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=1300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=1300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=1300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=1300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=2300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=2300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=40  modes=2300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x50  k=15  thr=40  modes=2300  stride=2  nlist=sqrt(1530)
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=50  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=50  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=4
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=50  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=50  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=64  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=64  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=4
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=64  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=64  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=100  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=100  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=4
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=100  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=100  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=4
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=1300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=1300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=4
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=1300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=1300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=2300  stride=2
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=2
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=2300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=2  nlist=sqrt(1252)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=4
+#   [ ] method=faiss_w x10  k=15  thr=50  modes=2300  stride=4  nlist=sqrt(443)
+#   [ ] method=faiss_w x50  k=15  thr=50  modes=2300  stride=4  nlist=sqrt(443) 
+
+# so I'd like to run_slepc_cache_prepare on what is missing .. 
 
 echo "Submitted $n_submitted shift-invert cache-prep jobs. Suffix: $EXP_SUFFIX"
 echo "Eigvecs -> $S3_EIGENVECTOR_DIR/eigvecs/   logs -> $S3_EIGENVECTOR_DIR/slepc_logs/"

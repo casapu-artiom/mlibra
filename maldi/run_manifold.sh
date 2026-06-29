@@ -66,8 +66,8 @@ FAISS_CPU_ARGS=""
 
 # FAISS IVF sizing. Pass an int or 'sqrt' (nlist=sqrt(N), nprobe=sqrt(nlist)) --
 # 'sqrt' is what makes the CPU path fast at scale (see faiss_bench_report).
-: "${N_LIST:=1}"
-: "${N_PROBE:=1}"
+: "${N_LIST:=sqrt}"
+: "${N_PROBE:=8}"
 
 cd $SRC_PATH
 #pip install -e .

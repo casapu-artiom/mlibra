@@ -79,6 +79,11 @@
 : "${KNN_METHOD:=faiss_atlas_weighted}"
 : "${CROSS_REGION_INFLATION:=50.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
+# Cosine/correlation kernel (manifold only, 1=on): L2-normalize the Riemann
+# feature rows so the prior variance is constant (diagonal=1) and the
+# sqrt(degree) sampling-density artifact is quotiented out; magnitude then lives
+# in the ScaleKernel outputscale. Encoded in the TAG as -cos. Off by default.
+: "${NORMALIZE_FEATURES:=1}"
 : "${BUMP_SCALE:=1.0}"
 : "${BUMP_DECAY:=0.01}"
 : "${GRAPHBANDWIDTH:=0.1}"
@@ -104,7 +109,7 @@
 # Learn the inducing-point LOCATIONS jointly with the rest (1=on). Default off
 # (points stay anchored where initialized). For the manifold kernel this lets
 # them drift off the graph nodes onto the Nyström path — enable deliberately.
-: "${LEARN_INDUCING:=1}"
+: "${LEARN_INDUCING:=0}"
 # Weights & Biases logging (1=on): loss / KL / hypers / noise / per-group
 # gradient norms (incl. inducing points when LEARN_INDUCING=1). Off by default.
 : "${WANDB:=0}"
@@ -124,7 +129,7 @@
 # OWN learnable lengthscale (PerTaskRiemannWrapper) instead of one shared across
 # the batch; the eigenpairs/graph are still shared. No effect on the euclidean
 # kernel (its batched kernel is already per-task). Encoded in the TAG as -ptls.
-: "${PER_TASK_LENGTHSCALE:=0}"
+: "${PER_TASK_LENGTHSCALE:=1}"
 
 # ---- Diffusion scale (manifold kernel) -----------------------------------
 # Multiplicative scale on the (frozen) Laplacian spectrum: lambda_k ->
@@ -135,7 +140,7 @@
 # pinned at DIFFUSION_SCALE_INIT (1.0 = identity, i.e. unchanged behaviour).
 # When learned, encoded in the TAG as -learndiff.
 : "${DIFFUSION_SCALE_INIT:=1.0}"
-: "${LEARN_DIFFUSION_SCALE:=0}"
+: "${LEARN_DIFFUSION_SCALE:=1}"
 
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -170,8 +175,8 @@ FAISS_CPU_ARGS=""
 
 # FAISS IVF sizing. Pass an int or 'sqrt' (nlist=sqrt(N), nprobe=sqrt(nlist)) --
 # 'sqrt' is what makes the CPU path fast at scale (see faiss_bench_report).
-: "${N_LIST:=1}"
-: "${N_PROBE:=1}"
+: "${N_LIST:=sqrt}"
+: "${N_PROBE:=8}"
 FAISS_CPU_ARGS="$FAISS_CPU_ARGS --n-list $N_LIST --n-probe $N_PROBE"
 
 # ---- one-shot launcher (called by the sweep loops too) -----------------
@@ -212,6 +217,8 @@ run_one() {
         [ "$PER_TASK_LENGTHSCALE" = "1" ] && TAG="${TAG}-ptls"
         # Learned diffusion scale (multiplicative spectral scale) → distinct dirs.
         [ "$LEARN_DIFFUSION_SCALE" = "1" ] && TAG="${TAG}-learndiff"
+        # Cosine/correlation kernel (unit-norm features) → distinct dirs.
+        [ "$NORMALIZE_FEATURES" = "1" ] && TAG="${TAG}-cos"
     elif [ "$FAMILY" = "eigenmap" ]; then
         TAG="eigenmap-r${EMBED_DIM}-${ARD_TAG}-${KERNEL}-nu${NU_}-K${NMODES_}-stride${STRIDE}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     elif [ "$FAMILY" = "spectral" ]; then
@@ -280,6 +287,8 @@ run_one() {
                 manifold_args="$manifold_args --lengthscale-init $LENGTHSCALE_INIT --lengthscale-no-decay"
             [ "$PER_TASK_LENGTHSCALE" = "1" ] && \
                 manifold_args="$manifold_args --per-task-lengthscale"
+            [ "$NORMALIZE_FEATURES" = "1" ] && \
+                manifold_args="$manifold_args --normalize-features"
         fi
         # Eigenmap embedding dimension.
         if [ "$FAMILY" = "eigenmap" ]; then
