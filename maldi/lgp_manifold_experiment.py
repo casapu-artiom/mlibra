@@ -394,17 +394,33 @@ def setup_experiment(args):
             f"(graph N={graph_coords.shape[0]:,}, MALDI={maldi_coords.shape[0]:,})"
         )
 
-    # Snap the inducing points to the nearest graph nodes.
+    # Snap the inducing points to the nearest graph nodes. The unique-dedup
+    # count depends on the (non bit-reproducible) KNN graph, so the resulting
+    # num_inducing varies run-to-run. If a trained checkpoint already exists in
+    # this folder, the model will be rebuilt only to load that checkpoint -- so
+    # take the inducing geometry straight from it, otherwise the freshly-snapped
+    # (slightly different) count makes load_state_dict fail. The stored param is
+    # (num_tasks, M, 3); any task slice gives the [M, 3] the constructor wants,
+    # and load_state_dict restores the exact per-task values afterwards.
+    ckpt_path = config.exp_path / "model.pth"
+    ind_key = "gp_model.variational_strategy.base_variational_strategy.inducing_points"
     with torch.no_grad():
-        ind_gpu = inducing_points.to(config.device)
-        _, nn_idx = knn.search(ind_gpu, 1)          # (M, 1) — nearest graph node
-        nn_idx = nn_idx.squeeze(1).cpu()            # (M,)
-        nn_idx_unique = torch.unique(nn_idx)
-        inducing_points = knn.x[nn_idx_unique].cpu()
+        if ckpt_path.exists():
+            inducing_points = torch.load(ckpt_path, map_location="cpu")[ind_key][0].contiguous()
+            logging.info(
+                f"Reusing {inducing_points.shape[0]} inducing points from checkpoint "
+                f"{ckpt_path}"
+            )
+        else:
+            ind_gpu = inducing_points.to(config.device)
+            _, nn_idx = knn.search(ind_gpu, 1)          # (M, 1) — nearest graph node
+            nn_idx = nn_idx.squeeze(1).cpu()            # (M,)
+            nn_idx_unique = torch.unique(nn_idx)
+            inducing_points = knn.x[nn_idx_unique].cpu()
+            logging.info(
+                f"Inducing points snapped to graph nodes: {inducing_points.shape[0]} unique"
+            )
         config.num_inducing = inducing_points.shape[0]
-    logging.info(
-        f"Inducing points snapped to graph nodes: {config.num_inducing} unique"
-    )
 
     # 5. Eigenpairs: compute (or load from cache) before kernel construction.
     eigvec_cache_dir = eigenvector_dir / "eigvecs"
