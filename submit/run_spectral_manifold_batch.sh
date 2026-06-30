@@ -56,7 +56,7 @@ FORCE_RECOMPUTE_GRAPH=${FORCE_RECOMPUTE_GRAPH:-0}
 N_LIST=${N_LIST:-sqrt}
 N_PROBE=${N_PROBE:-8}
 
-N_EPOCHS=20
+N_EPOCHS=50
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
 S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_16"
