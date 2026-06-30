@@ -372,7 +372,10 @@ class ManifoldLGP(nn.Module):
                 "kl_loss": kl_loss / len(dataloader),
                 "mse_loss": mse_loss / len(dataloader)
             })
-            print(f"Epoch {epoch} loss: {mean_loss / len(dataloader):.4f} | MSE: {mse_loss / len(dataloader):.4f}")
+            print(f"Epoch {epoch} loss: {mean_loss / len(dataloader):.4f} | "
+                  f"recon: {reconstr_loss / len(dataloader):.4f} | "
+                  f"kl: {kl_loss / len(dataloader):.4f} | "
+                  f"MSE: {mse_loss / len(dataloader):.4f}")
             
         torch.save(self.state_dict(), exp_path / "model.pth")
 
@@ -393,12 +396,23 @@ class SpectralLatentGP(gpytorch.models.GP):
         self.num_modes = self.kernel.num_modes
         N = self.kernel.eigvec.shape[0]
 
-        # Variational Parameters: q(w) ~ N(mu, S) 
+        # Variational Parameters: q(w) ~ N(mu, S)
         # mu: (num_tasks, num_modes) -> The 'Spectral Weights' for each latent dim
         self.register_parameter("q_mu", nn.Parameter(torch.randn(num_tasks, self.num_modes) * 0.01))
-        
-        # S: Cholesky of covariance (num_tasks, num_modes, num_modes)
-        self.register_parameter("q_log_diag_S", nn.Parameter(torch.zeros(num_tasks, self.num_modes)))
+
+        # Diagonal posterior variance S, initialised AT THE PRIOR Φ so the KL
+        # starts ≈ 0 — the weight-space analogue of gpytorch's whitened
+        # VariationalStrategy init (q(u) ≈ p(u) at start). The previous zeros init
+        # gave S=1 against a prior Φ≈0.03–0.06, i.e. a huge initial KL that — added
+        # unscaled every batch — collapsed the posterior toward the over-smooth
+        # prior mean before any data was fit (the inducing path never pays this
+        # because it whitens). q_log_diag_S = log Φ. See kl_divergence().
+        with torch.no_grad():
+            # spectral_density() carries the kernel's leading lengthscale batch
+            # dims (e.g. (1, 1, num_modes)); flatten to (num_modes,) before broadcasting.
+            phi0 = self.kernel.spectral_density().detach().reshape(-1).clamp_min(1e-12)
+        log_phi0 = phi0.log().unsqueeze(0).expand(num_tasks, self.num_modes).contiguous()
+        self.register_parameter("q_log_diag_S", nn.Parameter(log_phi0))
 
         # Per-task linear mean over the 3D coordinates (one w_t·x + b_t trend per
         # latent), matching LatentRiemannGP's LinearMean instead of a flat
@@ -586,6 +600,9 @@ class SpectralManifoldLGP(nn.Module):
                 "kl_loss": kl_loss / len(dataloader),
                 "mse_loss": mse_loss / len(dataloader)
             })
-            print(f"Epoch {epoch} loss: {mean_loss / len(dataloader):.4f} | MSE: {mse_loss / len(dataloader):.4f}")
+            print(f"Epoch {epoch} loss: {mean_loss / len(dataloader):.4f} | "
+                  f"recon: {reconstr_loss / len(dataloader):.4f} | "
+                  f"kl: {kl_loss / len(dataloader):.4f} | "
+                  f"MSE: {mse_loss / len(dataloader):.4f}")
             
         torch.save(self.state_dict(), exp_path / "model.pth")
