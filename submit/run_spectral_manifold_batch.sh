@@ -122,14 +122,14 @@ submit() {
 
 FOLDS=("fold-2")           # lowercase, dashed
 KNN_K=(15)
-MAN_KNN_METHODS=("faiss_atlas_weighted")
+MAN_KNN_METHODS=("faiss" "faiss_atlas_weighted")
 MAN_INFLATIONS=(10 50)   # only used when knn_method=faiss_atlas_weighted
 LAPLACIAN_NORMS=("randomwalk")
 GRAPH_BANDWIDTHS=(0.1)
 BUMP_SCALES=(1.0)
 BUMP_DECAYS=(0.01)
 NU=(2)
-THRESHOLDS=(5)
+THRESHOLDS=(5 40 50)
 
 # Lengthscale-init sweep (spectral kernel). The Matern lengthscale reshapes the
 # spectral density Phi = (2 nu / ell^2 + lambda_k)^(-nu): smaller ell raises the
@@ -143,7 +143,7 @@ LENGTHSCALES=(1.0)
 #   INIT  = float -> its initial value (1.0 = identity; no eigenpair recompute).
 # LEARN=1 runs get a -learndiff suffix in EXP_NAME, so learned vs frozen don't
 # clobber each other. e.g. ("0:1.0" "1:1.0" "1:2.0") = baseline + two learned starts.
-DIFFUSION_SCALES=("0:1.0" "1:1.0")
+DIFFUSION_SCALES=("0:1.0")
 
 # (stride, num_modes) pairs swept together:
 #   (1) stride=4, num_modes=1300
