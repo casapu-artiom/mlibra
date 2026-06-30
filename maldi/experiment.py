@@ -1008,7 +1008,13 @@ class MaldiExperiment:
                 #coords_train = experiment.coordinates_train.to(experiment.config.device)
                 x1 = self.coordinates_train[:50].to(self.config.device).contiguous()
                 x2 = self.coordinates_train[50:100].to(self.config.device).contiguous()
-                kernel = self.lgp_model.gp_model.covar_module
+                # Inducing GPs expose the prior kernel as covar_module (a
+                # ScaleKernel); SpectralLatentGP has no covar_module and holds the
+                # RiemannMaternKernel directly as .kernel. Either way this probes
+                # the PRIOR kernel spread.
+                kernel = getattr(self.lgp_model.gp_model, "covar_module", None)
+                if kernel is None:
+                    kernel = self.lgp_model.gp_model.kernel
                 K = kernel(x1, x2).evaluate()
                 print(f"[init kernel spread] K shape:  {tuple(K.shape)}")
                 print(f"[init kernel spread] K mean:   {K.mean().item():.4g}")
@@ -1042,7 +1048,13 @@ class MaldiExperiment:
             with torch.no_grad():
                 x1 = self.coordinates_train[:50].to(self.config.device).contiguous()
                 x2 = self.coordinates_train[50:100].to(self.config.device).contiguous()
-                kernel = self.lgp_model.gp_model.covar_module
+                # Inducing GPs expose the prior kernel as covar_module (a
+                # ScaleKernel); SpectralLatentGP has no covar_module and holds the
+                # RiemannMaternKernel directly as .kernel. Either way this probes
+                # the PRIOR kernel spread.
+                kernel = getattr(self.lgp_model.gp_model, "covar_module", None)
+                if kernel is None:
+                    kernel = self.lgp_model.gp_model.kernel
                 K = kernel(x1, x2).evaluate()
                 print(f"[trained kernel spread] K shape:  {tuple(K.shape)}")
                 print(f"[trained kernel spread] K mean:   {K.mean().item():.4g}")

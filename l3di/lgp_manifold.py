@@ -61,6 +61,23 @@ def _build_kernel_hyperpriors(gp_model, lengthscale_prior_mean, device):
                 GammaPrior(conc, conc / float(lengthscale_prior_mean)).to(device),
                 lambda b=base: b.lengthscale,
             ))
+    elif hasattr(gp_model, "outputscale"):
+        # SpectralLatentGP has no ScaleKernel/covar_module: it exposes a per-task
+        # outputscale (the prior amplitude on the spectral weights) directly, and
+        # its Matérn lengthscale lives on gp_model.kernel. Apply the same
+        # Gamma(2,2) signal-variance prior as the ScaleKernel path, plus the
+        # optional lengthscale prior. The closure returns the (num_tasks,)
+        # outputscale, so _eval_hyperprior_logprob sums an independent Gamma over
+        # the per-task amplitudes.
+        terms.append((GammaPrior(2.0, 2.0).to(device), lambda g=gp_model: g.outputscale))
+        kern = getattr(gp_model, "kernel", None)
+        if (lengthscale_prior_mean is not None and kern is not None
+                and hasattr(kern, "raw_lengthscale")):
+            conc = 3.0
+            terms.append((
+                GammaPrior(conc, conc / float(lengthscale_prior_mean)).to(device),
+                lambda k=kern: k.lengthscale,
+            ))
     return terms
 
 
@@ -383,14 +400,35 @@ class SpectralLatentGP(gpytorch.models.GP):
         # S: Cholesky of covariance (num_tasks, num_modes, num_modes)
         self.register_parameter("q_log_diag_S", nn.Parameter(torch.zeros(num_tasks, self.num_modes)))
 
-        self.mean_module = gpytorch.means.ConstantMean(batch_shape=torch.Size([num_tasks]))
+        # Per-task linear mean over the 3D coordinates (one w_t·x + b_t trend per
+        # latent), matching LatentRiemannGP's LinearMean instead of a flat
+        # ConstantMean.
+        self.mean_module = LinearMean(input_size=3, batch_shape=torch.Size([num_tasks]))
+
+        # Per-task prior amplitude — the spectral analogue of ScaleKernel's
+        # outputscale. It scales the weight prior p(w) = N(0, σ_t² Φ) and so
+        # enters ONLY through the KL: in this weight-space parametrization the
+        # posterior over f is carried entirely by q(w), so the scale acts as a
+        # per-task regulariser controlling how strongly q(w) is pulled toward the
+        # Matérn spectral prior. softplus(raw) keeps it positive; raw≈0.5413 →
+        # outputscale≈1 at init.
+        self.register_parameter(
+            "raw_outputscale", nn.Parameter(torch.full((num_tasks,), 0.5413))
+        )
+
+    @property
+    def outputscale(self):
+        return F.softplus(self.raw_outputscale)
 
     def kl_divergence(self):
         """
-        Computes KL(q(w) || p(w)) where p(w) ~ N(0, Phi)
-        Phi is the Matérn spectral density (the 'prior power' of each mode).
+        Computes KL(q(w) || p(w)) where p(w) ~ N(0, σ_t² Phi)
+        Phi is the Matérn spectral density (the 'prior power' of each mode),
+        scaled per task by the learnable outputscale σ_t².
         """
-        Phi = self.kernel.spectral_density() # (m,)
+        Phi = self.kernel.spectral_density()                       # (m,)
+        # Per-task prior power σ_t² Φ_k → (num_tasks, m).
+        Phi = self.outputscale.unsqueeze(-1) * Phi.unsqueeze(0)
         mu = self.q_mu # (num_tasks, m)
         S_diag = self.q_log_diag_S.exp() # (num_tasks, m)
         
@@ -408,10 +446,12 @@ class SpectralLatentGP(gpytorch.models.GP):
         # 1. Get interpolated eigenvectors: (Batch, m)
         U_star = self.kernel.raw_eigenvectors(x)
         
-        # 2. Compute Mean: (Batch, m) @ (m, tasks) -> (Batch, tasks)
-        # ConstantMean(batch_shape=[tasks]).constant is (tasks, 1); flatten to
-        # (tasks,) so it broadcasts over the Batch dim of mean_z (Batch, tasks).
-        mean_z = torch.matmul(U_star, self.q_mu.T) + self.mean_module.constant.view(-1)
+        # 2. Compute Mean: (Batch, m) @ (m, tasks) -> (Batch, tasks), plus the
+        # per-task linear mean w_t·x + b_t. LinearMean(batch_shape=[tasks]) maps
+        # x (Batch, 3) -> (tasks, Batch); transpose to (Batch, tasks) to add onto
+        # the spectral mean.
+        linear_mean = self.mean_module(x).transpose(-1, -2)        # (Batch, tasks)
+        mean_z = torch.matmul(U_star, self.q_mu.T) + linear_mean
         
         # 3. Compute Variance: (Batch, m) @ (m, tasks) -> (Batch, tasks)
         var_z = torch.matmul(U_star.pow(2), self.q_log_diag_S.exp().T)
