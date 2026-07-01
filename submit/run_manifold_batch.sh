@@ -61,6 +61,10 @@ S3_BG_TEMPLATE_NAME="brainglobe"
 S3_REFERENCE_FILE_BG="/s3/mlibra/mlibra-data/bg_template.npy"
 S3_ANNOTATION_FILE_BG="/s3/mlibra/mlibra-data/bg_annotations.npy"
 SRC_PATH="/myhome/mlibra"
+# Curated lipid subset that run_manifold.sh reconstructs/renders. Lives in the
+# repo (mounted at $SRC_PATH), not on S3. Override at submit time with
+# RECONSTRUCTION_LIPIDS_FILE=... ./submit/run_manifold_batch.sh
+RECON_LIPIDS_FILE="${RECONSTRUCTION_LIPIDS_FILE:-$SRC_PATH/maldi/data/lipid_subset.txt}"
 
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
@@ -82,6 +86,7 @@ submit() {
         -e MALDI_FILE="$S3_MALDI_FILE" \
         -e SLICES_DATASET_FILE="$slice" \
         -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
+        -e RECONSTRUCTION_LIPIDS_FILE="$RECON_LIPIDS_FILE" \
         -e TEMPLATE_NAME="$template" \
         -e REFERENCE_FILE="$ref" \
         -e ANNOTATION_FILE="$annot" \

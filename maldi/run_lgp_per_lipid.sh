@@ -19,7 +19,7 @@
 # =============================================================================
 
 # ---- which kernel ----
-: "${KERNEL_FAMILY:=eigenmap}"          # euclidean | manifold | eigenmap | spectral
+: "${KERNEL_FAMILY:=manifold}"          # euclidean | manifold | eigenmap | spectral
 : "${KERNEL:=matern}"                   # only used for euclidean / eigenmap
 # eigenmap: project coords into the leading EMBED_DIM Laplacian eigenfunctions,
 # then a Euclidean ARD Matern GP over that embedding (needs EIGENVECTOR_DIR).
@@ -38,7 +38,7 @@
 : "${NUM_INDUCING:=1000}"
 : "${INDUCING_SOURCE:=reference}"
 : "${LIPID_BATCH_SIZE:=10}"
-: "${EPOCHS:=10}"
+: "${EPOCHS:=2}"
 : "${LEARNING_RATE:=0.005}"
 : "${BATCH_SIZE:=2048}"
 : "${SEED:=42}"

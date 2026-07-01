@@ -209,6 +209,112 @@ def render_lipid_volume(
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
+
+# -----------------------------------------------------------------------------
+# Reconstruction diagnostics: value distribution + true-vs-pred scatter
+# -----------------------------------------------------------------------------
+
+def _corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation, NaN-safe against degenerate (constant) inputs."""
+    if a.size < 2 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def render_lipid_diagnostics(
+    true_vals: np.ndarray,
+    pred_vals: np.ndarray,
+    lipid_name: str,
+    out_path: Path,
+    dpi: int = 150,
+):
+    """One PNG per lipid: the value distribution and the true-vs-predicted
+    scatter, each shown in BOTH the current (linear) range and the
+    log-transformed range.
+
+    ``true_vals`` / ``pred_vals`` are paired 1-D arrays in the model's native
+    (raw, de-standardized) intensity units — typically the held-out TEST points
+    where both a measurement and a prediction exist. The log panels drop
+    non-positive values (which have no log) and use log-scaled axes.
+
+    Layout (2×2)::
+
+        [ distribution — linear ]   [ distribution — log ]
+        [ scatter      — linear ]   [ scatter      — log ]
+    """
+    true_vals = np.asarray(true_vals, dtype=np.float64).ravel()
+    pred_vals = np.asarray(pred_vals, dtype=np.float64).ravel()
+    finite = np.isfinite(true_vals) & np.isfinite(pred_vals)
+    true_vals, pred_vals = true_vals[finite], pred_vals[finite]
+    if true_vals.size == 0:
+        logging.warning(f"diagnostics: {lipid_name} has no finite paired "
+                        f"values; skipping.")
+        return
+
+    pear = _corr(true_vals, pred_vals)
+
+    fig, axs = plt.subplots(2, 2, figsize=(12, 11), facecolor="white")
+    fig.suptitle(f"Lipid {lipid_name} — reconstruction diagnostics "
+                 f"(n={true_vals.size:,})", fontsize=14)
+
+    # ---- Row 0: value distributions (true vs pred) ----
+    lo = float(min(true_vals.min(), pred_vals.min()))
+    hi = float(max(true_vals.max(), pred_vals.max()))
+    bins = np.linspace(lo, hi, 60) if hi > lo else 60
+    ax = axs[0, 0]
+    ax.hist(true_vals, bins=bins, alpha=0.5, color="tab:blue", label="true")
+    ax.hist(pred_vals, bins=bins, alpha=0.5, color="tab:orange", label="pred")
+    ax.set_title("Value distribution (linear)")
+    ax.set_xlabel("value"); ax.set_ylabel("count"); ax.legend()
+
+    ax = axs[0, 1]
+    tpos, ppos = true_vals[true_vals > 0], pred_vals[pred_vals > 0]
+    if tpos.size and ppos.size:
+        loln = np.log10(min(tpos.min(), ppos.min()))
+        hiln = np.log10(max(tpos.max(), ppos.max()))
+        logbins = np.logspace(loln, hiln, 60) if hiln > loln else 60
+        ax.hist(tpos, bins=logbins, alpha=0.5, color="tab:blue", label="true")
+        ax.hist(ppos, bins=logbins, alpha=0.5, color="tab:orange", label="pred")
+        ax.set_xscale("log"); ax.legend()
+    else:
+        ax.text(0.5, 0.5, "no positive values", ha="center", va="center",
+                transform=ax.transAxes)
+    ax.set_title("Value distribution (log)")
+    ax.set_xlabel("value"); ax.set_ylabel("count")
+
+    # ---- Row 1: true vs pred scatter (density via hexbin) ----
+    ax = axs[1, 0]
+    if hi > lo:
+        ax.hexbin(true_vals, pred_vals, gridsize=50, cmap="inferno",
+                  bins="log", mincnt=1)
+        ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+        ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    ax.set_title(f"True vs Pred (linear)   r={pear:.3f}")
+    ax.set_xlabel("true"); ax.set_ylabel("pred")
+
+    ax = axs[1, 1]
+    m = (true_vals > 0) & (pred_vals > 0)
+    if m.sum() >= 2:
+        t, p = true_vals[m], pred_vals[m]
+        r_log = _corr(np.log(t), np.log(p))
+        lo2 = float(min(t.min(), p.min())); hi2 = float(max(t.max(), p.max()))
+        ax.hexbin(t, p, gridsize=50, cmap="inferno", bins="log", mincnt=1,
+                  xscale="log", yscale="log")
+        ax.plot([lo2, hi2], [lo2, hi2], "k--", lw=1)
+        ax.set_xlim(lo2, hi2); ax.set_ylim(lo2, hi2)
+        ax.set_title(f"True vs Pred (log)   r_log={r_log:.3f}")
+    else:
+        ax.text(0.5, 0.5, "no positive pairs", ha="center", va="center",
+                transform=ax.transAxes)
+        ax.set_title("True vs Pred (log)")
+    ax.set_xlabel("true"); ax.set_ylabel("pred")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=dpi, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+
+
 def render_selected_lipids(
     template_volume,
     volume_dir: Path,

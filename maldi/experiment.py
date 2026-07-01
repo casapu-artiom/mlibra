@@ -930,18 +930,44 @@ class MaldiExperiment:
                               region_suffix: str = ""):
         """Render per-lipid composite PNGs after reconstruction. Honors the
         same lipid filter resolution as whole_brain_reconstruction."""
-        from render_lipid_volumes import render_selected_lipids
+        from render_lipid_volumes import (
+            render_selected_lipids, render_lipid_diagnostics,
+        )
         suffix = "_diffusion" if self.config.use_diffusion else region_suffix
+        renders_dir = self.config.exp_path / "renders"
 
         render_selected_lipids(
             template_volume=template_volume,
             volume_dir=volume_path,
-            output_dir=self.config.exp_path / "renders",
+            output_dir=renders_dir,
             selected_lipids_names=self.config.selected_lipids_names,
             lipid_indices=list(lipid_filter),
             suffix=suffix,
             n_rotation_frames=10,
         )
+
+        # Per-lipid diagnostics (value distribution + true-vs-pred scatter,
+        # linear & log) for the reconstructed lipids. Uses the held-out TEST
+        # points, which carry both a measurement and a prediction in the raw
+        # (de-standardized) intensity scale. Non-fatal: a plotting hiccup must
+        # never invalidate a completed reconstruction.
+        try:
+            names = list(self.config.selected_lipids_names)
+            filt = (list(lipid_filter) if lipid_filter is not None
+                    else list(range(len(names))))
+            true_te = self.true_values_test
+            pred_te = self.predictions_test
+            if true_te is not None and pred_te is not None:
+                for gi in filt:
+                    render_lipid_diagnostics(
+                        true_te[:, gi], pred_te[:, gi], str(names[gi]),
+                        renders_dir / f"{names[gi]}_diagnostics.png",
+                    )
+            else:
+                logging.warning("Skipping diagnostics: test predictions/true "
+                                "values not found (run the experiment first).")
+        except Exception as e:
+            logging.warning(f"Reconstruction diagnostics plotting failed: {e}")
 
     def load_whole_brain_reconstruction(self, lipid):
         """Return per-lipid volume; builds on demand from consolidated array."""

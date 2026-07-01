@@ -486,6 +486,21 @@ def parse_args() -> dict:
                    help="In per-lipid mode this is always on — the "
                         "whole-brain prediction is what the viewer needs.")
 
+    # ---- whole-brain renders (same output as lgp_manifold_experiment) ----
+    p.add_argument("--render", dest="render", action="store_true", default=True,
+                   help="After training, render composite PNGs of the whole-brain "
+                        "reconstruction for the trained lipids into "
+                        "<exp>/renders/, mirroring lgp_manifold_experiment's "
+                        "whole_brain_reconstruction render. On by default; only "
+                        "the lipids trained in THIS run are rendered.")
+    p.add_argument("--no-render", dest="render", action="store_false",
+                   help="Disable the post-training lipid renders.")
+    p.add_argument("--render-max-lipids", dest="render_max_lipids", type=int,
+                   default=8,
+                   help="Cap on how many trained lipids get a PNG render — a cloud "
+                        "batch job just needs a few sanity-check images, not one "
+                        "per lipid. 0 = render every trained lipid.")
+
     p.add_argument("--force-recompute-graph", dest="force_recompute_graph",
                    action="store_true",
                    help="Ignore the cached KNN graph and rebuild it from scratch "
@@ -2223,6 +2238,152 @@ class GraphGeodesicNNUtil(torch.nn.Module):
 
 
 # =============================================================================
+# Whole-brain renders — composite PNGs per trained lipid, mirroring the manifold
+# GP's whole_brain_reconstruction -> render_reconstruction. Reuses the already-
+# computed whole-brain node predictions (predictions/<slug>/graph_pred_raw.npy),
+# so it costs no extra GPU work and honours --resume automatically.
+# =============================================================================
+def _graph_meta_voxel_layout(graph_meta, args, template_full):
+    """Map graph nodes -> integer voxel indices and pick the volume shape +
+    anatomy background to render into.
+
+    Euclidean runs store full-resolution ``node_voxel_idx`` directly, so we
+    render at the atlas's native resolution. Manifold runs store the strided
+    ``reference_nodes_z`` (nodes live on the stride-subsampled grid); scattering
+    those into the full-res atlas would leave every non-strided slice empty, so
+    we render into the STRIDED template instead — dense at that resolution and
+    the honest fidelity of the per-lipid manifold reconstruction.
+
+    Returns (positions:int64 (N,3), out_shape:tuple, anatomy:np.ndarray).
+    """
+    if "node_voxel_idx" in graph_meta:
+        positions = graph_meta["node_voxel_idx"].astype(np.int64)
+        out_shape = tuple(int(s) for s in graph_meta["template_shape"])
+        anatomy = template_full
+    else:
+        mm = (graph_meta["reference_nodes_z"] * graph_meta["coord_std"]
+              + graph_meta["coord_mean"])
+        scale = float(graph_meta["voxel_scale_mm"])   # strided scale (stride*0.025)
+        positions = (mm / scale).round().astype(np.int64)
+        stride = int(args["stride"])
+        anatomy = template_full[::stride, ::stride, ::stride]
+        out_shape = anatomy.shape
+    positions = positions.copy()
+    for ax in range(3):
+        np.clip(positions[:, ax], 0, out_shape[ax] - 1, out=positions[:, ax])
+    return positions, out_shape, anatomy
+
+
+def render_trained_lipids(out_root, args, lipid_names_all, lipid_idx_to_fit, log):
+    """Render composite PNGs of the whole-brain reconstruction for the lipids
+    trained in this run, into ``<out_root>/renders/`` — the same panels and
+    output layout as ``lgp_manifold_experiment``'s reconstruction render.
+
+    Each lipid's per-node prediction (``graph_pred_raw.npy``) is scattered back
+    into a template-shaped volume (NaN outside the brain) and handed to
+    ``render_lipid_volumes.render_selected_lipids``. Capped at
+    ``--render-max-lipids`` so a batch job produces a few sanity-check images
+    rather than one PNG per lipid. Lipids without predictions on disk (e.g. a
+    batch that hasn't run yet) are skipped.
+    """
+    from render_lipid_volumes import (
+        render_selected_lipids, render_lipid_diagnostics,
+    )
+
+    meta_path = out_root / "graph_meta.npz"
+    if not meta_path.exists():
+        log.warning(f"render: {meta_path} missing; skipping renders.")
+        return
+    graph_meta = np.load(meta_path)
+    template_full = np.load(args["reference_file"])
+    positions, out_shape, anatomy = _graph_meta_voxel_layout(
+        graph_meta, args, template_full,
+    )
+    z, y, x = positions[:, 0], positions[:, 1], positions[:, 2]
+
+    predictions_root = out_root / "predictions"
+    render_dir = out_root / "renders"
+    cap = int(args.get("render_max_lipids", 8) or 0)
+    volume_dir = render_dir / "volume"
+    volume_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-lipid de-standardization params (fit-order columns), for the raw-scale
+    # diagnostics. col_means[j] pairs with lipid_idx_to_fit[j].
+    col_means = col_stds = None
+    cm_path, cs_path = out_root / "col_means.pt", out_root / "col_stds.pt"
+    if cm_path.exists() and cs_path.exists():
+        col_means = torch.load(cm_path).cpu().numpy()
+        col_stds = torch.load(cs_path).cpu().numpy()
+    log_transform = bool(args.get("log_transform", False))
+
+    rendered = []   # (name, fit_col_j)
+    for j, g_idx in enumerate(lipid_idx_to_fit):
+        if cap and len(rendered) >= cap:
+            break
+        name = lipid_names_all[g_idx]
+        pred_file = predictions_root / safe_filename(name) / "graph_pred_raw.npy"
+        if not pred_file.exists():
+            continue
+        vals = np.load(pred_file).astype(np.float32)
+        if vals.shape[0] != positions.shape[0]:
+            log.warning(
+                f"render: {name} has {vals.shape[0]} node predictions but the "
+                f"graph has {positions.shape[0]} nodes; skipping."
+            )
+            continue
+        vol = np.full(out_shape, np.nan, dtype=np.float32)
+        vol[z, y, x] = vals
+        np.save(volume_dir / f"{name}_volume.npy", vol)
+        rendered.append((name, j))
+
+    if not rendered:
+        log.warning("render: no per-lipid predictions found to render.")
+        return
+
+    rendered_names = [name for name, _ in rendered]
+    log.info(f"render: writing {len(rendered_names)} composite PNG(s) to "
+             f"{render_dir} (lipids: {rendered_names})")
+    render_selected_lipids(
+        template_volume=anatomy,
+        volume_dir=volume_dir,
+        output_dir=render_dir,
+        selected_lipids_names=rendered_names,
+        lipid_names=rendered_names,
+        suffix="",
+        # render_lipid_volumes lays out 10 anatomical-slice columns, so the
+        # rotation row must also be 10 wide (same value the manifold GP uses).
+        n_rotation_frames=10,
+    )
+
+    # Per-lipid diagnostics: value distribution + true-vs-pred scatter (linear
+    # & log), from the held-out TEST points de-standardized back to raw
+    # intensity units (exp'd when --log-transform, matching the reconstruction).
+    if col_means is None:
+        log.warning("render: col_means/col_stds missing; skipping diagnostics.")
+    else:
+        for name, j in rendered:
+            lip_dir = predictions_root / safe_filename(name)
+            tz, pz = lip_dir / "test_true_z.npy", lip_dir / "test_pred_z.npy"
+            if not (tz.exists() and pz.exists()):
+                continue
+            cm, cs = float(col_means[j]), float(col_stds[j])
+            true_v = np.load(tz).astype(np.float64) * cs + cm
+            pred_v = np.load(pz).astype(np.float64) * cs + cm
+            if log_transform:
+                true_v = np.exp(true_v) - 1e-10
+                pred_v = np.exp(pred_v) - 1e-10
+            try:
+                render_lipid_diagnostics(
+                    true_v, pred_v, name,
+                    render_dir / f"{name}_diagnostics.png",
+                )
+            except Exception as ex:
+                log.warning(f"render: diagnostics for {name} failed ({ex}).")
+
+    log.info(f"render: done -> {render_dir}")
+
+
+# =============================================================================
 # Main pipeline
 # =============================================================================
 def main():
@@ -2683,6 +2844,13 @@ def main():
             log.info(f"VNNGP summary: corr median="
                      f"{df['test_corr'].median(skipna=True):+.4f}  "
                      f"R2 median={df['test_r2'].median():+.4f}")
+        if args.get("render", True):
+            try:
+                render_trained_lipids(
+                    out_root, args, lipid_names_all, lipid_idx_to_fit, log,
+                )
+            except Exception as ex:
+                log.warning(f"render: failed ({ex}); training outputs unaffected.")
         log.info(f"Outputs in: {out_root}")
         return
 
@@ -3085,6 +3253,15 @@ def main():
              f"median={summary['test_corr']['median']:+.4f}")
     log.info(f"         test RMSE(z) mean={summary['test_rmse_z']['mean']:.4f}")
     log.info(f"Outputs in: {out_root}")
+
+    # ---- whole-brain renders (same output as lgp_manifold_experiment) ----
+    if args.get("render", True):
+        try:
+            render_trained_lipids(
+                out_root, args, lipid_names_all, lipid_idx_to_fit, log,
+            )
+        except Exception as ex:
+            log.warning(f"render: failed ({ex}); training outputs unaffected.")
 
     if args.get("wandb", False):
         import wandb

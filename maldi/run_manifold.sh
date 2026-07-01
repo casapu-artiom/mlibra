@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
-: "${NUM_INDUCING_POINTS:=2000}"
-: "${NUM_MODES:=6000}"
+: "${NUM_INDUCING_POINTS:=1000}"
+: "${NUM_MODES:=1300}"
 # Lanczos Krylov subspace floor. -1 = auto (max(1500, 3*NUM_MODES+20)).
 # At stride=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
 : "${NCV_MIN:=-1}"
@@ -11,11 +11,11 @@
 : "${INDUCING_FROM_MALDI_NODES:=0}"
 : "${INDUCING_DENSITY_FRAC:=0.8}"
 : "${LATENT_DIM:=5}"
-: "${STRIDE:=8}"
+: "${STRIDE:=4}"
 : "${BATCH_SIZE:=1000}"
-: "${N_EPOCHS:=10}"
+: "${N_EPOCHS:=2}"
 : "${LEARNING_RATE:=0.001}"
-: "${GRAPHBANDWIDTH:=0.07}"
+: "${GRAPHBANDWIDTH:=0.1}"
 # Diffusion scale (manifold kernel): multiplicative scale on the frozen Laplacian
 # spectrum (lambda_k -> DIFFUSION_SCALE_INIT * lambda_k in the Matern spectral
 # density). No eigenpair recompute. LEARN_DIFFUSION_SCALE=1 trains it; otherwise
@@ -76,6 +76,44 @@ FAISS_CPU_ARGS=""
 
 cd $SRC_PATH
 #pip install -e .
+
+# ---- reconstruction lipids from the curated subset file -------------------
+# Reconstruct/render exactly the lipids listed in RECONSTRUCTION_LIPIDS_FILE.
+# A tiny python parser (clearer than a shell loop) emits one lipid per line;
+# with IFS=newline we then fold each line into a positional arg -- preserving
+# the spaces in names -- so --reconstruction-lipids (nargs='+') picks them up.
+: "${RECONSTRUCTION_LIPIDS_FILE:=/home/casap/mlibra_git/maldi/data/lipid_subset.txt}"
+# Built-in fallback (mirror of lipid_subset.txt) used when the file above is
+# missing/empty -- e.g. a container where the repo path differs -- so we still
+# render the intended subset instead of every lipid.
+RECON_LIPIDS_DEFAULT='PC 35:1 PE 38:1
+PA 36:1
+LPC 22:6
+PE O-36:0 PE O-38:3
+Hex2Cer 40:1;O2'
+RECON_LIPIDS=$(python - "$RECONSTRUCTION_LIPIDS_FILE" <<'PY'
+import sys
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                print(line)
+except FileNotFoundError:
+    pass
+PY
+)
+if [ -n "$RECON_LIPIDS" ]; then
+    echo "Reconstruction lipids from $RECONSTRUCTION_LIPIDS_FILE"
+else
+    echo "NOTE: $RECONSTRUCTION_LIPIDS_FILE missing/empty;" \
+         "using built-in default lipid subset."
+    RECON_LIPIDS="$RECON_LIPIDS_DEFAULT"
+fi
+IFS='
+'
+set -- "$@" --reconstruction-lipids $RECON_LIPIDS
+unset IFS
 
 if [ "$NO_RSAMPLE" = "true" ] || [ "$NO_RSAMPLE" = "1" ]; then
     SAMPLING_TAG="MEAN"         # Update this to whatever you want the name to be without rsample
@@ -159,5 +197,4 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --n-probe "$N_PROBE" \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
-    --reconstruction-lipids "Hex2Cer 40:1;O2" "PA 36:1 PA 38:4" "PC 35:1 PE 38:1" \
     $FAISS_CPU_ARGS $SAMPLING_FLAG "$@"
