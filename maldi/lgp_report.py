@@ -1,13 +1,18 @@
 #!/usr/bin/env python
 """
-Aggregate report over WHOLE-BRAIN latent-GP runs — the sibling of
-``per_lipid_report.py`` for the *latent* pipelines:
+Aggregate report over WHOLE-BRAIN latent-GP AND baseline runs — the sibling of
+``per_lipid_report.py``. It scores any run dir that holds ``<split>/predictions.npy``
+(+ ``true_values.npy``), so it is model-agnostic; the ``family`` label just groups
+them. Recognised families:
 
-    * lgp       — ``run_final.sh``    -> ``lgp_experiment.py``        (Euclidean latent GP)
-    * manifold  — ``run_manifold.sh`` -> ``lgp_manifold_experiment.py`` (Riemann latent GP)
-    * baselines — ``run_baseline.sh`` / ``run_baseline_bottleneck.sh``
-                  -> ``experiment_baselines.py``                      (mlp / ridge / xgb)
-    * gplfr     — ``run_gplfr.sh``                                    (if present)
+    * lgp             — ``lgp_experiment.py``            (Euclidean latent GP)
+    * manifold        — ``lgp_manifold_experiment.py``   (Riemann inducing-point GP)
+    * spectral        — ``spectral_lgp_manifold_experiment.py`` (weight-space spectral GP)
+    * gplfr-<base>    — ``run_gplfr.sh`` -> ``gplfr_experiment.py``, split by the
+                        latent-GP kernel: gplfr-euclidean / gplfr-riemann / gplfr-spectral
+    * baseline-<model>— ``experiment_baselines.py``: baseline-mean / -linear /
+                        -xgboost / -mlp / -mlp_eigen / -gcn / -gcn_faiss
+                        (bottleneck runs -> baseline-bottleneck-<model>)
 
 Unlike the per-lipid pipeline, these runs do NOT write a ``metrics.csv``. Each run
 dir instead holds:
@@ -32,11 +37,15 @@ Per-lipid metrics (computed per output column, then averaged per run):
     rmse  sqrt(mean (y-yhat)^2)   (lower better; ORIGINAL units)
     mae   mean |y-yhat|           (lower better)
 
+Multiple roots may be passed; runs from each are pooled, and a ``source`` column
+tags which root each run came from.
+
 Usage
 -----
     python maldi/lgp_report.py /home/casap/mlibra/output
+    python maldi/lgp_report.py out_a out_b out_c            # multiple roots pooled
     python maldi/lgp_report.py /path/to/out --split test --metric r2
-    python maldi/lgp_report.py /path/to/out --family manifold --csv-dir ./lgp_report_out
+    python maldi/lgp_report.py /path/to/out --family gplfr --csv-dir ./lgp_report_out
     python maldi/lgp_report.py /path/to/out --lipid-names-file .../available_lipids.npy
 """
 from __future__ import annotations
@@ -86,9 +95,11 @@ def derive_fold(run_dir: Path, args: dict | None) -> str:
 
 
 def derive_family(run_dir: Path, args: dict | None) -> str:
-    """Coarse model family, stable across folds: lgp | manifold | baseline-<m> | gplfr."""
+    """Coarse model family, stable across folds:
+    lgp | manifold | spectral | gplfr-<base> | baseline-<model>."""
     name = str((args or {}).get("exp_name") or run_dir.name).upper()
     model = (args or {}).get("model")
+    base_gp = (args or {}).get("base_gp")
     if "BASELINE" in name:
         tag = "baseline"
         if "BOTTLENECK" in name:
@@ -96,10 +107,14 @@ def derive_family(run_dir: Path, args: dict | None) -> str:
         if model:
             tag += f"-{model}"
         return tag
+    if "GPLFR" in name:
+        # Split by the latent-GP kernel (euclidean / riemann / spectral) so the
+        # kernels are comparable side by side rather than pooled into one "gplfr".
+        return f"gplfr-{base_gp}" if base_gp else "gplfr"
     if "MANIFOLD" in name:
         return "manifold"
-    if "GPLFR" in name:
-        return "gplfr"
+    if "SPECTRAL" in name:
+        return "spectral"
     if "LGPALL" in name or "LGP" in name:
         return "lgp"
     return str((args or {}).get("kernel", "?"))
@@ -116,7 +131,8 @@ def derive_model(run_dir: Path, args: dict | None) -> str:
 # One run -> per-lipid metric table (cached metrics.csv if present, else recompute)
 # ---------------------------------------------------------------------------
 def load_run(run_dir: Path, split: str, chunk_rows: int,
-             lipid_names: np.ndarray | None, force: bool) -> dict | None:
+             lipid_names: np.ndarray | None, force: bool,
+             source: str = "") -> dict | None:
     # Read the cached metrics.csv if it exists (and not --force); otherwise
     # recompute from the npy arrays AND write the cache. Shared with the
     # experiments, which write the same metrics.csv at the end of a run.
@@ -132,6 +148,7 @@ def load_run(run_dir: Path, split: str, chunk_rows: int,
 
     return {
         "run": run_dir.name,
+        "source": source,
         "fold": derive_fold(run_dir, args),
         "family": derive_family(run_dir, args),
         "model": derive_model(run_dir, args),
@@ -190,6 +207,10 @@ def build_per_lipid_model(long_df: pd.DataFrame, metric: str) -> pd.DataFrame:
 
 
 def build_tables(runs: list[dict], metric: str):
+    # Only surface the `source` (root) column when runs span >1 root, else it's
+    # constant clutter.
+    multi_source = len({r.get("source", "") for r in runs}) > 1
+
     long_parts = []
     for r in runs:
         d = r["df"].copy()
@@ -197,13 +218,18 @@ def build_tables(runs: list[dict], metric: str):
         d.insert(1, "fold", r["fold"])
         d.insert(2, "family", r["family"])
         d.insert(3, "model", r["model"])
+        if multi_source:
+            d.insert(1, "source", r.get("source", ""))
         long_parts.append(d)
     long_df = pd.concat(long_parts, ignore_index=True) if long_parts else pd.DataFrame()
 
     per_run_rows = []
     for r in runs:
-        row = {"run": r["run"], "fold": r["fold"], "family": r["family"],
-               "failed": r["failed"], "n_lipids": r["n_lipids"], "n_test": r["n_test"]}
+        row = {"run": r["run"]}
+        if multi_source:
+            row["source"] = r.get("source", "")
+        row.update({"fold": r["fold"], "family": r["family"],
+                    "failed": r["failed"], "n_lipids": r["n_lipids"], "n_test": r["n_test"]})
         row.update(summarise(r["df"]))
         per_run_rows.append(row)
     per_run = pd.DataFrame(per_run_rows)
@@ -228,8 +254,9 @@ def build_tables(runs: list[dict], metric: str):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("root", type=Path,
-                    help="Directory containing the per-run output dirs.")
+    ap.add_argument("roots", type=Path, nargs="+",
+                    help="One or more directories containing per-run output dirs. "
+                         "Runs from all roots are pooled (a 'source' column tags each).")
     ap.add_argument("--split", default="test", choices=["test", "train"],
                     help="Which split's arrays to score (default test).")
     ap.add_argument("--metric", default="r2", choices=METRIC_COLS,
@@ -254,9 +281,10 @@ def main() -> int:
                     help="Cap rows printed in the per-run / per-lipid tables (default 200).")
     args = ap.parse_args()
 
-    root: Path = args.root
-    if not root.is_dir():
-        print(f"ERROR: not a directory: {root}", file=sys.stderr)
+    roots: list[Path] = args.roots
+    missing = [r for r in roots if not r.is_dir()]
+    if missing:
+        print("ERROR: not a directory: " + ", ".join(str(m) for m in missing), file=sys.stderr)
         return 1
 
     lipid_names = None
@@ -267,14 +295,22 @@ def main() -> int:
             print(f"  ! could not read --lipid-names-file ({ex})", file=sys.stderr)
 
     # A run dir is any dir holding <split>/predictions.npy (and its sibling truth).
-    run_dirs = sorted({p.parent.parent for p in root.rglob(f"{args.split}/predictions.npy")})
+    # Discover across every root; a run's `source` is the first root it's found under
+    # (dedup by full path, so the same dir under two roots is still scored once).
+    run_dir_to_source: dict[Path, str] = {}
+    for root in roots:
+        for p in root.rglob(f"{args.split}/predictions.npy"):
+            run_dir_to_source.setdefault(p.parent.parent, root.name)
+    run_dirs = sorted(run_dir_to_source)
     if not run_dirs:
-        print(f"No {args.split}/predictions.npy found anywhere under {root}", file=sys.stderr)
+        roots_str = ", ".join(str(r) for r in roots)
+        print(f"No {args.split}/predictions.npy found anywhere under {roots_str}", file=sys.stderr)
         return 1
 
     runs = []
     for d in run_dirs:
-        r = load_run(d, args.split, args.chunk_rows, lipid_names, args.force)
+        r = load_run(d, args.split, args.chunk_rows, lipid_names, args.force,
+                     source=run_dir_to_source[d])
         if r is None:
             continue
         if args.family and args.family.lower() not in r["family"].lower():
@@ -282,7 +318,8 @@ def main() -> int:
         print(f"  scored {r['family']:18s} {r['run']}", file=sys.stderr)
         runs.append(r)
     if not runs:
-        print(f"Found {args.split} arrays under {root} but none were usable"
+        roots_str = ", ".join(str(r) for r in roots)
+        print(f"Found {args.split} arrays under {roots_str} but none were usable"
               + (f" for family~='{args.family}'." if args.family else "."), file=sys.stderr)
         return 1
 
@@ -293,8 +330,9 @@ def main() -> int:
     pd.set_option("display.float_format", lambda v: f"{v:.4f}")
 
     n_failed = int(per_run["failed"].sum())
+    roots_str = ", ".join(str(r) for r in roots)
     print("=" * 100)
-    print(f"WHOLE-BRAIN LGP REPORT  —  root: {root}   split: {args.split}")
+    print(f"WHOLE-BRAIN LGP REPORT  —  roots: {roots_str}   split: {args.split}")
     print(f"  runs: {len(runs)}   folds: {long_df['fold'].nunique()}   "
           f"families: {long_df['family'].nunique()}   lipid-rows: {len(long_df)}   "
           f"failed: {n_failed}")
