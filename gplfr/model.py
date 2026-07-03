@@ -1,10 +1,15 @@
 """GPLFR model: inducing-point latent GP + analytically collapsed linear decoder.
 
 This is a GPyTorch port of the GPLFR model (https://github.com/edstevenson/GPLFR,
-arXiv:2606.06576). The latent GP is the same variational inducing-point multitask
-GP used by ``l3di.lgp.LGP`` (``IndependentMultitaskGPModel`` with
-``num_tasks = latent_dim``); the decoder is GPLFR's linear-Gaussian map
-``Y = Z W + eps`` with ``W`` marginalized in closed form.
+arXiv:2606.06576). The decoder is GPLFR's linear-Gaussian map ``Y = Z W + eps``
+with ``W`` marginalized in closed form; the latent GP that produces ``Z`` is
+pluggable. GPLFR only touches its ``gp_model`` through two hooks — the per-point
+marginal moments ``gp_model(coords).mean/.variance`` and the latent KL (see
+``_gp_kl_divergence``) — so any multitask GP with ``num_tasks = latent_dim`` drops
+in. The runner (``maldi/gplfr_experiment.py --base-gp``) currently wires three:
+the Euclidean inducing-point ``IndependentMultitaskGPModel`` (default, as used by
+``l3di.lgp.LGP``), the manifold inducing-point ``LatentRiemannGP``, and the
+weight-space ``SpectralLatentGP`` over the manifold spectrum.
 
 Pixel-as-sample mapping for MALDI:
   X = standardized 3D CCF coordinates,  Y = p lipid channels,  Z = q latent factors.
@@ -113,46 +118,84 @@ class GPLFR(nn.Module):
         Direct port of upstream ``_collapsed_loglikelihood`` (W ~ N(0, I) prior,
         eps ~ N(0, sigma^2 I)).
         """
-        n, p = Y.shape
-        q = Z.shape[1]
-        sigma_sq = sigma ** 2 + Y.new_tensor(self.jitter + self._eps)
+        # The likelihood depends on Z only through the sufficient statistics
+        # ZᵀZ, ZᵀY and ΣYᵀY, so we route through the stats form (which is also
+        # what lets training chunk over minibatches — see ``train_model``).
+        n = Y.shape[0]
+        return self._collapsed_ll_from_stats(
+            Z.T @ Z, Z.T @ Y, torch.sum(Y * Y), n, sigma)
+
+    def _collapsed_ll_from_stats(self, ZtZ, ZtY, sum_YY, n, sigma):
+        """Collapsed log-likelihood from sufficient statistics.
+
+        ``ZtZ`` is ``(q,q)``, ``ZtY`` is ``(q,p)``, ``sum_YY`` a scalar, ``n`` the
+        number of rows. Exact given the (full-data) statistics; identical to the
+        upstream port when the statistics span the whole training set.
+        """
+        q, p = ZtY.shape
+        sigma_sq = sigma ** 2 + ZtZ.new_tensor(self.jitter + self._eps)
         inv_sigma_sq = 1.0 / sigma_sq
 
-        eye = torch.eye(q, device=Y.device, dtype=Y.dtype)
-        Psi = eye + inv_sigma_sq * (Z.T @ Z)
+        eye = torch.eye(q, device=ZtZ.device, dtype=ZtZ.dtype)
+        Psi = eye + inv_sigma_sq * ZtZ
         L_Psi = torch.linalg.cholesky(Psi)
         logdet_Psi = 2.0 * torch.sum(torch.log(torch.diagonal(L_Psi)))
 
-        ZTY = Z.T @ Y
-        Psi_inv_ZTY = torch.cholesky_solve(ZTY, L_Psi)
+        Psi_inv_ZtY = torch.cholesky_solve(ZtY, L_Psi)
         return (
             -0.5 * p * n * math.log(2.0 * math.pi)
             - 0.5 * p * n * torch.log(sigma_sq)
             - 0.5 * p * logdet_Psi
-            - 0.5 * inv_sigma_sq * torch.sum(Y * Y)
-            + 0.5 * inv_sigma_sq ** 2 * torch.sum(ZTY * Psi_inv_ZTY)
+            - 0.5 * inv_sigma_sq * sum_YY
+            + 0.5 * inv_sigma_sq ** 2 * torch.sum(ZtY * Psi_inv_ZtY)
         )
 
     def _decoder_posterior(self, Z, Y, sigma):
         """Posterior over the decoder ``W``: returns ``(mu_W (q,p), Sigma_W (q,q))``."""
-        q = Z.shape[1]
-        inv_sigma_sq = 1.0 / (sigma ** 2 + Y.new_tensor(self.jitter + self._eps))
-        eye = torch.eye(q, device=Y.device, dtype=Y.dtype)
-        precision = eye + inv_sigma_sq * (Z.T @ Z)
+        return self._decoder_posterior_from_stats(Z.T @ Z, Z.T @ Y, sigma)
+
+    def _decoder_posterior_from_stats(self, ZtZ, ZtY, sigma):
+        """Decoder posterior from sufficient statistics ``ZᵀZ`` / ``ZᵀY``."""
+        q = ZtZ.shape[0]
+        inv_sigma_sq = 1.0 / (sigma ** 2 + ZtZ.new_tensor(self.jitter + self._eps))
+        eye = torch.eye(q, device=ZtZ.device, dtype=ZtZ.dtype)
+        precision = eye + inv_sigma_sq * ZtZ
         L = torch.linalg.cholesky(precision)
-        mu_W = inv_sigma_sq * torch.cholesky_solve(Z.T @ Y, L)
+        mu_W = inv_sigma_sq * torch.cholesky_solve(ZtY, L)
         Sigma_W = torch.cholesky_inverse(L)
         return mu_W, Sigma_W
 
     # ------------------------------------------------------------------
+    # Latent-GP KL (base-GP agnostic)
+    # ------------------------------------------------------------------
+    def _gp_kl_divergence(self):
+        """KL(q||p) of the latent GP, summed to a scalar.
+
+        Inducing-point bases (``IndependentMultitaskGPModel``, ``LatentRiemannGP``)
+        expose it through ``variational_strategy.kl_divergence()``; the weight-space
+        ``SpectralLatentGP`` parametrizes q(w) directly and exposes
+        ``kl_divergence()`` on the model itself. Duck-type over the two so any base
+        GP drops in.
+        """
+        vs = getattr(self.gp_model, "variational_strategy", None)
+        if vs is not None:
+            return vs.kl_divergence().sum()
+        return self.gp_model.kl_divergence().sum()
+
+    # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
-    def loss_function(self, Y, Z, beta=1.0):
-        """ELBO-style objective: -inverse_temperature * collapsed_ll + beta * KL."""
+    def loss_function(self, Y, Z, beta=1.0, scale=1.0):
+        """ELBO-style objective: -inverse_temperature * scale * collapsed_ll + beta * KL.
+
+        ``scale`` (= n_total / n_batch) rescales a minibatch's collapsed
+        log-likelihood up to dataset magnitude so the KL weighting is independent
+        of batch size (the standard doubly-stochastic SVGP scaling).
+        """
         sigma = self.log_sigma.exp()
         collapsed_ll = self._collapsed_loglikelihood(Y, Z, sigma)
-        kl_gp = self.gp_model.variational_strategy.kl_divergence().sum()
-        recon_loss = -self.inverse_temperature * collapsed_ll
+        kl_gp = self._gp_kl_divergence()
+        recon_loss = -self.inverse_temperature * scale * collapsed_ll
         total_loss = recon_loss + beta * kl_gp
         return total_loss, recon_loss, kl_gp
 
@@ -160,13 +203,25 @@ class GPLFR(nn.Module):
     # Decoder-posterior cache for prediction
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def build_state(self, coords, Y):
-        """Compute and cache ``mu_W`` / ``Sigma_W`` from the full training set."""
+    def build_state(self, dataloader):
+        """Cache the global decoder posterior ``mu_W`` / ``Sigma_W``.
+
+        Accumulates the sufficient statistics ``ZᵀZ`` / ``ZᵀY`` over the whole
+        training set chunk-by-chunk (no autograd graph), so memory stays at one
+        minibatch's GP forward — the decoder posterior is still exact and global.
+        """
         was_training = self.training
         self.eval()
-        mean, _, _ = self._latent_moments(coords)
+        ZtZ = torch.zeros(self.d, self.d, device=self.device, dtype=self.mu_W.dtype)
+        ZtY = torch.zeros(self.d, self.p, device=self.device, dtype=self.mu_W.dtype)
+        for Y_b, coord_b in dataloader:
+            Y_b = Y_b.to(self.device)
+            coord_b = coord_b.to(self.device)
+            z = self._latent_moments(coord_b)[0]
+            ZtZ += z.T @ z
+            ZtY += z.T @ Y_b
         sigma = self.log_sigma.exp()
-        mu_W, Sigma_W = self._decoder_posterior(mean, Y, sigma)
+        mu_W, Sigma_W = self._decoder_posterior_from_stats(ZtZ, ZtY, sigma)
         self.mu_W.copy_(mu_W)
         self.Sigma_W.copy_(Sigma_W)
         self.sigma_sq.copy_(sigma ** 2)
@@ -212,52 +267,43 @@ class GPLFR(nn.Module):
         return mean, var.clamp_min(0.0).sqrt()
 
     # ------------------------------------------------------------------
-    # Training (full-batch — the collapsed likelihood couples all points)
+    # Training (minibatched: each step optimizes the batch's collapsed
+    # marginal likelihood, rescaled to dataset magnitude, plus the GP KL).
     # ------------------------------------------------------------------
-    @staticmethod
-    def _materialize_full_batch(dataloader):
-        """Return ``(Y, coords)`` for the entire training set.
-
-        Fast path for the ``TensorDataset`` built by ``MaldiExperiment``
-        (``tensors == (train_data, coordinates_train)``); otherwise concatenate
-        the loader.
-        """
-        dataset = dataloader.dataset
-        tensors = getattr(dataset, "tensors", None)
-        if tensors is not None and len(tensors) == 2:
-            return tensors[0], tensors[1]
-        ys, coords = [], []
-        for y, coord in dataloader:
-            ys.append(y)
-            coords.append(coord)
-        return torch.cat(ys, dim=0), torch.cat(coords, dim=0)
-
     def train_model(self, exp_path, dataloader, optimizer, epochs, current_epoch,
                     print_every=1000):
         self.to(self.device)
         self.train()
-
-        Y_full, coord_full = self._materialize_full_batch(dataloader)
-        Y_full = Y_full.to(self.device)
-        coord_full = coord_full.to(self.device)
+        n_total = len(dataloader.dataset)
 
         for epoch in tqdm(range(current_epoch, epochs)):
-            optimizer.zero_grad()
-            z, _ = self._sample_latent(coord_full)
-            loss, recon_loss, kl_div = self.loss_function(Y_full, z, beta=1.0)
-            loss.backward()
-            optimizer.step()
+            mean_loss = recon_loss_sum = kl_loss_sum = 0.0
+            n_batches = 0
+            for Y_b, coord_b in dataloader:
+                Y_b = Y_b.to(self.device)
+                coord_b = coord_b.to(self.device)
+                optimizer.zero_grad()
+                z, _ = self._sample_latent(coord_b)
+                scale = n_total / Y_b.shape[0]
+                loss, recon_loss, kl_div = self.loss_function(Y_b, z, beta=1.0, scale=scale)
+                loss.backward()
+                optimizer.step()
+                mean_loss += loss.item()
+                recon_loss_sum += recon_loss.item()
+                kl_loss_sum += kl_div.item()
+                n_batches += 1
 
             torch.save(self.state_dict(), exp_path / f"checkpoints/model_{epoch}.pth")
-            _wandb_log({"loss": loss.item(),
-                        "reconstruction_loss": recon_loss.item(),
-                        "kl_loss": kl_div.item(),
+            _wandb_log({"loss": mean_loss / n_batches,
+                        "reconstruction_loss": recon_loss_sum / n_batches,
+                        "kl_loss": kl_loss_sum / n_batches,
                         "sigma": self.log_sigma.exp().item()})
             if epoch % max(1, print_every) == 0:
-                print(f"Epoch {epoch} loss: {loss.item():.4f} "
-                      f"(recon {recon_loss.item():.4f}, kl {kl_div.item():.4f}, "
+                print(f"Epoch {epoch} loss: {mean_loss / n_batches:.4f} "
+                      f"(recon {recon_loss_sum / n_batches:.4f}, "
+                      f"kl {kl_loss_sum / n_batches:.4f}, "
                       f"sigma {self.log_sigma.exp().item():.4g})")
 
-        # Cache the collapsed-decoder posterior for prediction, then save.
-        self.build_state(coord_full, Y_full)
+        # Cache the collapsed-decoder posterior (global, chunked) for prediction.
+        self.build_state(dataloader)
         torch.save(self.state_dict(), exp_path / "model.pth")

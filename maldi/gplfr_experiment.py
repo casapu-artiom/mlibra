@@ -15,13 +15,20 @@ scope here.
 from argparse import ArgumentParser
 import logging
 
+import torch
+
 from l3di.lgp import IndependentMultitaskGPModel
+from l3di.lgp_manifold import LatentRiemannGP, SpectralLatentGP
 from gplfr import GPLFR
 from experiment import MaldiExperiment
 from config import MaldiConfig
+from manifold_kernel_builder import add_manifold_args, build_manifold_kernel
+from manifold_gp.utils.nearest_neighbors import apply_faiss_cpu_args
 from utils import (
     get_inducing_points,
     get_data_inducing_points,
+    coord_norm_from_reference,
+    _inducing_from_coords,
 )
 
 
@@ -50,6 +57,14 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--epochs", type=int, default=100, help="Number of (full-batch) training epochs.")
     parser.add_argument("--latent-dim", dest="latent_dim", type=int, default=8, help="Latent dimension q.")
+    parser.add_argument("--base-gp", dest="base_gp", type=str, default="euclidean",
+                        choices=["euclidean", "riemann", "spectral"],
+                        help="Latent GP that produces Z. 'euclidean' (default): "
+                             "Euclidean inducing-point IndependentMultitaskGPModel. "
+                             "'riemann': manifold inducing-point LatentRiemannGP. "
+                             "'spectral': weight-space SpectralLatentGP over the "
+                             "manifold spectrum. The manifold bases need the "
+                             "eigenpair pipeline (see the manifold flags).")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run the experiment on.")
     parser.add_argument("--kernel", type=str, default="matern", help="Kernel type for the latent GP.")
     parser.add_argument("--log-transform", dest="log_transform", action='store_true', help="Apply log transformation to the data.")
@@ -69,14 +84,13 @@ def parse_args():
         nargs="+", default=None,
         help="Restrict reconstruction to these lipids (indices or names). Default: all.",
     )
+    # Manifold graph/Laplacian/eigensolve flags (used by --base-gp riemann|spectral).
+    add_manifold_args(parser)
     return vars(parser.parse_args())
 
 
-def setup_experiment(args):
-    config = MaldiConfig.from_args(args)
-    logging.info("Configuration created successfully")
-
-    # Inducing points (reused verbatim from the LGP baseline).
+def _build_euclidean_gp(args, config):
+    """Euclidean inducing-point latent GP (the original GPLFR base)."""
     logging.info("Getting inducing points")
     if args.get("inducing_source", "reference") == "data":
         inducing_points, coord_mean, coord_std = get_data_inducing_points(
@@ -91,11 +105,9 @@ def setup_experiment(args):
         )
     logging.info(f"Got {inducing_points.shape[0]} inducing points")
 
-    logging.info("Creating latent GP model")
     voxel_size = 0.025
-    n_pixel = args["n_pixels"]
     minimal_length_scale = args["n_pixels"] * voxel_size / (coord_std.sum() / 3)
-    logging.info(f"minimal length scale in um: {n_pixel * voxel_size}")
+    logging.info(f"minimal length scale in um: {args['n_pixels'] * voxel_size}")
     gp_model = IndependentMultitaskGPModel(
         inducing_points=inducing_points,
         num_tasks=config.latent_dim,
@@ -104,6 +116,66 @@ def setup_experiment(args):
         minimal_length_scale=minimal_length_scale,
         input_dim=3,
     )
+    return gp_model, coord_mean, coord_std
+
+
+def _build_riemann_gp(args, config):
+    """Manifold inducing-point latent GP (LatentRiemannGP).
+
+    Uses the global reference-image normalization (the frame the cached graphs
+    live in) and picks inducing points directly from the graph nodes so they sit
+    on the Riemann kernel's exact-eigenvector branch.
+    """
+    coord_mean, coord_std = coord_norm_from_reference(config.reference_file)
+    manifold_kernel, knn = build_manifold_kernel(args, config, coord_mean, coord_std)
+
+    nodes = knn.x.detach().cpu().numpy()
+    sel = _inducing_from_coords(
+        nodes, config.num_inducing,
+        method=args.get("inducing_method", "kmeans_snap"), seed=args["seed"],
+    )
+    inducing_points = torch.tensor(sel, dtype=torch.float32)
+    config.num_inducing = inducing_points.shape[0]
+    logging.info(f"Selected {inducing_points.shape[0]} inducing points from graph nodes")
+
+    gp_model = LatentRiemannGP(
+        inducing_points=inducing_points,
+        num_tasks=config.latent_dim,
+        manifold_kernel=manifold_kernel,
+    )
+    return gp_model, coord_mean, coord_std
+
+
+def _build_spectral_gp(args, config):
+    """Weight-space latent GP over the manifold spectrum (SpectralLatentGP).
+
+    No inducing points: the variational posterior lives on the num_modes
+    eigen-coefficients directly.
+    """
+    coord_mean, coord_std = coord_norm_from_reference(config.reference_file)
+    manifold_kernel, _knn = build_manifold_kernel(args, config, coord_mean, coord_std)
+    gp_model = SpectralLatentGP(
+        num_tasks=config.latent_dim,
+        manifold_kernel=manifold_kernel,
+    )
+    return gp_model, coord_mean, coord_std
+
+
+_GP_BUILDERS = {
+    "euclidean": _build_euclidean_gp,
+    "riemann": _build_riemann_gp,
+    "spectral": _build_spectral_gp,
+}
+
+
+def setup_experiment(args):
+    config = MaldiConfig.from_args(args)
+    logging.info("Configuration created successfully")
+
+    base_gp = args.get("base_gp", "euclidean")
+    logging.info(f"Creating latent GP model (base-gp={base_gp})")
+    gp_model, coord_mean, coord_std = _GP_BUILDERS[base_gp](args, config)
+    gp_model = gp_model.to(config.device)
     logging.info("Latent GP model created successfully")
 
     logging.info("Creating GPLFR instance")
@@ -123,6 +195,8 @@ if __name__ == "__main__":
     logging.info("Starting MALDI experiment (GPLFR collapsed linear decoder)")
     args = parse_args()
     logging.info(f"Parsed arguments: {args}")
+    # Pin FAISS phases to CPU if requested (only affects manifold-base graph builds).
+    apply_faiss_cpu_args(args)
     experiment = setup_experiment(args)
     experiment.run()
     if experiment.config.do_brain_reconstruction:

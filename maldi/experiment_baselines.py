@@ -32,10 +32,20 @@ Persistence outputs (so reconstruction can be re-run later from CLI):
     <exp_path>/lipid_stds.pth     per-lipid (log) std
 
 Available baselines (--model):
-    mean      per-lipid training mean. The floor.
-    linear    Ridge regression (closed form).
-    xgboost   p independent XGBRegressors with early stopping.
-    mlp       configurable-depth MLP (default 128x128x128, SiLU, dropout).
+    mean       per-lipid training mean. The floor.
+    linear     Ridge regression (closed form).
+    xgboost    p independent XGBRegressors with early stopping.
+    mlp        configurable-depth MLP (default 128x128x128, SiLU, dropout).
+    mlp_eigen  mlp with the points' manifold-eigenbasis projection concatenated
+               onto the coords (needs the eigenpair pipeline; reference frame).
+    gcn        Graph Conv Net over a per-batch KNN graph of the coords.
+    gcn_faiss  Graph Conv Net over the FAISS reference-node manifold graph (same
+               graph as the manifold GP); reads out per nearest node.
+
+Reconstruction/render/diagnostics parity with the GP runs: after reconstruction
+this writes the composite renders AND the per-lipid diagnostics PNGs (value
+distribution + true-vs-pred scatter, linear & log) from the held-out test split,
+matching MaldiExperiment.render_reconstruction.
 
 All shared CLI flags mirror lgp_manifold_experiment.py so launches feel
 symmetric. Region semantics also mirror it: when --region-bbox is set, parquet
@@ -73,7 +83,16 @@ except ImportError:
     HAVE_XGB = False
 
 from config import MaldiConfig
-from utils import apply_region_to_config
+from utils import coord_norm_from_reference
+from manifold_kernel_builder import (
+    add_manifold_args, build_manifold_kernel, build_manifold_graph,
+)
+
+try:
+    from torch_geometric.nn import GCNConv
+    HAVE_PYG = True
+except ImportError:
+    HAVE_PYG = False
 
 
 # ===========================================================================
@@ -115,13 +134,25 @@ def parse_args():
 
     # Baseline-specific knobs
     parser.add_argument("--model", type=str, default="linear",
-                        choices=["mean", "linear", "xgboost", "mlp"])
+                        choices=["mean", "linear", "xgboost", "mlp", "mlp_eigen",
+                                 "gcn", "gcn_faiss"])
     parser.add_argument("--ridge-alpha", type=float, default=1.0)
     parser.add_argument("--mlp-hidden", type=int, nargs="+", default=[128, 128, 128])
     parser.add_argument("--mlp-dropout", type=float, default=0.1)
     parser.add_argument("--xgb-n-estimators", type=int, default=400)
     parser.add_argument("--xgb-max-depth", type=int, default=6)
     parser.add_argument("--xgb-lr", type=float, default=0.05)
+    # GCN knobs (--model gcn): per-batch KNN graph over coords.
+    parser.add_argument("--gcn-hidden", dest="gcn_hidden", type=int, nargs="+", default=[128, 128, 128])
+    parser.add_argument("--gcn-dropout", dest="gcn_dropout", type=float, default=0.1)
+    parser.add_argument("--gcn-knn-k", dest="gcn_knn_k", type=int, default=15,
+                        help="Neighbours for the per-batch GCN KNN graph.")
+    # gcn_faiss is full-graph (1 optimizer step per forward), so it needs its own
+    # iteration budget rather than the shared --epochs (tuned for minibatch models).
+    parser.add_argument("--gcn-faiss-iters", dest="gcn_faiss_iters", type=int, default=2000,
+                        help="(--model gcn_faiss) number of full-graph gradient steps.")
+    parser.add_argument("--gcn-faiss-node-batch", dest="gcn_faiss_node_batch", type=int, default=65536,
+                        help="(--model gcn_faiss) training measurements sampled per step.")
 
     # Reconstruction
     parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="Template name.")
@@ -139,6 +170,9 @@ def parse_args():
         help=("Restrict reconstruction to these lipids. Accepts indices "
               "(0 5 10) or names ('PA 36:4' 'PE 40:7'). Default: all."),
     )
+
+    # Manifold graph/eigenbasis flags (used by --model mlp_eigen).
+    add_manifold_args(parser)
 
     args = vars(parser.parse_args())
     # Coerce to int where possible so the resolver gets a homogeneous list.
@@ -325,8 +359,8 @@ class MLPBaseline:
         self.model: nn.Sequential | None = None
         self.device: torch.device | None = None
 
-    def _build(self, p, hidden, dropout, device):
-        dims = [3] + list(hidden) + [p]
+    def _build(self, p, hidden, dropout, device, in_dim=3):
+        dims = [in_dim] + list(hidden) + [p]
         layers = []
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
@@ -346,7 +380,8 @@ class MLPBaseline:
         Xte = coords_test.to(self.device);   Yte = y_test.to(self.device)
         n = Xtr.shape[0]
         bs = args["batch_size"]
-        for epoch in range(args["epochs"]):
+        pbar = tqdm(range(args["epochs"]), desc="mlp")
+        for epoch in pbar:
             self.model.train()
             perm = torch.randperm(n, device=self.device)
             loss_sum = 0.0
@@ -356,6 +391,7 @@ class MLPBaseline:
                 loss = F.mse_loss(pred, Ytr[idx])
                 opt.zero_grad(); loss.backward(); opt.step()
                 loss_sum += loss.item() * idx.shape[0]
+            pbar.set_postfix(train=f"{loss_sum/n:.4g}")
             if (epoch + 1) % 25 == 0 or epoch == args["epochs"] - 1:
                 self.model.eval()
                 with torch.no_grad():
@@ -383,12 +419,348 @@ class MLPBaseline:
         self.model.eval()
 
 
+class MLPEigenBaseline(MLPBaseline):
+    """MLP whose inputs are the 3D coords CONCATENATED with the point's
+    projection onto the manifold eigenbasis (the Laplacian harmonics).
+
+    Same MLP as ``MLPBaseline`` but with input dim ``3 + num_modes``. The
+    eigen-projection ``raw_eigenvectors(x)`` is only valid in the reference
+    coordinate frame the graph was built in, so ``main`` standardizes coords
+    with ``coord_norm_from_reference`` for this model (see ``needs_eigen``); the
+    coords reaching ``predict`` are therefore already in that frame.
+
+    ``attach_kernel`` must be called (in ``main``) before ``fit``/``predict``/
+    ``load`` so the eigenbasis is available; the kernel is rebuilt from the same
+    caches on the ``--skip-training`` path.
+    """
+    kind = "mlp_eigen"
+
+    def __init__(self):
+        super().__init__()
+        self.kernel = None
+        self.num_modes = None
+
+    def attach_kernel(self, kernel):
+        self.kernel = kernel
+        self.num_modes = int(kernel.num_modes)
+
+    # Row-chunk for the eigenvector interpolation. The Nyström out_of_sample step
+    # materializes a (rows, k, num_modes) transient, which OOMs on the full
+    # multi-million-row train set — so we interpolate in chunks and concatenate.
+    eigen_chunk = 50_000
+
+    def _eigenvectors(self, x):
+        outs = []
+        for i in range(0, x.shape[0], self.eigen_chunk):
+            outs.append(self.kernel.raw_eigenvectors(x[i:i + self.eigen_chunk]))
+        return torch.cat(outs, dim=0)
+
+    def _inputs(self, coords_std):
+        """concat[coords (3), eigenfeatures (num_modes)] on ``self.device``."""
+        if self.kernel is None:
+            raise RuntimeError("MLPEigenBaseline needs attach_kernel() before use.")
+        x = coords_std.to(self.device)
+        with torch.no_grad():
+            U = self._eigenvectors(x)                    # (B, num_modes), chunked
+        return torch.cat([x, U], dim=1)
+
+    def fit(self, coords_train, y_train, coords_test, y_test, args):
+        self.device = torch.device(args["device"])
+        p = y_train.shape[1]
+        in_dim = 3 + self.num_modes
+        self.model = self._build(p, args["mlp_hidden"], args["mlp_dropout"], self.device, in_dim=in_dim)
+        opt = torch.optim.Adam(self.model.parameters(), lr=args["learning_rate"])
+
+        Xtr = self._inputs(coords_train); Ytr = y_train.to(self.device)
+        Xte = self._inputs(coords_test);  Yte = y_test.to(self.device)
+        n = Xtr.shape[0]
+        bs = args["batch_size"]
+        pbar = tqdm(range(args["epochs"]), desc="mlp_eigen")
+        for epoch in pbar:
+            self.model.train()
+            perm = torch.randperm(n, device=self.device)
+            loss_sum = 0.0
+            for i in range(0, n, bs):
+                idx = perm[i:i + bs]
+                loss = F.mse_loss(self.model(Xtr[idx]), Ytr[idx])
+                opt.zero_grad(); loss.backward(); opt.step()
+                loss_sum += loss.item() * idx.shape[0]
+            pbar.set_postfix(train=f"{loss_sum/n:.4g}")
+            if (epoch + 1) % 25 == 0 or epoch == args["epochs"] - 1:
+                self.model.eval()
+                with torch.no_grad():
+                    te = F.mse_loss(self.model(Xte), Yte).item()
+                logging.info(f"  mlp_eigen epoch {epoch+1}/{args['epochs']}  "
+                             f"train={loss_sum/n:.6g}  test={te:.6g}")
+        self.model.eval()
+        with torch.no_grad():
+            return self.model(Xtr).cpu(), self.model(Xte).cpu()
+
+    def predict(self, coords_std):
+        self.model.eval()
+        with torch.no_grad():
+            return self.model(self._inputs(coords_std)).cpu()
+
+    def load(self, path, p, args):
+        self.device = torch.device(args["device"])
+        in_dim = 3 + self.num_modes
+        self.model = self._build(p, args["mlp_hidden"], args["mlp_dropout"], self.device, in_dim=in_dim)
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        self.model.eval()
+
+
+def _knn_edge_index(x, k):
+    """Symmetric KNN edge_index (2, E) over the batch point cloud ``x`` (B, 3).
+
+    Built per batch (inductive) from Euclidean distances; self is excluded
+    (GCNConv re-adds self-loops). k is clamped to B-1 so small final batches
+    don't error.
+    """
+    n = x.shape[0]
+    k = min(k, n - 1)
+    if k < 1:
+        return torch.empty(2, 0, dtype=torch.long, device=x.device)
+    d = torch.cdist(x, x)
+    idx = d.topk(k + 1, largest=False).indices[:, 1:]        # (n, k), drop self
+    src = torch.arange(n, device=x.device).unsqueeze(1).expand(-1, k).reshape(-1)
+    dst = idx.reshape(-1)
+    return torch.stack([torch.cat([src, dst]), torch.cat([dst, src])], dim=0)
+
+
+class _GCNNet(nn.Module):
+    """Stacked GCNConv layers + a linear read-out (coords -> lipids)."""
+    def __init__(self, in_dim, hidden, p, dropout):
+        super().__init__()
+        dims = [in_dim] + list(hidden)
+        self.convs = nn.ModuleList(
+            [GCNConv(dims[i], dims[i + 1]) for i in range(len(dims) - 1)]
+        )
+        self.dropout = dropout
+        self.head = nn.Linear(dims[-1], p)
+
+    def forward(self, x, edge_index):
+        for conv in self.convs:
+            x = F.silu(conv(x, edge_index))
+            if self.dropout > 0:
+                x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.head(x)
+
+
+class GCNBaseline:
+    """Graph Convolutional Network over a per-batch KNN graph of the coords.
+
+    Inductive: each train/test/reconstruction batch builds its own KNN graph
+    (neighbourhoods are batch-local), so it slots into the existing batched
+    ``predict``/``reconstruct`` contract with no refactor. Node features are the
+    3D coords; the graph supplies the manifold structure.
+    """
+    kind = "gcn"
+
+    def __init__(self):
+        self.model: _GCNNet | None = None
+        self.device: torch.device | None = None
+        self.k = None
+        self.hidden = None
+        self.dropout = None
+
+    def _predict_batch(self, coords):
+        edge_index = _knn_edge_index(coords, self.k)
+        return self.model(coords, edge_index)
+
+    def _predict_split(self, X, bs):
+        """Batched prediction: the per-batch KNN uses O(batch^2) cdist, so the
+        full split (millions of rows) must NOT be passed to _predict_batch at
+        once. Batches also keep the KNN graph at the same scale as training."""
+        self.model.eval()
+        with torch.no_grad():
+            return torch.cat([self._predict_batch(X[i:i + bs])
+                              for i in range(0, X.shape[0], bs)])
+
+    def fit(self, coords_train, y_train, coords_test, y_test, args):
+        if not HAVE_PYG:
+            raise RuntimeError("torch_geometric not installed (needed for --model gcn).")
+        self.device = torch.device(args["device"])
+        self.k = args["gcn_knn_k"]
+        self.hidden = args["gcn_hidden"]
+        self.dropout = args["gcn_dropout"]
+        p = y_train.shape[1]
+        self.model = _GCNNet(3, self.hidden, p, self.dropout).to(self.device)
+        opt = torch.optim.Adam(self.model.parameters(), lr=args["learning_rate"])
+
+        Xtr = coords_train.to(self.device); Ytr = y_train.to(self.device)
+        Xte = coords_test.to(self.device);   Yte = y_test.to(self.device)
+        n = Xtr.shape[0]
+        bs = args["batch_size"]
+        pbar = tqdm(range(args["epochs"]), desc="gcn")
+        for epoch in pbar:
+            self.model.train()
+            perm = torch.randperm(n, device=self.device)
+            loss_sum = 0.0
+            for i in range(0, n, bs):
+                idx = perm[i:i + bs]
+                xb = Xtr[idx]
+                pred = self.model(xb, _knn_edge_index(xb, self.k))
+                loss = F.mse_loss(pred, Ytr[idx])
+                opt.zero_grad(); loss.backward(); opt.step()
+                loss_sum += loss.item() * idx.shape[0]
+            pbar.set_postfix(train=f"{loss_sum/n:.4g}")
+            if (epoch + 1) % 25 == 0 or epoch == args["epochs"] - 1:
+                te = F.mse_loss(self._predict_split(Xte, bs), Yte).item()
+                logging.info(f"  gcn epoch {epoch+1}/{args['epochs']}  "
+                             f"train={loss_sum/n:.6g}  test={te:.6g}")
+        # Predict each split in batches so the KNN graphs match training scale.
+        pred_tr = self._predict_split(Xtr, bs).cpu()
+        pred_te = self._predict_split(Xte, bs).cpu()
+        return pred_tr, pred_te
+
+    def predict(self, coords_std):
+        self.model.eval()
+        with torch.no_grad():
+            return self._predict_batch(coords_std.to(self.device)).cpu()
+
+    def save(self, path):
+        torch.save({"state_dict": self.model.state_dict(),
+                    "k": self.k, "hidden": self.hidden, "dropout": self.dropout}, path)
+
+    def load(self, path, p, args):
+        if not HAVE_PYG:
+            raise RuntimeError("torch_geometric not installed (needed for --model gcn).")
+        self.device = torch.device(args["device"])
+        d = torch.load(path, map_location=self.device, weights_only=False)
+        self.k, self.hidden, self.dropout = d["k"], d["hidden"], d["dropout"]
+        self.model = _GCNNet(3, self.hidden, p, self.dropout).to(self.device)
+        self.model.load_state_dict(d["state_dict"])
+        self.model.eval()
+
+
+class GCNFaissBaseline:
+    """GCN over the FAISS reference-node manifold graph (the same graph the
+    manifold GP uses), as opposed to ``GCNBaseline``'s per-batch KNN graph.
+
+    Node features are the graph-node coords; the fixed KNN graph supplies the
+    manifold structure. Each measurement / reconstruction voxel reads out from
+    its nearest graph node (``knn.search``). Training is transductive full-graph:
+    one forward over all nodes per step, MSE on the training measurements mapped
+    to their nearest node.
+
+    ``attach_graph`` must be called (in ``main``) before fit/predict/load, and
+    coords must arrive in the reference frame (``main`` standardizes with
+    ``coord_norm_from_reference``) so nearest-node search matches the graph.
+    """
+    kind = "gcn_faiss"
+
+    def __init__(self):
+        self.model: _GCNNet | None = None
+        self.device: torch.device | None = None
+        self.hidden = None
+        self.dropout = None
+        self.knn = None            # KnnGraph: .x (N,3), .search(x, k)
+        self.edge_index = None     # (2, E)
+        self.node_x = None         # (N, 3) node features
+        self._node_preds = None    # cached (N, p) node predictions (eval)
+
+    def attach_graph(self, knn, edge_index, device):
+        self.device = torch.device(device)
+        self.knn = knn
+        self.edge_index = edge_index.to(self.device)
+        self.node_x = knn.x.to(self.device).float()
+
+    def _nearest_node(self, coords):
+        """(B,) long node indices for query coords (reference frame)."""
+        # faiss's torch search requires a contiguous input; sliced/normalized
+        # coord tensors often aren't. .contiguous() is a no-op when already so.
+        q = coords.to(self.node_x.device).contiguous()
+        _, idx = self.knn.search(q, 1)
+        return idx.reshape(-1).long()
+
+    def _refresh_node_preds(self):
+        self.model.eval()
+        with torch.no_grad():
+            self._node_preds = self.model(self.node_x, self.edge_index)
+
+    def fit(self, coords_train, y_train, coords_test, y_test, args):
+        if not HAVE_PYG:
+            raise RuntimeError("torch_geometric not installed (needed for --model gcn_faiss).")
+        if self.knn is None:
+            raise RuntimeError("GCNFaissBaseline needs attach_graph() before fit().")
+        self.hidden = args["gcn_hidden"]
+        self.dropout = args["gcn_dropout"]
+        p = y_train.shape[1]
+        self.model = _GCNNet(3, self.hidden, p, self.dropout).to(self.device)
+        opt = torch.optim.Adam(self.model.parameters(), lr=args["learning_rate"])
+
+        nn_tr = self._nearest_node(coords_train)
+        nn_te = self._nearest_node(coords_test)
+        Ytr = y_train.to(self.device); Yte = y_test.to(self.device)
+
+        # Full-graph transductive training. Each step is ONE full-graph forward +
+        # ONE optimizer step, so the shared per-epoch count (tuned for the
+        # minibatch baselines that take n/batch_size steps per epoch) would leave
+        # this drastically undertrained. Instead run a dedicated iteration budget
+        # (gcn_faiss_iters), each on a stochastic minibatch of training
+        # measurements (mapped to their nearest node) for SGD noise + bounded
+        # memory on the (n_tr, p) gather.
+        n_tr = nn_tr.shape[0]
+        n_iters = int(args.get("gcn_faiss_iters", 2000))
+        mb = min(int(args.get("gcn_faiss_node_batch", 65536)), n_tr)
+        log_every = max(1, n_iters // 20)
+        pbar = tqdm(range(n_iters), desc="gcn_faiss")
+        for it in pbar:
+            self.model.train()
+            node_preds = self.model(self.node_x, self.edge_index)   # (N, p)
+            sel = torch.randint(0, n_tr, (mb,), device=self.device)
+            loss = F.mse_loss(node_preds[nn_tr[sel]], Ytr[sel])
+            opt.zero_grad(); loss.backward(); opt.step()
+            pbar.set_postfix(train=f"{loss.item():.4g}")
+            if (it + 1) % log_every == 0 or it == n_iters - 1:
+                self.model.eval()
+                with torch.no_grad():
+                    te = F.mse_loss(
+                        self.model(self.node_x, self.edge_index)[nn_te], Yte
+                    ).item()
+                logging.info(f"  gcn_faiss iter {it+1}/{n_iters}  "
+                             f"train={loss.item():.6g}  test={te:.6g}")
+
+        self._refresh_node_preds()
+        return (self._node_preds[nn_tr].cpu(), self._node_preds[nn_te].cpu())
+
+    def predict(self, coords_std):
+        if self._node_preds is None:
+            self._refresh_node_preds()
+        return self._node_preds[self._nearest_node(coords_std)].cpu()
+
+    def save(self, path):
+        torch.save({"state_dict": self.model.state_dict(),
+                    "hidden": self.hidden, "dropout": self.dropout}, path)
+
+    def load(self, path, p, args):
+        if not HAVE_PYG:
+            raise RuntimeError("torch_geometric not installed (needed for --model gcn_faiss).")
+        self.device = torch.device(args["device"])
+        d = torch.load(path, map_location=self.device, weights_only=False)
+        self.hidden, self.dropout = d["hidden"], d["dropout"]
+        self.model = _GCNNet(3, self.hidden, p, self.dropout).to(self.device)
+        self.model.load_state_dict(d["state_dict"])
+        self.model.eval()
+        self._node_preds = None   # recomputed lazily (graph re-attached in main)
+
+
 MODEL_REGISTRY = {
-    "mean":    MeanBaseline,
-    "linear":  LinearBaseline,
-    "xgboost": XGBoostBaseline,
-    "mlp":     MLPBaseline,
+    "mean":      MeanBaseline,
+    "linear":    LinearBaseline,
+    "xgboost":   XGBoostBaseline,
+    "mlp":       MLPBaseline,
+    "mlp_eigen": MLPEigenBaseline,
+    "gcn":       GCNBaseline,
+    "gcn_faiss": GCNFaissBaseline,
 }
+
+# Models that consume the manifold eigenbasis (need build_manifold_kernel).
+EIGEN_MODELS = {"mlp_eigen"}
+# Models that consume the manifold graph topology (need build_manifold_graph).
+GRAPH_MODELS = {"gcn_faiss"}
+# Both families require coords in the reference frame the graph was built in.
+REFERENCE_FRAME_MODELS = EIGEN_MODELS | GRAPH_MODELS
 
 def _resolve_lipid_filter(selected_lipids_names, lipid_indices=None, lipid_names=None):
     """Resolve a lipid filter spec to an int array of column indices.
@@ -602,6 +974,40 @@ def reconstruct(model, config, template_volume, coord_mean, coord_std,
 
     return volume_path, suffix
 
+def _render_diagnostics(config, renders_dir, lipid_filter):
+    """Per-lipid diagnostics from the held-out TEST split (mirror of
+    MaldiExperiment.render_reconstruction's diagnostics block).
+
+    Reads the raw (de-standardized) test predictions/true values written by the
+    training path — so a measurement and a prediction exist for each point — and
+    writes ``{lipid}_diagnostics.png`` for each reconstructed lipid. Non-fatal:
+    a plotting hiccup must never invalidate a completed reconstruction.
+    """
+    try:
+        from render_lipid_volumes import render_lipid_diagnostics
+        test_dir = config.exp_path / "test"
+        true_path = test_dir / "true_values.npy"
+        pred_path = test_dir / "predictions.npy"
+        if not (true_path.exists() and pred_path.exists()):
+            logging.warning("Skipping diagnostics: test predictions/true values "
+                            "not found (run training first).")
+            return
+        true_te = np.load(true_path)
+        pred_te = np.load(pred_path)
+        names = [str(n) for n in config.selected_lipids_names]
+        filt = (list(lipid_filter) if lipid_filter is not None
+                else list(range(len(names))))
+        renders_dir.mkdir(parents=True, exist_ok=True)
+        for gi in filt:
+            render_lipid_diagnostics(
+                true_te[:, gi], pred_te[:, gi], names[gi],
+                renders_dir / f"{names[gi]}_diagnostics.png",
+            )
+        logging.info(f"Diagnostics written to {renders_dir}")
+    except Exception as e:  # noqa: BLE001
+        logging.warning(f"Reconstruction diagnostics plotting failed: {e}")
+
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -616,7 +1022,13 @@ def main():
 
     config = MaldiConfig.from_args(args)
     region_bbox = args.get("region_bbox")
-    apply_region_to_config(config, region_bbox)
+    if region_bbox is not None:
+        # The bbox parquet-filter helpers (apply_region_to_config / bbox_to_mm_bounds)
+        # were removed upstream ("Remove bbox" commit); only whole-brain remains.
+        raise NotImplementedError(
+            "--region-bbox is no longer supported (its parquet-filter helpers were "
+            "removed upstream). Run whole-brain by omitting --region-bbox."
+        )
     config.exp_path.mkdir(parents=True, exist_ok=True)
 
     rec_mode = args["reconstruct"]
@@ -627,6 +1039,28 @@ def main():
 
     model_cls = MODEL_REGISTRY[args["model"]]
     model = model_cls()
+
+    # Manifold-aware models (mlp_eigen / gcn_faiss): build the eigenbasis and/or
+    # the FAISS graph and attach it, in both the training and --skip-training
+    # paths (cheap — same graph/eigvec caches as the manifold runners). Their
+    # coords must live in the reference frame the graph was built in, so we
+    # standardize with coord_norm_from_reference.
+    needs_eigen = args["model"] in EIGEN_MODELS
+    needs_graph = args["model"] in GRAPH_MODELS
+    needs_ref_frame = args["model"] in REFERENCE_FRAME_MODELS
+    ref_mean = ref_std = None
+    if needs_ref_frame:
+        from manifold_gp.utils.nearest_neighbors import apply_faiss_cpu_args
+        apply_faiss_cpu_args(args)
+        ref_mean, ref_std = coord_norm_from_reference(config.reference_file)
+    if needs_eigen:
+        manifold_kernel, _knn = build_manifold_kernel(args, config, ref_mean, ref_std)
+        model.attach_kernel(manifold_kernel)
+    if needs_graph:
+        knn, edge_index, _edge_value, _gk = build_manifold_graph(
+            args, config, ref_mean, ref_std,
+        )
+        model.attach_graph(knn, edge_index, args["device"])
 
     model_path = config.exp_path / "model.pth"
     coord_mean_path = config.exp_path / "coord_mean.pth"
@@ -655,8 +1089,13 @@ def main():
         )
         col_means = y_train_logged.mean(dim=0)
         col_stds  = y_train_logged.std(dim=0).clamp(min=1e-8)
-        coord_mean = coords_train.mean(dim=0)
-        coord_std  = coords_train.std(dim=0).clamp(min=1e-8)
+        if needs_ref_frame:
+            # Reference frame so raw_eigenvectors / nearest-node search is valid;
+            # saved below so reconstruction standardizes voxels in the same frame.
+            coord_mean, coord_std = ref_mean, ref_std
+        else:
+            coord_mean = coords_train.mean(dim=0)
+            coord_std  = coords_train.std(dim=0).clamp(min=1e-8)
         y_train_norm, coords_train_std = _normalize_with_train_stats(
             y_train_logged, coords_train, col_means, col_stds, coord_mean, coord_std,
         )
@@ -743,10 +1182,13 @@ def main():
             lipid_filter=lipid_filter,
         )
 
-        # ---- Render per-lipid composites ----
+        # ---- Render per-lipid composites + diagnostics ----
+        # Parity with MaldiExperiment.render_reconstruction: the composite PNGs
+        # AND the per-lipid diagnostics (value distribution + true-vs-pred
+        # scatter, linear & log) computed from the held-out TEST points.
+        output_dir = config.exp_path / "renders"
         try:
             from render_lipid_volumes import render_selected_lipids
-            output_dir = config.exp_path / "renders"
             render_selected_lipids(
                 template_volume=template_volume,
                 volume_dir=volume_path,
@@ -755,10 +1197,13 @@ def main():
                 lipid_indices=(list(lipid_filter)
                                 if lipid_filter is not None else None),
                 suffix=suffix,
+                n_rotation_frames=10,
             )
             logging.info(f"Renders written to {output_dir}")
         except Exception as e:
             logging.error(f"Rendering failed (reconstruction still saved): {e}")
+
+        _render_diagnostics(config, output_dir, lipid_filter)
 
     logging.info("Done.")
 
