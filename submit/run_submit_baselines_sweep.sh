@@ -47,7 +47,7 @@ PLAIN_MODELS=(${PLAIN_MODELS:-mean linear mlp xgboost})
 
 # --- Run config -------------------------------------------------------------
 N_EPOCHS=${N_EPOCHS:-100}
-GCN_FAISS_ITERS=${GCN_FAISS_ITERS:-2000}
+GCN_FAISS_ITERS=${GCN_FAISS_ITERS:-20000}
 STRIDE=${STRIDE:-4}
 FOLD=${FOLD:-fold-2}
 
