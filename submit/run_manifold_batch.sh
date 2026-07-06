@@ -47,14 +47,19 @@ FORCE_RECOMPUTE_GRAPH=${FORCE_RECOMPUTE_GRAPH:-0}
 N_LIST=${N_LIST:-sqrt}
 N_PROBE=${N_PROBE:-8}
 
-N_EPOCHS=20
+N_EPOCHS=50
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_16"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_long_cv"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
-S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_15annot.npy"
+# Atlas level: ATLAS_LEVEL=5|15 (default 15) selects the annotation volume on S3.
+# The run script keys graph/eigenvector caches by the file's stem, and tags the
+# output dir with it, so level5 vs level15 never collide. Re-invoke with a
+# different ATLAS_LEVEL to run the other level (upload level_5annot.npy to S3 first).
+ATLAS_LEVEL=${ATLAS_LEVEL:-5}
+S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_${ATLAS_LEVEL}annot.npy"
 S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
 S3_BG_TEMPLATE_NAME="brainglobe"
@@ -118,6 +123,10 @@ submit() {
         -e FORCE_RECOMPUTE_GRAPH="$FORCE_RECOMPUTE_GRAPH" \
         -e N_LIST="$N_LIST" \
         -e N_PROBE="$N_PROBE" \
+        -e CLUSTER_K="${CLUSTER_K:-64}" \
+        -e CLUSTER_SPATIAL_WEIGHT="${CLUSTER_SPATIAL_WEIGHT:-1.0}" \
+        -e CLUSTER_FIT_SUBSAMPLE="${CLUSTER_FIT_SUBSAMPLE:-40000}" \
+        -e CLUSTER_SEED="${CLUSTER_SEED:-0}" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 
@@ -134,10 +143,16 @@ submit() {
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.1 1.0)
 
-FOLDS=("fold-2")           # lowercase, dashed
+FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
 KNN_K=(15)
-MAN_KNN_METHODS=("faiss_atlas_weighted")
-MAN_INFLATIONS=(10 50)   # only used when knn_method=faiss_atlas_weighted
+# Graph methods to sweep. Override at submit time (space-separated), e.g.
+#   MAN_KNN_METHODS_STR="faiss faiss_cluster_weighted" ATLAS_LEVEL=5 ./submit/run_manifold_batch.sh
+#   'faiss'                = plain kNN, no prior
+#   'faiss_atlas_weighted' = atlas-region inflation (uses ATLAS_LEVEL's annotation volume)
+#   'faiss_cluster_weighted' = template-clustering inflation (no atlas; CLUSTER_* knobs)
+MAN_KNN_METHODS=(faiss faiss_atlas_weighted faiss_cluster_weighted)
+# Cross-region inflation, used by faiss_atlas_weighted AND faiss_cluster_weighted.
+MAN_INFLATIONS=(50)
 LAPLACIAN_NORMS=("randomwalk")
 GRAPH_BANDWIDTHS=(0.1)
 BUMP_SCALES=(1.0)
@@ -151,13 +166,14 @@ THRESHOLDS=(5)
 #   data      - k-means/fps/random over measured MALDI voxels
 #   blend     - density/MALDI blend over the strided graph (overrides the
 #               source); INDUCING_DENSITY_FRAC fixed at 0.8 (80/20).
-IND_SOURCES=("reference" "data" "blend")
+#IND_SOURCES=("reference" "data" "blend")
+IND_SOURCES=("blend")
 # Diffusion-scale sweep (manifold kernel). Each entry is "LEARN:INIT":
 #   LEARN = 0/1   -> is the multiplicative spectral scale learnable?
 #   INIT  = float -> its initial value (1.0 = identity; no eigenpair recompute).
 # LEARN=1 runs get a -learndiff suffix in EXP_NAME, so learned vs frozen don't
 # clobber each other. e.g. ("0:1.0" "1:1.0" "1:2.0") = baseline + two learned starts.
-DIFFUSION_SCALES=("0:1.0" "1:1.0")
+DIFFUSION_SCALES=("1:1.0")
 
 # Product ARD-Matern sweep (manifold kernel). Each entry is "ENABLE:NU":
 #   ENABLE = 0/1   -> multiply the Riemann kernel by an ambient ARD Euclidean Matern?
@@ -170,7 +186,8 @@ PRODUCT_ARD=("0:2.5")
 #   (1) stride=4, num_modes=1300
 #   (2) stride=8, num_modes=6000
 #STRIDE_NUM_MODES=("4:1300" "8:6000")
-STRIDE_NUM_MODES=("4:50" "4:100" "4:300" "4:1300" "4:2300")
+#STRIDE_NUM_MODES=("4:50" "4:100" "4:300" "4:1300" "4:2300")
+STRIDE_NUM_MODES=("4:100" "4:300")
 
 # Fixed across the whole sweep
 TEMPLATE="reference"
@@ -211,7 +228,7 @@ for fold in "${FOLDS[@]}"; do
                                                 INDUCING_DENSITY_FRAC=0.8
                                                 ind_source_arg=$ind_src
                                             fi
-                                            if [ "$knn_method" = "faiss_atlas_weighted" ]; then
+                                            if [ "$knn_method" = "faiss_atlas_weighted" ] || [ "$knn_method" = "faiss_cluster_weighted" ]; then
                                                 infl_list=("${MAN_INFLATIONS[@]}")
                                             else
                                                 infl_list=(1)
