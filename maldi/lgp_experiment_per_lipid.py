@@ -2348,7 +2348,7 @@ def render_trained_lipids(out_root, args, lipid_names_all, lipid_idx_to_fit, log
     batch that hasn't run yet) are skipped.
     """
     from render_lipid_volumes import (
-        render_selected_lipids, render_lipid_diagnostics,
+        render_selected_lipids, render_lipid_diagnostics, render_error_slice,
     )
 
     meta_path = out_root / "graph_meta.npz"
@@ -2440,6 +2440,18 @@ def render_trained_lipids(out_root, args, lipid_names_all, lipid_idx_to_fit, log
                 )
             except Exception as ex:
                 log.warning(f"render: diagnostics for {name} failed ({ex}).")
+            # One MALDI section as a reconstruction-error heatmap, from the same
+            # held-out TEST points (physical mm coords saved alongside).
+            coords_f = lip_dir / "test_coords_mm.npy"
+            if coords_f.exists():
+                try:
+                    render_error_slice(
+                        np.load(coords_f), true_v, pred_v, name,
+                        render_dir / f"{name}_error_slice.png",
+                        axis_labels=("xccf", "yccf", "zccf"),
+                    )
+                except Exception as ex:
+                    log.warning(f"render: error-slice for {name} failed ({ex}).")
 
     log.info(f"render: done -> {render_dir}")
 

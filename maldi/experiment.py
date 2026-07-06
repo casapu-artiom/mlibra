@@ -931,7 +931,7 @@ class MaldiExperiment:
         """Render per-lipid composite PNGs after reconstruction. Honors the
         same lipid filter resolution as whole_brain_reconstruction."""
         from render_lipid_volumes import (
-            render_selected_lipids, render_lipid_diagnostics,
+            render_selected_lipids, render_lipid_diagnostics, render_error_slice,
         )
         suffix = "_diffusion" if self.config.use_diffusion else region_suffix
         renders_dir = self.config.exp_path / "renders"
@@ -962,6 +962,15 @@ class MaldiExperiment:
                     render_lipid_diagnostics(
                         true_te[:, gi], pred_te[:, gi], str(names[gi]),
                         renders_dir / f"{names[gi]}_diagnostics.png",
+                    )
+                # One MALDI section as a reconstruction-error heatmap, from the
+                # same held-out TEST points (row-aligned ccf mm coordinates).
+                coords_te = self.ccf_test
+                for gi in filt:
+                    render_error_slice(
+                        coords_te, true_te[:, gi], pred_te[:, gi], str(names[gi]),
+                        renders_dir / f"{names[gi]}_error_slice.png",
+                        axis_labels=("xccf", "yccf", "zccf"),
                     )
             else:
                 logging.warning("Skipping diagnostics: test predictions/true "

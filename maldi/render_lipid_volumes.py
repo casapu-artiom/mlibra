@@ -315,6 +315,107 @@ def render_lipid_diagnostics(
     plt.close(fig)
 
 
+def _pick_section(coords: np.ndarray):
+    """Guess which axis the MALDI sections run along and pick the densest one.
+
+    MALDI is measured section-by-section: along the sectioning axis the
+    coordinates collapse onto a few discrete planes, while the two in-plane axes
+    are quasi-continuous. So the section axis is the one whose values occupy the
+    fewest bins (here 50 bins across each axis' range). Returns
+    ``(section_axis, in_plane_axes, plane_mask)`` where ``plane_mask`` selects the
+    single densest section.
+    """
+    occupancy, binned = [], []
+    for a in range(3):
+        col = coords[:, a]
+        lo, hi = float(col.min()), float(col.max())
+        res = max((hi - lo) / 50.0, 1e-9)
+        b = np.round((col - lo) / res).astype(np.int64)
+        binned.append(b)
+        occupancy.append(np.unique(b).size)
+    saxis = int(np.argmin(occupancy))
+    vals, counts = np.unique(binned[saxis], return_counts=True)
+    plane_bin = vals[int(np.argmax(counts))]
+    plane_mask = binned[saxis] == plane_bin
+    in_plane = [a for a in range(3) if a != saxis]
+    return saxis, in_plane, plane_mask
+
+
+def render_error_slice(
+    coords: np.ndarray,
+    true_vals: np.ndarray,
+    pred_vals: np.ndarray,
+    lipid_name: str,
+    out_path: Path,
+    axis_labels: Sequence[str] = ("x", "y", "z"),
+    dpi: int = 150,
+):
+    """One MALDI section shown as a reconstruction-error heatmap.
+
+    Scatters the held-out TEST measurements of a single densest section, colored
+    by the SIGNED error ``pred - true`` (raw intensity units) on a diverging
+    colormap centered at 0 — blue = under-prediction, red = over-prediction. The
+    companion middle/right panels show the true and predicted intensity on the
+    same section for context (shared sequential scale).
+
+    ``coords`` is ``(N, 3)`` paired row-for-row with ``true_vals`` / ``pred_vals``
+    — either physical mm (``*ccf``) or integer voxel indices; the units only set
+    the axis ticks. The section axis is inferred from the coordinate geometry.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    true_vals = np.asarray(true_vals, dtype=np.float64).ravel()
+    pred_vals = np.asarray(pred_vals, dtype=np.float64).ravel()
+    finite = (np.isfinite(true_vals) & np.isfinite(pred_vals)
+              & np.all(np.isfinite(coords), axis=1))
+    coords, true_vals, pred_vals = coords[finite], true_vals[finite], pred_vals[finite]
+    if coords.shape[0] == 0:
+        logging.warning(f"error-slice: {lipid_name} has no finite paired "
+                        f"values; skipping.")
+        return
+
+    saxis, in_plane, plane_mask = _pick_section(coords)
+    ax0, ax1 = in_plane
+    x = coords[plane_mask, ax0]
+    y = coords[plane_mask, ax1]
+    true_s = true_vals[plane_mask]
+    pred_s = pred_vals[plane_mask]
+    err = pred_s - true_s
+    if err.size == 0:
+        logging.warning(f"error-slice: {lipid_name} densest section is empty; "
+                        f"skipping.")
+        return
+
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    emax = float(np.percentile(np.abs(err), 99)) or float(np.abs(err).max()) or 1.0
+    vlo = float(min(true_s.min(), pred_s.min()))
+    vhi = float(max(true_s.max(), pred_s.max()))
+    lbl = str(axis_labels[saxis]) if saxis < len(axis_labels) else f"axis{saxis}"
+    plane_pos = float(np.median(coords[plane_mask, saxis]))
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6), facecolor="white")
+    fig.suptitle(f"Lipid {lipid_name} — error heatmap on densest MALDI section "
+                 f"({lbl}≈{plane_pos:.3g}, n={err.size:,}, RMSE={rmse:.3g})",
+                 fontsize=13)
+    marker = max(4, min(40, int(30000 / max(err.size, 1))))
+
+    def _panel(ax, c, cmap, vmin, vmax, title):
+        sc = ax.scatter(x, y, c=c, cmap=cmap, vmin=vmin, vmax=vmax,
+                        s=marker, marker="s", linewidths=0)
+        ax.set_aspect("equal"); ax.set_title(title)
+        ax.set_xlabel(str(axis_labels[ax0]) if ax0 < len(axis_labels) else f"axis{ax0}")
+        ax.set_ylabel(str(axis_labels[ax1]) if ax1 < len(axis_labels) else f"axis{ax1}")
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+
+    _panel(axs[0], true_s, "inferno", vlo, vhi, "True")
+    _panel(axs[1], pred_s, "inferno", vlo, vhi, "Predicted")
+    _panel(axs[2], err, "RdBu_r", -emax, emax, "Error (pred − true)")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=dpi, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+
+
 def render_selected_lipids(
     template_volume,
     volume_dir: Path,

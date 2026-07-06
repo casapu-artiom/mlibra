@@ -6,8 +6,9 @@ A "batch directory" (e.g. ``experiment_batch_16`` / ``experiment_batch_long_cv``
 holds one sub-directory per trained model. This script walks it, finds every
 model, and for each renders whatever is missing under ``<model>/renders/``:
 
-    <model>/renders/<name>_multi_panel.png    # <- the "lipid render"
+    <model>/renders/<name>_multi_panel.png    # <- the "lipid render" (volume)
     <model>/renders/<name>_diagnostics.png    # <- the "scatterplot"
+    <model>/renders/<name>_error_slice.png    # <- one MALDI section, error heatmap
 
 It understands BOTH on-disk layouts the pipeline produces:
 
@@ -58,7 +59,7 @@ from pathlib import Path
 import numpy as np
 
 from render_lipid_volumes import (
-    render_selected_lipids, render_lipid_diagnostics,
+    render_selected_lipids, render_lipid_diagnostics, render_error_slice,
 )
 
 log = logging.getLogger("render_missing")
@@ -127,6 +128,25 @@ def load_names_list(path: str | None):
         return None
 
 
+def load_joint_coords(model: Path):
+    """Row-aligned coordinates for the joint-LGP test points, from
+    ``test/coordinates_pixel_index.pth`` (integer voxel index, preferred) or
+    ``test/coordinates.pth`` (physical mm). Returns (coords:(N,3), axis_labels)
+    or (None, None) if neither is present."""
+    for fn, labels in (("coordinates_pixel_index.pth", ("x_index", "y_index", "z_index")),
+                       ("coordinates.pth", ("xccf", "yccf", "zccf"))):
+        p = model / "test" / fn
+        if p.exists():
+            try:
+                import torch
+                t = torch.load(p, map_location="cpu")
+                arr = t.numpy() if hasattr(t, "numpy") else np.asarray(t)
+                return np.asarray(arr, dtype=np.float64), labels
+            except Exception as ex:   # noqa: BLE001
+                log.warning(f"{model.name}: couldn't read test/{fn} ({ex}).")
+    return None, None
+
+
 def load_lipid_selection(lipids, lipids_file) -> set[str] | None:
     """The set of lipid names to render, from ``--lipids`` and/or
     ``--lipids-file``. Returns None when neither is given (= render every lipid).
@@ -188,7 +208,7 @@ def find_models(batch_dir: Path) -> list[tuple[Path, str]]:
 def process_perlipid(model: Path, only: str, force: bool, max_lipids: int,
                      dry_run: bool, wanted: set[str] | None) -> dict:
     stats = {"model": model.name, "kind": "perlipid", "volumes": 0,
-             "scatters": 0, "skipped": 0, "no_pred": 0}
+             "scatters": 0, "errors": 0, "skipped": 0, "no_pred": 0}
 
     args = json.loads((model / "config.json").read_text())
     ref_file = args.get("reference_file")
@@ -252,7 +272,10 @@ def process_perlipid(model: Path, only: str, force: bool, max_lipids: int,
                 touched = True
 
         diag_png = render_dir / f"{name}_diagnostics.png"
-        if do_scatter and (force or not diag_png.exists()):
+        err_png = render_dir / f"{name}_error_slice.png"
+        need_diag = do_scatter and (force or not diag_png.exists())
+        need_err = do_scatter and (force or not err_png.exists())
+        if need_diag or need_err:
             tz, pz, pr = (lip_dir / "test_true_z.npy",
                           lip_dir / "test_pred_z.npy",
                           lip_dir / "test_pred_raw.npy")
@@ -261,17 +284,26 @@ def process_perlipid(model: Path, only: str, force: bool, max_lipids: int,
                 aff = recover_affine(np.load(pz), pred_raw)
                 if aff is None:
                     log.warning(f"{model.name}/{name}: degenerate preds; "
-                                f"skipping scatter.")
+                                f"skipping scatter/error.")
                 else:
                     cs, cm = aff
                     true_v = np.load(tz).astype(np.float64) * cs + cm
                     pred_v = pred_raw
                     if log_transform:
                         true_v, pred_v = np.exp(true_v) - 1e-10, np.exp(pred_v) - 1e-10
-                    if not dry_run:
-                        _safe_diag(true_v, pred_v, name, diag_png, model)
-                    stats["scatters"] += 1
-                    touched = True
+                    if need_diag:
+                        if not dry_run:
+                            _safe_diag(true_v, pred_v, name, diag_png, model)
+                        stats["scatters"] += 1
+                        touched = True
+                    coords_f = lip_dir / "test_coords_mm.npy"
+                    if need_err and coords_f.exists():
+                        if not dry_run:
+                            _safe_err(np.load(coords_f), true_v, pred_v, name,
+                                      err_png, model,
+                                      labels=("xccf", "yccf", "zccf"))
+                        stats["errors"] += 1
+                        touched = True
 
         if touched:
             n_done += 1
@@ -288,7 +320,7 @@ def process_joint(model: Path, only: str, force: bool, max_lipids: int,
                   dry_run: bool, template_full, names_list,
                   wanted: set[str] | None) -> dict:
     stats = {"model": model.name, "kind": "joint", "volumes": 0,
-             "scatters": 0, "skipped": 0, "no_pred": 0}
+             "scatters": 0, "errors": 0, "skipped": 0, "no_pred": 0}
     render_dir = model / "renders"
     do_volume = only in ("both", "volume")
     do_scatter = only in ("both", "scatter")
@@ -331,6 +363,7 @@ def process_joint(model: Path, only: str, force: bool, max_lipids: int,
     # Volumes to (re)render, grouped by (volume_dir, suffix) for one batched call.
     groups: dict[tuple[Path, str], list[str]] = {}
     scatter_names: list[str] = []
+    errslice_names: list[str] = []
     n_done = 0
     for name in candidates:
         if max_lipids and n_done >= max_lipids:
@@ -343,9 +376,11 @@ def process_joint(model: Path, only: str, force: bool, max_lipids: int,
                 stats["volumes"] += 1
                 touched = True
         if do_scatter and name in scatterable:
-            diag_png = render_dir / f"{name}_diagnostics.png"
-            if force or not diag_png.exists():
+            if force or not (render_dir / f"{name}_diagnostics.png").exists():
                 scatter_names.append(name)
+                touched = True
+            if force or not (render_dir / f"{name}_error_slice.png").exists():
+                errslice_names.append(name)
                 touched = True
         if touched:
             n_done += 1
@@ -364,6 +399,21 @@ def process_joint(model: Path, only: str, force: bool, max_lipids: int,
             _safe_diag(true_te[:, gi], pred_te[:, gi], name,
                        render_dir / f"{name}_diagnostics.png", model)
         stats["scatters"] += 1
+
+    # Error-slice PNGs — need the row-aligned test coordinates.
+    if errslice_names:
+        coords, coord_labels = load_joint_coords(model)
+        if coords is None:
+            log.warning(f"{model.name}: no test/coordinates[_pixel_index].pth; "
+                        f"skipping {len(errslice_names)} error-slice(s).")
+        else:
+            for name in errslice_names:
+                if not dry_run:
+                    gi = name_to_col[name]
+                    _safe_err(coords, true_te[:, gi], pred_te[:, gi], name,
+                              render_dir / f"{name}_error_slice.png", model,
+                              labels=coord_labels)
+                stats["errors"] += 1
 
     # Explain a common surprise: scatter requested but nothing was mappable.
     if do_scatter and not scatter_names and not can_scatter:
@@ -388,6 +438,16 @@ def _safe_diag(true_v, pred_v, name, out_path, model):
                                  str(name), out_path)
     except Exception as ex:   # noqa: BLE001 — a plot hiccup must not abort the run
         log.warning(f"{model.name}/{name}: diagnostics failed ({ex}).")
+
+
+def _safe_err(coords, true_v, pred_v, name, out_path, model,
+              labels=("x", "y", "z")):
+    try:
+        render_error_slice(np.asarray(coords), np.asarray(true_v),
+                           np.asarray(pred_v), str(name), out_path,
+                           axis_labels=labels)
+    except Exception as ex:   # noqa: BLE001 — a plot hiccup must not abort the run
+        log.warning(f"{model.name}/{name}: error-slice failed ({ex}).")
 
 
 def _flush_volumes(names, anatomy, volume_dir, render_dir, suffix, force, dry_run):
@@ -480,7 +540,7 @@ def main() -> int:
         log.info(f"  - [{kind:8s}] {rel}")
 
     tag = "[dry-run] " if args.dry_run else ""
-    totals = {"volumes": 0, "scatters": 0, "skipped": 0}
+    totals = {"volumes": 0, "scatters": 0, "errors": 0, "skipped": 0}
     for m, kind in models:
         if kind == "perlipid":
             s = process_perlipid(m, args.only, args.force, args.max_lipids,
@@ -489,13 +549,14 @@ def main() -> int:
             s = process_joint(m, args.only, args.force, args.max_lipids,
                               args.dry_run, template_full, names_list, wanted)
         log.info(f"{tag}{s['model']} ({s['kind']}): {s['volumes']} volume(s), "
-                 f"{s['scatters']} scatter(s), {s['skipped']} up-to-date, "
-                 f"{s['no_pred']} without predictions.")
+                 f"{s['scatters']} scatter(s), {s['errors']} error-slice(s), "
+                 f"{s['skipped']} up-to-date, {s['no_pred']} without predictions.")
         for k in totals:
             totals[k] += s[k]
 
     log.info(f"{tag}DONE — {totals['volumes']} volume render(s), "
-             f"{totals['scatters']} scatter(s) across {len(models)} model(s).")
+             f"{totals['scatters']} scatter(s), {totals['errors']} error-slice(s) "
+             f"across {len(models)} model(s).")
     return 0
 
 
