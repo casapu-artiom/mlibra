@@ -311,15 +311,28 @@ def process_joint(model: Path, only: str, force: bool, max_lipids: int,
     if tp.exists() and tt.exists():
         pred_te, true_te = np.load(tp), np.load(tt)
 
+    # Volumes and scatterplots are INDEPENDENT here: the joint LGP only writes a
+    # curated SUBSET of lipids as volume/*_volume.npy, but test/*.npy holds EVERY
+    # lipid (columns ordered by names_list). So a lipid can get a scatter with no
+    # volume, and vice-versa — don't gate one on the other.
+    name_to_col = ({n: i for i, n in enumerate(names_list)}
+                   if names_list is not None else {})
+    can_scatter = bool(name_to_col) and true_te is not None and pred_te is not None
+    scatterable = {n for n, i in name_to_col.items()
+                   if can_scatter and i < true_te.shape[1]}
+
+    if wanted is not None:
+        candidates = sorted(wanted)
+    else:
+        # Everything we could possibly render: reconstructed volumes + every
+        # lipid present in the test arrays.
+        candidates = sorted(set(vol_entries) | scatterable)
+
     # Volumes to (re)render, grouped by (volume_dir, suffix) for one batched call.
     groups: dict[tuple[Path, str], list[str]] = {}
     scatter_names: list[str] = []
-    render_targets = list(vol_entries) if vol_entries else \
-        (list(names_list) if (names_list and true_te is not None) else [])
-    if wanted is not None:
-        render_targets = [n for n in render_targets if n in wanted]
     n_done = 0
-    for name in render_targets:
+    for name in candidates:
         if max_lipids and n_done >= max_lipids:
             break
         touched = False
@@ -329,7 +342,7 @@ def process_joint(model: Path, only: str, force: bool, max_lipids: int,
                 groups.setdefault(vol_entries[name], []).append(name)
                 stats["volumes"] += 1
                 touched = True
-        if do_scatter:
+        if do_scatter and name in scatterable:
             diag_png = render_dir / f"{name}_diagnostics.png"
             if force or not diag_png.exists():
                 scatter_names.append(name)
@@ -344,28 +357,27 @@ def process_joint(model: Path, only: str, force: bool, max_lipids: int,
         _flush_volumes(names, template_full, vol_dir, render_dir,
                        suffix=suffix, force=force, dry_run=dry_run)
 
-    # Scatter PNGs — need the ordered names to map name -> test column.
-    if do_scatter and scatter_names:
-        if true_te is None or pred_te is None:
-            log.warning(f"{model.name}: no test/predictions to make scatterplots.")
-            stats["scatters"] = 0
-        elif not names_list:
-            log.warning(f"{model.name}: --available-lipids-file not given, can't "
-                        f"map lipids to test columns; skipping {len(scatter_names)} "
-                        f"scatterplot(s).")
-            stats["scatters"] = 0
+    # Scatter PNGs (names already known to map to a test column via `scatterable`).
+    for name in scatter_names:
+        if not dry_run:
+            gi = name_to_col[name]
+            _safe_diag(true_te[:, gi], pred_te[:, gi], name,
+                       render_dir / f"{name}_diagnostics.png", model)
+        stats["scatters"] += 1
+
+    # Explain a common surprise: scatter requested but nothing was mappable.
+    if do_scatter and not scatter_names and not can_scatter:
+        if true_te is None:
+            log.warning(f"{model.name}: no test/{{predictions,true_values}}.npy — "
+                        f"can't make scatterplots.")
         else:
-            name_to_col = {n: i for i, n in enumerate(names_list)}
-            for name in scatter_names:
-                gi = name_to_col.get(name)
-                if gi is None or gi >= true_te.shape[1]:
-                    log.warning(f"{model.name}/{name}: not in names list / test "
-                                f"columns; skipping scatter.")
-                    continue
-                if not dry_run:
-                    _safe_diag(true_te[:, gi], pred_te[:, gi], name,
-                               render_dir / f"{name}_diagnostics.png", model)
-                stats["scatters"] += 1
+            log.warning(f"{model.name}: --available-lipids-file not given, can't "
+                        f"map lipids to test columns; skipping scatterplots.")
+    elif do_scatter and wanted is not None:
+        missing = [n for n in wanted if n not in scatterable]
+        if missing and can_scatter:
+            log.warning(f"{model.name}: requested lipid(s) not in test columns: "
+                        f"{missing}")
     return stats
 
 
