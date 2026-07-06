@@ -241,10 +241,14 @@ run_one() {
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
-    # Atlas methods: encode WHICH annotation volume (level_5annot vs level_15annot) so
-    # level5 vs level15 runs get distinct output dirs. Only for atlas methods.
+    # Atlas methods: encode WHICH annotation volume so level5 vs level15 get distinct
+    # dirs. The historical default (level_15annot) gets NO suffix, so existing dir names
+    # / caches stay valid; any other level is tagged. Mirrors the Python key logic.
     case "$KMETHOD_" in
-        faiss_atlas_weighted|anatomical_atlas) TAG="${TAG}-$(basename "$ANNOTATION_FILE" .npy)" ;;
+        faiss_atlas_weighted|anatomical_atlas)
+            _atlas_stem="$(basename "$ANNOTATION_FILE" .npy)"
+            [ "$_atlas_stem" != "level_15annot" ] && TAG="${TAG}-$_atlas_stem"
+            ;;
     esac
     # Learned vs anchored inducing points → distinct output dirs (both families).
     [ "$LEARN_INDUCING" = "1" ] && TAG="${TAG}-learnind"

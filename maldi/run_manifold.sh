@@ -177,12 +177,14 @@ if [ "$KNN_METHOD" = "faiss_cluster_weighted" ]; then
     EXP_NAME="$EXP_NAME-clk$CLUSTER_K-sw$CLUSTER_SPATIAL_WEIGHT-cs$CLUSTER_SEED"
 fi
 
-# Atlas methods: encode WHICH annotation volume (e.g. level_5annot vs level_15annot)
-# in the dir name so level5 vs level15 runs don't clobber each other. Only for atlas
-# methods, so non-atlas dir names stay unchanged. Matches the Python cache-key logic.
+# Atlas methods: encode WHICH annotation volume in the dir name so level5 vs level15
+# runs don't clobber. The historical default (level_15annot) gets NO suffix, so its
+# dir names — and thus existing checkpoints/caches — stay valid; any other level is
+# tagged. Mirrors the Python cache-key _legacy_atlas logic exactly.
 case "$KNN_METHOD" in
     faiss_atlas_weighted|anatomical_atlas)
-        EXP_NAME="$EXP_NAME-$(basename "$ANNOTATION_FILE" .npy)"
+        _atlas_stem="$(basename "$ANNOTATION_FILE" .npy)"
+        [ "$_atlas_stem" != "level_15annot" ] && EXP_NAME="$EXP_NAME-$_atlas_stem"
         ;;
 esac
 
