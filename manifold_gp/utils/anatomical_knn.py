@@ -396,3 +396,105 @@ def labels_for_nodes_from_sub_atlas(
         )
     mask = sub_volume > threshold
     return sub_atlas[mask].astype(np.int64)
+
+
+def labels_for_nodes_from_template_clustering(
+    sub_volume: np.ndarray,
+    threshold: float,
+    n_clusters: int,
+    spatial_weight: float = 1.0,
+    fit_subsample: int = 40000,
+    seed: int = 0,
+    niter: int = 25,
+) -> np.ndarray:
+    """Derive node labels by clustering the reference TEMPLATE with faiss k-means.
+
+    A data-driven, whole-brain, lipid-free replacement for the anatomical atlas
+    as the label source for ``inflate_cross_region_edges``. Uses only image
+    structure of ``sub_volume`` (no atlas, no lipids), so it is defined everywhere
+    the template is and needs no imputation.
+
+    Node order matches the graph's: voxels where ``sub_volume > threshold`` in
+    numpy C-order — the SAME ordering as ``labels_for_nodes_from_sub_atlas`` and
+    the faiss node set, so the returned labels line up with ``knn.x``.
+
+    Clustering: faiss ``Kmeans`` (GPU if available) over a joint feature space of
+      [ ``spatial_weight`` * z-scored (z,y,x) coords , z-scored template features ]
+    where the template features are intensity + local gradient magnitude + local
+    mean + local std. The coordinate block makes clusters spatially COMPACT — the
+    larger ``spatial_weight``, the more contiguous (anatomy-like) the regions; at
+    0 it is pure feature k-means (speckly). k-means does not *guarantee* connected
+    regions the way constrained Ward does, but faiss makes it GPU-fast and avoids
+    the scipy/sklearn CPU path. Deterministic given ``seed``.
+
+    Args:
+      sub_volume:     strided reference template (grayscale intensity).
+      threshold:      tissue threshold used to build the node set.
+      n_clusters:     number of regions (K). For a matched comparison vs the atlas
+                      pass the atlas's region count.
+      spatial_weight: weight on the (z-scored) coordinate block. Higher = more
+                      spatially compact/contiguous; 0 = pure feature clustering.
+      fit_subsample:  random sample of nodes used to TRAIN the centroids (all
+                      nodes are then assigned). <=0 or >= N trains on all nodes.
+      seed:           RNG seed for k-means init + the training subsample. Make it
+                      part of any graph cache key so runs stay reproducible.
+      niter:          k-means iterations.
+
+    Returns:
+      labels: (N,) int64 array, one region id per node, in node order.
+    """
+    import faiss
+    from scipy import ndimage
+
+    mask = sub_volume > threshold
+    zc, yc, xc = np.where(mask)
+    node_idx = np.stack([zc, yc, xc], axis=1).astype(np.float32)   # (N,3), node order
+    n_nodes = node_idx.shape[0]
+
+    vol = sub_volume.astype(np.float32)
+    gmag = ndimage.gaussian_gradient_magnitude(vol, sigma=1.0)
+    lmean = ndimage.uniform_filter(vol, size=3)
+    lstd = np.sqrt(np.maximum(ndimage.uniform_filter(vol ** 2, size=3) - lmean ** 2, 0.0))
+    feats = np.stack(
+        [vol[zc, yc, xc], gmag[zc, yc, xc], lmean[zc, yc, xc], lstd[zc, yc, xc]],
+        axis=1,
+    ).astype(np.float32)
+    feats = (feats - feats.mean(0)) / (feats.std(0) + 1e-8)
+
+    coords_z = (node_idx - node_idx.mean(0)) / (node_idx.std(0) + 1e-8)
+    X = np.ascontiguousarray(
+        np.hstack([float(spatial_weight) * coords_z, feats]), dtype=np.float32
+    )
+    d = X.shape[1]
+
+    rng = np.random.default_rng(seed)
+    m = int(fit_subsample) if 0 < int(fit_subsample) < n_nodes else n_nodes
+    train = X if m >= n_nodes else X[rng.choice(n_nodes, m, replace=False)]
+
+    try:
+        use_gpu = faiss.get_num_gpus() > 0
+    except Exception:
+        use_gpu = False
+    km = faiss.Kmeans(
+        d, int(n_clusters), niter=int(niter), seed=int(seed),
+        gpu=use_gpu, verbose=False,
+    )
+    km.train(np.ascontiguousarray(train, dtype=np.float32))
+
+    # Assign every node to its nearest centroid in NUMPY (not faiss .index.search):
+    # K is small so this is cheap, and it avoids the faiss-CPU search path that
+    # can memory-fault alongside torch in some envs. argmin over ||x - c||^2 via
+    # the (||c||^2 - 2 x·c) reduction (||x||^2 is constant per row).
+    C = np.ascontiguousarray(km.centroids, dtype=np.float32).reshape(int(n_clusters), d)
+    c_sq = (C ** 2).sum(1)
+    labels = np.empty(n_nodes, dtype=np.int64)
+    step = 200_000
+    for s in range(0, n_nodes, step):
+        block = X[s:s + step]
+        scores = c_sq[None, :] - 2.0 * (block @ C.T)   # (b, K), monotone in distance
+        labels[s:s + block.shape[0]] = np.argmin(scores, axis=1)
+    logging.info(
+        f"template k-means: {n_nodes} nodes -> {n_clusters} regions "
+        f"(train on {m}, spatial_weight={spatial_weight}, gpu={use_gpu}, seed={seed})"
+    )
+    return labels

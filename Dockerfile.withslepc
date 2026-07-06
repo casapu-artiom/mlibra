@@ -1,0 +1,40 @@
+# SLEPc-enabled image: layers PETSc + SLEPc + MUMPS on top of the base maldi
+# image so the CPU-heavy shift-invert eigensolver (slepc/slepc_eigensolve.py)
+# can run on the cluster. Everything else (faiss, torch, the venv, the entry-
+# point) is inherited from the base, so this only adds the eigensolver toolchain.
+#
+# Build (from the repo root, so the COPY can see slepc/):
+#     docker build -f Dockerfile.withslepc -t artiomartiom/sdsc:maldi_manifold_slepc .
+#
+# The base must already be built/pulled; override it with --build-arg if needed.
+
+ARG BASE_IMAGE=artiomartiom/sdsc:withfaiss
+FROM ${BASE_IMAGE} AS slepc
+
+USER root
+
+# PETSc/SLEPc build needs gfortran + an MPI (the base has gcc/g++/make/cmake/curl
+# via build-essential, but neither a Fortran compiler nor MPI). openmpi-bin also
+# provides the `mpirun` the eigensolver entrypoint shells out to at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gfortran openmpi-bin libopenmpi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build PETSc + SLEPc + MUMPS from source and install petsc4py/slepc4py into the
+# inherited /opt/venv (on PATH from the base image). WITH_MUMPS=1 is what makes
+# the 64-bit parallel direct solver available for the shift-invert path.
+# PREFIX=/opt installs the libs to /opt/petsc and /opt/slepc.
+COPY slepc/build_slepc_petsc.sh /tmp/build_slepc_petsc.sh
+RUN PREFIX=/opt WITH_MUMPS=1 bash /tmp/build_slepc_petsc.sh \
+    && rm -f /tmp/build_slepc_petsc.sh
+
+# Make the prefix installs discoverable at runtime: PETSC_DIR/SLEPC_DIR for the
+# python bindings, LD_LIBRARY_PATH so the loader finds libpetsc/libslepc (+ the
+# bundled MUMPS/ScaLAPACK/metis shared objects).
+ENV PETSC_DIR=/opt/petsc
+ENV SLEPC_DIR=/opt/slepc
+ENV LD_LIBRARY_PATH=/opt/petsc/lib:/opt/slepc/lib:${LD_LIBRARY_PATH}
+
+# The build wrote new files into /opt/venv as root; hand them back to the app
+# user (the base created it and runs as it).
+RUN chown -R ${APP_USER}:${APP_GID} /opt/venv

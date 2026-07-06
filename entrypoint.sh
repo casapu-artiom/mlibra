@@ -29,36 +29,9 @@ chmod 700 "$ssh_dir"
 [ -f "$ssh_dir/authorized_keys" ] && chmod 600 "$ssh_dir/authorized_keys"
 chown -R "${APP_USER}:${APP_GID}" "$ssh_dir"
 
-FAISS_DIR="/myhome/faiss"
-FAISS_VERSION="v1.14.1"
-CUDA_ARCHS="80;86;89;90;120"
-
-if [ -d "$FAISS_DIR/build" ]; then
-    echo "[entrypoint] Faiss build directory found. Skipping compilation and installing..."
-    cd "$FAISS_DIR"
-else
-    echo "[entrypoint] Faiss not built. Starting full compilation..."
-    git clone --depth 1 --branch ${FAISS_VERSION} https://github.com/facebookresearch/faiss.git "$FAISS_DIR"
-    cd "$FAISS_DIR"
-    
-    # 1. Configure and Build
-    cmake -B build . \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DFAISS_ENABLE_GPU=ON \
-        -DFAISS_ENABLE_PYTHON=ON \
-        -DBUILD_SHARED_LIBS=ON \
-        -DFAISS_OPT_LEVEL=avx2 \
-        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
-        -DPython_EXECUTABLE=$(which python)
-    
-    make -C build -j"$(nproc)" faiss faiss_avx2 swigfaiss swigfaiss_avx2
-fi
-
-# 2. Always Install (This links the existing build to the current container)
-echo "[entrypoint] Registering Faiss with system..."
-make -C build install
-(cd build/faiss/python && python setup.py install)
-ldconfig
+# ---- Faiss ----
+# faiss is now compiled and installed at image build time (see Dockerfile);
+# no per-boot compilation needed.
 
 # ---- Maldi Repo Check and Install ----
 if [ ! -d /myhome/mlibra ]; then

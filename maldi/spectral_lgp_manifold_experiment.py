@@ -35,6 +35,7 @@ from manifold_gp.utils.nearest_neighbors import (
 )
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
+    labels_for_nodes_from_template_clustering,
 )
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from l3di.lgp_manifold import SpectralLatentGP, SpectralManifoldLGP
@@ -78,19 +79,32 @@ def parse_args():
     parser.add_argument("--load-args", dest="load_args", action='store_true', help="Load arguments from a file instead of command line.")
     parser.add_argument("--use-diffusion", dest="use_diffusion", action='store_true', help="Use diffusion model in the experiment.")
     parser.add_argument("--knn-method", dest="knn_method", type=str, default="faiss",
-                        choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted"],
+                        choices=["faiss", "anatomical_atlas", "faiss_atlas_weighted",
+                                 "faiss_cluster_weighted"],
                         help=("'faiss': Euclidean kNN, no anatomical prior. "
                               "'anatomical_atlas': edges restricted to same atlas region + "
                               "voxel-adjacent cross-region links (strong but can produce "
                               "disconnected components → NaN). "
                               "'faiss_atlas_weighted': use the faiss kNN graph but INFLATE "
                               "squared distances on edges that cross atlas regions by "
-                              "--cross-region-inflation. Soft prior — graph stays connected."))
+                              "--cross-region-inflation. Soft prior — graph stays connected. "
+                              "'faiss_cluster_weighted': same soft inflation, but the region "
+                              "labels are CLUSTERED from the reference template (no atlas "
+                              "file needed) — data-driven, whole-brain, lipid-free."))
     parser.add_argument("--cross-region-inflation", dest="cross_region_inflation", type=float,
                         default=10.0,
-                        help=("For --knn-method=faiss_atlas_weighted only. "
+                        help=("For --knn-method=faiss_atlas_weighted|faiss_cluster_weighted. "
                               "Multiplier applied to squared distance on cross-region edges. "
                               "Default 10 = mild prior; 100 = strong prior."))
+    parser.add_argument("--cluster-k", dest="cluster_k", type=int, default=64,
+                        help="(faiss_cluster_weighted) number of template-clustering regions.")
+    parser.add_argument("--cluster-spatial-weight", dest="cluster_spatial_weight", type=float, default=1.0,
+                        help="(faiss_cluster_weighted) weight on (z-scored) coords in the k-means feature "
+                             "space; higher = more spatially compact/contiguous regions, 0 = pure feature k-means.")
+    parser.add_argument("--cluster-fit-subsample", dest="cluster_fit_subsample", type=int, default=40000,
+                        help="(faiss_cluster_weighted) nodes used to train the k-means centroids.")
+    parser.add_argument("--cluster-seed", dest="cluster_seed", type=int, default=0,
+                        help="(faiss_cluster_weighted) RNG seed for the template clustering.")
     parser.add_argument("--laplacian-norm", dest="laplacian_norm", type=str, default="symmetric",
                         choices=["symmetric", "randomwalk"])
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
@@ -232,13 +246,13 @@ def setup_experiment(args):
         # Augmented graphs have a different node set (and N) than strided-only
         # ones — key them separately so the KNN/eigenvector caches don't collide.
         graph_key_parts["augmaldi"] = int(reference_nodes.shape[0])
-        if knn_method in ("anatomical_atlas", "faiss_atlas_weighted"):
-            # These map nodes 1:1 back to strided atlas voxels for region
+        if knn_method in ("anatomical_atlas", "faiss_atlas_weighted", "faiss_cluster_weighted"):
+            # These map nodes 1:1 back to strided template voxels for region
             # labels; appended MALDI nodes break that mapping.
             raise ValueError(
                 f"--augment-maldi-nodes is only supported with --knn-method=faiss "
-                f"(got {knn_method!r}); atlas-label methods assume nodes == strided "
-                f"atlas voxels."
+                f"(got {knn_method!r}); atlas/cluster-label methods assume nodes == strided "
+                f"template voxels."
             )
 
     graph_key = make_graph_key(graph_key_parts)
@@ -316,6 +330,48 @@ def setup_experiment(args):
         # ---- 4. Re-key so the eigvec cache doesn't collide with
         #         vanilla faiss runs (same topology, different weights).
         graph_key_parts["weighting"] = f"atlas_x{inflation:g}"
+        graph_key = make_graph_key(graph_key_parts)
+    elif knn_method == "faiss_cluster_weighted":
+        # Same soft inflation, but node labels are CLUSTERED from the reference
+        # template itself (no annotations-file). Base topology = plain faiss graph.
+        base_key_parts = dict(graph_key_parts)
+        base_key_parts["method"] = "faiss"
+        base_key = make_graph_key(base_key_parts)
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=base_key,
+            method="faiss",
+            coords=reference_nodes,
+            k=knn_k,
+            nlist=nlist,
+            nprobe=nprobe,
+            extra=base_key_parts,
+            force_recompute=bool(args.get("force_recompute_graph", False)),
+            device=config.device,
+        )
+        cluster_k = int(args.get("cluster_k", 64))
+        sw = float(args.get("cluster_spatial_weight", 1.0))
+        cseed = int(args.get("cluster_seed", 0))
+        node_labels = labels_for_nodes_from_template_clustering(
+            sub_volume, threshold, n_clusters=cluster_k,
+            spatial_weight=sw,
+            fit_subsample=int(args.get("cluster_fit_subsample", 40000)),
+            seed=cseed,
+        )
+        if node_labels.shape[0] != knn.x.shape[0]:
+            raise RuntimeError(
+                f"Mismatch between clustered voxels ({node_labels.shape[0]}) "
+                f"and graph nodes ({knn.x.shape[0]}). Check the reference "
+                f"template stride/threshold."
+            )
+        inflation = float(args.get("cross_region_inflation", 10.0))
+        # treat_zero_as_cross=False: cluster id 0 is a real region, not background.
+        edge_index, edge_value, _info = inflate_cross_region_edges(
+            edge_index, edge_value, node_labels,
+            inflation=inflation, treat_zero_as_cross=False,
+        )
+        graph_key_parts["weighting"] = (
+            f"tmplclust_k{cluster_k}_sw{sw:g}_s{cseed}_x{inflation:g}"
+        )
         graph_key = make_graph_key(graph_key_parts)
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
