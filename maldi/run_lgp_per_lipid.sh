@@ -78,6 +78,13 @@
 : "${KNN_K:=15}"
 : "${KNN_METHOD:=faiss_atlas_weighted}"
 : "${CROSS_REGION_INFLATION:=50.0}"
+# Template-clustering node labels (--knn-method faiss_cluster_weighted): data-driven,
+# whole-brain, lipid-free labels clustered from the reference template (no ANNOTATION_FILE).
+# CROSS_REGION_INFLATION is reused as the cross-cluster inflation.
+: "${CLUSTER_K:=64}"
+: "${CLUSTER_SPATIAL_WEIGHT:=1.0}"
+: "${CLUSTER_FIT_SUBSAMPLE:=40000}"
+: "${CLUSTER_SEED:=0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
 # Cosine/correlation kernel (manifold only, 1=on): L2-normalize the Riemann
 # feature rows so the prior variance is constant (diagonal=1) and the
@@ -148,7 +155,10 @@
 : "${OUTPUT_DIR:=/home/casap/mlibra/output/per_lipid}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
-: "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
+# Atlas level convenience: ATLAS_LEVEL=5 or 15 selects level_${ATLAS_LEVEL}annot.npy
+# under DATA_PATH. Override ANNOTATION_FILE directly to use any other volume.
+: "${ATLAS_LEVEL:=15}"
+: "${ANNOTATION_FILE:=${DATA_PATH}/level_${ATLAS_LEVEL}annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${TEMPLATE_NAME:=reference}"
@@ -213,6 +223,10 @@ run_one() {
         # Cross-region edge inflation only applies to faiss_atlas_weighted; encode
         # it there so a sweep over inflation values gets distinct output dirs.
         [ "$KMETHOD_" = "faiss_atlas_weighted" ] && TAG="${TAG}-infl${CROSS_REGION_INFLATION}"
+        # Template-clustering labels: encode K / spatial-weight / seed / inflation so a
+        # sweep over any of them gets distinct output dirs.
+        [ "$KMETHOD_" = "faiss_cluster_weighted" ] && \
+            TAG="${TAG}-clk${CLUSTER_K}-sw${CLUSTER_SPATIAL_WEIGHT}-cs${CLUSTER_SEED}-infl${CROSS_REGION_INFLATION}"
         # Per-task vs shared lengthscale → distinct output dirs.
         [ "$PER_TASK_LENGTHSCALE" = "1" ] && TAG="${TAG}-ptls"
         # Learned diffusion scale (multiplicative spectral scale) → distinct dirs.
@@ -227,6 +241,11 @@ run_one() {
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
+    # Atlas methods: encode WHICH annotation volume (level_5annot vs level_15annot) so
+    # level5 vs level15 runs get distinct output dirs. Only for atlas methods.
+    case "$KMETHOD_" in
+        faiss_atlas_weighted|anatomical_atlas) TAG="${TAG}-$(basename "$ANNOTATION_FILE" .npy)" ;;
+    esac
     # Learned vs anchored inducing points → distinct output dirs (both families).
     [ "$LEARN_INDUCING" = "1" ] && TAG="${TAG}-learnind"
     # VNNGP runs get their own tag suffix so they don't clobber the analytic ones.
@@ -263,6 +282,10 @@ run_one() {
             $augment_args \
             --knn-method $KMETHOD_ \
             --cross-region-inflation $CROSS_REGION_INFLATION \
+            --cluster-k $CLUSTER_K \
+            --cluster-spatial-weight $CLUSTER_SPATIAL_WEIGHT \
+            --cluster-fit-subsample $CLUSTER_FIT_SUBSAMPLE \
+            --cluster-seed $CLUSTER_SEED \
             --laplacian-norm $LN_ \
             --stride $STRIDE \
             --knn-k $KNN_ \

@@ -715,8 +715,14 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     # exact nlist=1 graph.
     if nlist != 1:
         graph_key_parts["nlist"] = nlist
+    # Level-aware atlas id so different annotation volumes (e.g. level_5 vs
+    # level_15) never share a graph/eigenvector cache. The historical default
+    # (level_15annot) keeps its original un-suffixed keys.
+    atlas_stem = (Path(args["annotations_file"]).stem
+                  if args.get("annotations_file") else "noatlas")
+    _legacy_atlas = (atlas_stem == "level_15annot")
     if args["knn_method"] == "anatomical_atlas":
-        graph_key_parts["atlas"] = "annotation_coarse_d4"
+        graph_key_parts["atlas"] = "annotation_coarse_d4" if _legacy_atlas else atlas_stem
         graph_key_parts["conn"] = 3
     elif args["knn_method"] == "faiss_atlas_weighted":
         # The base graph is pure faiss — we reuse that cache. The atlas
@@ -815,7 +821,9 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         # Laplacian → different eigenmodes. Encode the inflation in
         # graph_key so the eigvec cache doesn't collide with vanilla
         # faiss runs.
-        graph_key_parts["weighting"] = f"atlas_x{inflation:g}"
+        graph_key_parts["weighting"] = (
+            f"atlas_x{inflation:g}" if _legacy_atlas else f"{atlas_stem}_x{inflation:g}"
+        )
         graph_key = make_graph_key(graph_key_parts)
     elif args["knn_method"] == "faiss_cluster_weighted":
         # ---- 1. Base faiss graph (cache shared with --knn-method=faiss) ----

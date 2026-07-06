@@ -234,8 +234,13 @@ def setup_experiment(args):
     # default (nlist=1) compatible with caches built before nlist was ever keyed.
     if nlist != 1:
         graph_key_parts["nlist"] = nlist
+    # Level-aware atlas id so different annotation volumes (e.g. level_5 vs
+    # level_15) never share a graph/eigenvector cache. The historical default
+    # (level_15annot) keeps its original un-suffixed keys.
+    atlas_stem = Path(config.annotations_file).stem if config.annotations_file else "noatlas"
+    _legacy_atlas = (atlas_stem == "level_15annot")
     if knn_method == "anatomical_atlas":
-        graph_key_parts["atlas"] = "annotation_coarse_d4"
+        graph_key_parts["atlas"] = "annotation_coarse_d4" if _legacy_atlas else atlas_stem
         graph_key_parts["conn"] = 3
     elif knn_method == "faiss_atlas_weighted":
         # The base graph is pure faiss — reuse that cache. Atlas weighting is
@@ -329,7 +334,9 @@ def setup_experiment(args):
         )
         # ---- 4. Re-key so the eigvec cache doesn't collide with
         #         vanilla faiss runs (same topology, different weights).
-        graph_key_parts["weighting"] = f"atlas_x{inflation:g}"
+        graph_key_parts["weighting"] = (
+            f"atlas_x{inflation:g}" if _legacy_atlas else f"{atlas_stem}_x{inflation:g}"
+        )
         graph_key = make_graph_key(graph_key_parts)
     elif knn_method == "faiss_cluster_weighted":
         # Same soft inflation, but node labels are CLUSTERED from the reference

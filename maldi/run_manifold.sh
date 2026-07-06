@@ -43,15 +43,26 @@
 : "${OUTPUT_DIR:=/home/casap/mlibra/output}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
-: "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
-: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_3.json}"
+# Atlas level convenience: ATLAS_LEVEL=5 or 15 selects level_${ATLAS_LEVEL}annot.npy
+# under DATA_PATH. Override ANNOTATION_FILE directly to use any other volume.
+: "${ATLAS_LEVEL:=15}"
+: "${ANNOTATION_FILE:=${DATA_PATH}/level_${ATLAS_LEVEL}annot.npy}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${KNN_METHOD:=faiss_atlas_weighted}"
+: "${KNN_METHOD:=faiss_cluster_weighted}"
 : "${CROSS_REGION_INFLATION:=10.0}"
+# --- template-clustering node labels (--knn-method faiss_cluster_weighted) ---
+# Data-driven, whole-brain, lipid-free labels clustered from the reference
+# template itself (no ANNOTATION_FILE needed). CROSS_REGION_INFLATION is reused
+# as the cross-cluster edge-weight inflation.
+: "${CLUSTER_K:=64}"
+: "${CLUSTER_SPATIAL_WEIGHT:=1.0}"
+: "${CLUSTER_FIT_SUBSAMPLE:=40000}"
+: "${CLUSTER_SEED:=0}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
-: "${EXP_PREFIX:=FOLD-3-STATIC-INDP}"
+: "${EXP_PREFIX:=FOLD-2-STATIC-INDP}"
 : "${LAPLACIAN_NORM:=randomwalk}"
-: "${THRESHOLD:=50}"
+: "${THRESHOLD:=5}"
 
 # ---- FAISS CPU-only flags (env -> CLI) ------------------------------------
 # The submit script passes FAISS_CPU_* as env vars; here we translate them into
@@ -157,6 +168,24 @@ if [ "$INDUCING_FROM_MALDI_NODES" = "1" ]; then
     EXP_NAME="$EXP_NAME-blend$INDUCING_DENSITY_FRAC"
 fi
 
+# Template-clustering node labels: always pass the knobs (Python ignores them for
+# other methods, since they only feed faiss_cluster_weighted). Encode K/conn/seed
+# in the dir name ONLY for that method, so existing dir names stay unchanged and a
+# sweep over cluster-K gets distinct dirs.
+CLUSTER_ARGS="--cluster-k $CLUSTER_K --cluster-spatial-weight $CLUSTER_SPATIAL_WEIGHT --cluster-fit-subsample $CLUSTER_FIT_SUBSAMPLE --cluster-seed $CLUSTER_SEED"
+if [ "$KNN_METHOD" = "faiss_cluster_weighted" ]; then
+    EXP_NAME="$EXP_NAME-clk$CLUSTER_K-sw$CLUSTER_SPATIAL_WEIGHT-cs$CLUSTER_SEED"
+fi
+
+# Atlas methods: encode WHICH annotation volume (e.g. level_5annot vs level_15annot)
+# in the dir name so level5 vs level15 runs don't clobber each other. Only for atlas
+# methods, so non-atlas dir names stay unchanged. Matches the Python cache-key logic.
+case "$KNN_METHOD" in
+    faiss_atlas_weighted|anatomical_atlas)
+        EXP_NAME="$EXP_NAME-$(basename "$ANNOTATION_FILE" .npy)"
+        ;;
+esac
+
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
@@ -192,6 +221,7 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     $PROD_ARGS \
     --knn-method $KNN_METHOD \
     --cross-region-inflation $CROSS_REGION_INFLATION \
+    $CLUSTER_ARGS \
     --knn-k $KNN_K \
     --n-list "$N_LIST" \
     --n-probe "$N_PROBE" \

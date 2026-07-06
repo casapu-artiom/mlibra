@@ -34,11 +34,20 @@
 : "${OUTPUT_DIR:=/home/casap/mlibra/output}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
-: "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
+# Atlas level convenience: ATLAS_LEVEL=5 or 15 selects level_${ATLAS_LEVEL}annot.npy
+# under DATA_PATH. Override ANNOTATION_FILE directly to use any other volume.
+: "${ATLAS_LEVEL:=15}"
+: "${ANNOTATION_FILE:=${DATA_PATH}/level_${ATLAS_LEVEL}annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${KNN_METHOD:=faiss_atlas_weighted}"
+: "${KNN_METHOD:=faiss_cluster_weighted}"
 : "${CROSS_REGION_INFLATION:=10.0}"
+# Template-clustering node labels (--knn-method faiss_cluster_weighted): data-driven,
+# whole-brain, lipid-free labels from the reference template (no ANNOTATION_FILE).
+: "${CLUSTER_K:=64}"
+: "${CLUSTER_SPATIAL_WEIGHT:=1.0}"
+: "${CLUSTER_FIT_SUBSAMPLE:=40000}"
+: "${CLUSTER_SEED:=0}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=FOLD-2-STATIC-INDP}"
 : "${LAPLACIAN_NORM:=randomwalk}"
@@ -112,6 +121,22 @@ unset IFS
 # tag distinguishes these dirs from the inducing-point (MANIFOLD) runs.
 EXP_NAME="$EXP_PREFIX-SPECTRAL-$LATENT_DIM-$STRIDE-K$NUM_MODES-$TEMPLATE_NAME-$THRESHOLD-$BATCH_SIZE-$KNN_METHOD-$CROSS_REGION_INFLATION-$KNN_K-$LAPLACIAN_NORM-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH-$LENGTHSCALE_INIT"
 
+# Template-clustering node labels: always pass the knobs (Python ignores them for
+# other methods). Encode K/spatial-weight/seed in the dir name ONLY for that method,
+# so existing dir names stay unchanged and a cluster sweep gets distinct dirs.
+CLUSTER_ARGS="--cluster-k $CLUSTER_K --cluster-spatial-weight $CLUSTER_SPATIAL_WEIGHT --cluster-fit-subsample $CLUSTER_FIT_SUBSAMPLE --cluster-seed $CLUSTER_SEED"
+if [ "$KNN_METHOD" = "faiss_cluster_weighted" ]; then
+    EXP_NAME="$EXP_NAME-clk$CLUSTER_K-sw$CLUSTER_SPATIAL_WEIGHT-cs$CLUSTER_SEED"
+fi
+
+# Atlas methods: encode WHICH annotation volume (level_5annot vs level_15annot) in the
+# dir name so level5 vs level15 runs don't clobber. Only for atlas methods.
+case "$KNN_METHOD" in
+    faiss_atlas_weighted|anatomical_atlas)
+        EXP_NAME="$EXP_NAME-$(basename "$ANNOTATION_FILE" .npy)"
+        ;;
+esac
+
 # Diffusion scale: always pass the init (1.0 = identity); learn it only when asked.
 # Encode the INIT VALUE in the tag (not just a boolean) so a sweep over inits gets
 # distinct dirs. Frozen-at-1.0 (the default) adds no suffix => unchanged dir names.
@@ -153,6 +178,7 @@ python $SRC_PATH/maldi/spectral_lgp_manifold_experiment.py \
     $DIFF_ARGS \
     --knn-method $KNN_METHOD \
     --cross-region-inflation $CROSS_REGION_INFLATION \
+    $CLUSTER_ARGS \
     --knn-k $KNN_K \
     --n-list "$N_LIST" \
     --n-probe "$N_PROBE" \
