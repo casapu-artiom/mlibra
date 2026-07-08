@@ -47,7 +47,7 @@ FORCE_RECOMPUTE_GRAPH=${FORCE_RECOMPUTE_GRAPH:-0}
 N_LIST=${N_LIST:-sqrt}
 N_PROBE=${N_PROBE:-8}
 
-N_EPOCHS=50
+N_EPOCHS=30
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
 S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_long_cv"
@@ -108,7 +108,7 @@ submit() {
         -e BUMP_SCALE="$bumpscale" \
         -e BUMP_DECAY="$bumpdecay" \
         -e N_EPOCHS="$N_EPOCHS" \
-        -e NUM_INDUCING_POINTS=2000 \
+        -e NUM_INDUCING_POINTS=1000 \
         -e INDUCING_SOURCE="$ind_source" \
         -e INDUCING_FROM_MALDI_NODES="${INDUCING_FROM_MALDI_NODES:-0}" \
         -e INDUCING_DENSITY_FRAC="${INDUCING_DENSITY_FRAC:-0.8}" \

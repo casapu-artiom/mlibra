@@ -140,7 +140,7 @@ KNN_K=(15)
 #   'faiss'                  = plain kNN, no prior
 #   'faiss_atlas_weighted'   = atlas-region inflation (uses ATLAS_LEVEL's annotation volume)
 #   'faiss_cluster_weighted' = template-clustering inflation (no atlas; CLUSTER_* knobs)
-MAN_KNN_METHODS=(faiss faiss_atlas_weighted faiss_cluster_weighted)
+MAN_KNN_METHODS=(faiss_atlas_weighted)
 # Cross-region inflation, used by faiss_atlas_weighted AND faiss_cluster_weighted.
 MAN_INFLATIONS=(50)
 LAPLACIAN_NORMS=("randomwalk")
@@ -162,13 +162,13 @@ LENGTHSCALES=(1.0)
 #   INIT  = float -> its initial value (1.0 = identity; no eigenpair recompute).
 # LEARN=1 runs get a -learndiff suffix in EXP_NAME, so learned vs frozen don't
 # clobber each other. e.g. ("0:1.0" "1:1.0" "1:2.0") = baseline + two learned starts.
-DIFFUSION_SCALES=("0:1.0" "1:1.0")
+DIFFUSION_SCALES=("1:1.0")
 
 # (stride, num_modes) pairs swept together:
 #   (1) stride=4, num_modes=1300
 #   (2) stride=8, num_modes=6000
 #STRIDE_NUM_MODES=("4:1300" "8:6000")
-STRIDE_NUM_MODES=("4:100" "4:300")
+STRIDE_NUM_MODES=("4:2300" "8:6000")
 
 # Fixed across the whole sweep
 TEMPLATE="reference"
