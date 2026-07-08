@@ -162,15 +162,24 @@ def resolve_graph_keys(args):
     # (recall ~1.0 at nlist=1), matching the experiments so caches stay shared.
     if args.nlist != 1:
         parts["nlist"] = args.nlist
+    # Level-aware atlas id so different annotation volumes (e.g. level_5 vs
+    # level_15) never share a graph/eigenvector cache. The historical default
+    # (level_15annot) keeps its original un-suffixed keys. Mirrors the
+    # experiment side (maldi/manifold_kernel_builder.py::build_manifold_graph).
+    atlas_stem = Path(args.annotations_file).stem if args.annotations_file else "noatlas"
+    _legacy_atlas = (atlas_stem == "level_15annot")
     if args.knn_method == "anatomical_atlas":
-        parts["atlas"] = "annotation_coarse_d4"
+        parts["atlas"] = "annotation_coarse_d4" if _legacy_atlas else atlas_stem
         parts["conn"] = 3
 
     if args.knn_method == "faiss_atlas_weighted":
         base = dict(parts)
         base["method"] = "faiss"            # graph is the plain-faiss cache
         graph_cache_key = make_graph_key(base)
-        parts["weighting"] = f"atlas_x{args.cross_region_inflation:g}"
+        parts["weighting"] = (
+            f"atlas_x{args.cross_region_inflation:g}" if _legacy_atlas
+            else f"{atlas_stem}_x{args.cross_region_inflation:g}"
+        )
         eig_graph_key = make_graph_key(parts)
         return "faiss", graph_cache_key, eig_graph_key
 

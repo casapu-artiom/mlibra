@@ -51,7 +51,14 @@ IMAGE=${IMAGE:-artiomartiom/sdsc:withslepc}
 # -------------------------------------------------------------------------
 S3_EIGENVECTOR_DIR="${S3_EIGENVECTOR_DIR:-/s3/mlibra/mlibra-data/artiom/eigenvectors}"
 S3_REFERENCE_FILE="${S3_REFERENCE_FILE:-/s3/mlibra/mlibra-data/reference_image.npy}"
-S3_ANNOTATION_FILE="${S3_ANNOTATION_FILE:-/s3/mlibra/mlibra-data/level_15annot.npy}"
+# Atlas level convenience: ATLAS_LEVEL=5 or 15 selects level_${ATLAS_LEVEL}annot.npy
+# under the S3 data dir. Defaults to level 15 (the historical default, which keeps
+# its original un-suffixed eigvec cache keys). Override S3_ANNOTATION_FILE directly
+# to use any other volume. The atlas file is only consumed by the atlas KNN methods
+# (anatomical_atlas / faiss_atlas_weighted); plain faiss ignores it.
+S3_DATA_DIR="${S3_DATA_DIR:-/s3/mlibra/mlibra-data}"
+ATLAS_LEVEL="${ATLAS_LEVEL:-15}"
+S3_ANNOTATION_FILE="${S3_ANNOTATION_FILE:-${S3_DATA_DIR}/level_${ATLAS_LEVEL}annot.npy}"
 SRC_PATH="${SRC_PATH:-/myhome/mlibra}"
 BANDWIDTH="${BANDWIDTH:-0.1}"
 
@@ -134,7 +141,17 @@ submit_one() {
     if [ "$nlist" != "sqrt" ]; then
         ltag="_nl${nlist}"
     fi
-    local run_slug="str${stride}_t${threshold}_k${knn_k}_bw1p0_${norm}_nm${modes}${mtag}${ltag}_si"
+    # Atlas-level tag so level_5 vs level_15 log dirs don't collide (the atlas
+    # file only matters for the atlas methods). Untagged for the legacy
+    # level_15annot default -> existing slugs stay unchanged.
+    local atag="" atlas_stem
+    atlas_stem=$(basename "$S3_ANNOTATION_FILE" .npy)
+    case "$knn_method" in
+        faiss_atlas_weighted|anatomical_atlas)
+            [ "$atlas_stem" != "level_15annot" ] && atag="_${atlas_stem}"
+            ;;
+    esac
+    local run_slug="str${stride}_t${threshold}_k${knn_k}_bw1p0_${norm}_nm${modes}${mtag}${atag}${ltag}_si"
     n_submitted=$((n_submitted + 1))
     local job_name="slepcsi-${EXP_SUFFIX}-$(printf '%03d' "$n_submitted")"
 
@@ -167,6 +184,7 @@ submit_one() {
         -e TARGET="$TARGET" \
         -e MPD="$MPD" \
         -e BANDWIDTH="$BANDWIDTH" \
+        -e TOL="1e-4" \
         -e FACTOR_SOLVER="$FACTOR_SOLVER" \
         -- ./slepc/slepc_eigensolve.sh
 }
