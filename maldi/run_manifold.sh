@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 : "${NUM_INDUCING_POINTS:=1000}"
-: "${NUM_MODES:=1300}"
+: "${NUM_MODES:=300}"
 # Lanczos Krylov subspace floor. -1 = auto (max(1500, 3*NUM_MODES+20)).
 # At stride=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
 : "${NCV_MIN:=-1}"
@@ -21,7 +21,7 @@
 # density). No eigenpair recompute. LEARN_DIFFUSION_SCALE=1 trains it; otherwise
 # pinned at the init (1.0 = identity). Adds -learndiff to EXP_NAME when learned.
 : "${DIFFUSION_SCALE_INIT:=1.0}"
-: "${LEARN_DIFFUSION_SCALE:=0}"
+: "${LEARN_DIFFUSION_SCALE:=1}"
 # Product ARD-Matern (manifold kernel): multiply the (geodesic) Riemann kernel by an
 # ambient per-axis Euclidean Matern, k = k_geo * k_eucl-ARD, to regain the directional
 # anisotropy the Riemann kernel structurally lacks. PRODUCT_ARD_MATERN=1 enables it;
@@ -49,8 +49,8 @@
 : "${ANNOTATION_FILE:=${DATA_PATH}/level_${ATLAS_LEVEL}annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${KNN_METHOD:=faiss_cluster_weighted}"
-: "${CROSS_REGION_INFLATION:=10.0}"
+: "${KNN_METHOD:=faiss_atlas_weighted}"
+: "${CROSS_REGION_INFLATION:=50.0}"
 # --- template-clustering node labels (--knn-method faiss_cluster_weighted) ---
 # Data-driven, whole-brain, lipid-free labels clustered from the reference
 # template itself (no ANNOTATION_FILE needed). CROSS_REGION_INFLATION is reused
@@ -59,6 +59,15 @@
 : "${CLUSTER_SPATIAL_WEIGHT:=1.0}"
 : "${CLUSTER_FIT_SUBSAMPLE:=40000}"
 : "${CLUSTER_SEED:=0}"
+# --- atlas root handling + label denoise + hard prune (faiss_atlas_weighted) ---
+# ROOT_HANDLING: dissolve (default, fold label-0 'root' into nearest region),
+#   ignore (keep root, don't inflate its edges), or cross (legacy behaviour).
+# DENOISE_LABELS: majority-vote label smoothing passes before the prune (0=off).
+# PRUNE_CROSS_REGION: fraction of cross-region edges to HARD-remove (0=off).
+# Non-cross ROOT_HANDLING and any PRUNE change the eigvec cache key (fresh solve).
+: "${ROOT_HANDLING:=dissolve}"
+: "${DENOISE_LABELS:=3}"
+: "${PRUNE_CROSS_REGION:=0.95}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=FOLD-2-STATIC-INDP}"
 : "${LAPLACIAN_NORM:=randomwalk}"
@@ -188,6 +197,21 @@ case "$KNN_METHOD" in
         ;;
 esac
 
+# Atlas root handling + label denoise + hard prune: reflect in the dir name so
+# runs with different graph refinements don't clobber. Only tagged when they
+# actually change the graph (root!=cross for the atlas method; denoise>0;
+# prune>0), so legacy dir names stay valid. Mirrors the Python eigvec cache-key
+# suffixes (_root{mode} / denoise / prune).
+if [ "$KNN_METHOD" = "faiss_atlas_weighted" ] && [ "$ROOT_HANDLING" != "cross" ]; then
+    EXP_NAME="$EXP_NAME-root$ROOT_HANDLING"
+fi
+if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
+    EXP_NAME="$EXP_NAME-dn$DENOISE_LABELS"
+fi
+if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
+    EXP_NAME="$EXP_NAME-prune$PRUNE_CROSS_REGION"
+fi
+
 python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
@@ -223,6 +247,9 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     $PROD_ARGS \
     --knn-method $KNN_METHOD \
     --cross-region-inflation $CROSS_REGION_INFLATION \
+    --root-handling $ROOT_HANDLING \
+    --denoise-labels $DENOISE_LABELS \
+    --prune-cross-region $PRUNE_CROSS_REGION \
     $CLUSTER_ARGS \
     --knn-k $KNN_K \
     --n-list "$N_LIST" \

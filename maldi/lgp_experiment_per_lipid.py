@@ -85,7 +85,8 @@ from manifold_gp.utils.nearest_neighbors import (
 )
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
-    labels_for_nodes_from_template_clustering,
+    labels_for_nodes_from_template_clustering, dissolve_root_labels,
+    denoise_labels_majority_vote, prune_cross_region_edges,
 )
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 
@@ -320,6 +321,21 @@ def parse_args() -> dict:
                    help="(faiss_cluster_weighted) nodes used to train the k-means centroids.")
     p.add_argument("--cluster-seed", dest="cluster_seed", type=int, default=0,
                    help="(faiss_cluster_weighted) RNG seed for the template clustering.")
+    p.add_argument("--root-handling", dest="root_handling", type=str, default="dissolve",
+                   choices=["dissolve", "ignore", "cross"],
+                   help="(faiss_atlas_weighted) how to treat the atlas label-0 'root' catch-all "
+                        "tissue. 'dissolve' (default): reassign each root node to its nearest real "
+                        "region before inflating (frees interiors, keeps region↔region "
+                        "confinement). 'ignore': keep root, don't inflate root-touching edges. "
+                        "'cross': legacy (inflate all root edges; reuses old eigvec caches).")
+    p.add_argument("--denoise-labels", dest="denoise_labels", type=int, default=0,
+                   help="Majority-vote label smoothing passes over the graph before the prune "
+                        "(absorbs speck nodes). 0 = off. NOTE: erodes thin real boundaries — "
+                        "prefer --root-handling dissolve for the catch-all.")
+    p.add_argument("--prune-cross-region", dest="prune_cross_region", type=float, default=0.0,
+                   help="Fraction of cross-region edges to HARD-remove (vs the soft "
+                        "--cross-region-inflation), connectivity-preserving. 0 = off. Changes "
+                        "edges → distinct eigvec cache key.")
     p.add_argument("--laplacian-norm", default="randomwalk",
                    choices=["symmetric", "randomwalk"])
     p.add_argument("--normalize-features", dest="normalize_features", action="store_true",
@@ -360,6 +376,16 @@ def parse_args() -> dict:
                         "leaves its eigenvectors unchanged), so it is a cheap, "
                         "eigenpairs-free companion to the lengthscale. Frozen at "
                         "--diffusion-scale-init otherwise.")
+    p.add_argument("--learn-spectral-weights", dest="learn_spectral_weights",
+                   action="store_true",
+                   help="Learn ONE free positive weight per Laplacian mode instead of "
+                        "tying them to the monotone Matern density "
+                        "S_k=(2*nu/l^2+diffusion_scale*lambda_k)^-nu. Makes the prior "
+                        "spectral density anisotropic in lambda (can up-weight the "
+                        "boundary-discriminating modes a monotone S_k cannot). "
+                        "Warm-started at the Matern density. Applies to the manifold and "
+                        "spectral families; with one knob per mode, use more epochs / a "
+                        "smoothness prior to avoid overfitting.")
     p.add_argument("--bump-scale", type=float, default=20.0)
     p.add_argument("--bump-decay", type=float, default=0.01)
     p.add_argument("--num-modes", type=int, default=1300)
@@ -808,22 +834,30 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
                 f"differently — check that they have the same shape."
             )
 
-        # ---- 3. Inflate cross-region edges via library function -----
-        # Topology is unchanged; only edge_value gets reweighted.
+        # ---- 3. Root handling + inflate cross-region edges ----------
+        # The atlas label-0 'root' is real tissue, not background; dissolving it
+        # into the nearest region (default) stops the soft prior from spraying
+        # through interiors. Applied AFTER the MALDI-augment relabel above so any
+        # appended root nodes are dissolved too. 'cross' = legacy behaviour.
+        root_mode = str(args.get("root_handling", "dissolve"))
+        if root_mode == "dissolve":
+            node_labels = dissolve_root_labels(
+                node_labels, reference_nodes.detach().cpu().numpy())
         inflation = float(args.get("cross_region_inflation", 10.0))
         edge_index, edge_value, _info = inflate_cross_region_edges(
             edge_index, edge_value, node_labels,
-            inflation=inflation, treat_zero_as_cross=True,
+            inflation=inflation, treat_zero_as_cross=(root_mode == "cross"),
         )
 
         # ---- 4. Re-key the eigenvector cache -----------------------
         # Same graph topology but different edge weights → different
-        # Laplacian → different eigenmodes. Encode the inflation in
-        # graph_key so the eigvec cache doesn't collide with vanilla
-        # faiss runs.
+        # Laplacian → different eigenmodes. Encode the inflation (+ root mode)
+        # in graph_key so the eigvec cache doesn't collide with vanilla faiss
+        # runs. Legacy 'cross' stays un-suffixed so old caches still load.
+        _base_wt = (f"atlas_x{inflation:g}" if _legacy_atlas
+                    else f"{atlas_stem}_x{inflation:g}")
         graph_key_parts["weighting"] = (
-            f"atlas_x{inflation:g}" if _legacy_atlas else f"{atlas_stem}_x{inflation:g}"
-        )
+            _base_wt if root_mode == "cross" else f"{_base_wt}_root{root_mode}")
         graph_key = make_graph_key(graph_key_parts)
     elif args["knn_method"] == "faiss_cluster_weighted":
         # ---- 1. Base faiss graph (cache shared with --knn-method=faiss) ----
@@ -875,6 +909,25 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
     else:
         raise ValueError(f"unknown knn_method: {args['knn_method']}")
 
+    # ---- Label denoise + hard prune (weighted methods, after inflation) ----
+    # Refine the HARD topology on the region labels the graph was weighted on.
+    # Prune changes edges → the eigvecs change, so prune (+ the denoise that
+    # shaped it) go into the eigvec cache key; denoise alone leaves edges intact.
+    if args["knn_method"] in ("faiss_atlas_weighted", "faiss_cluster_weighted"):
+        n_denoise = int(args.get("denoise_labels", 0) or 0)
+        prune = float(args.get("prune_cross_region", 0.0) or 0.0)
+        if n_denoise > 0:
+            node_labels = denoise_labels_majority_vote(
+                node_labels, edge_index, n_denoise)
+        if prune > 0.0:
+            edge_index, edge_value = prune_cross_region_edges(
+                edge_index, edge_value, node_labels, prune,
+                zero_is_region=(args["knn_method"] == "faiss_cluster_weighted"))
+            graph_key_parts["prune"] = f"{prune:g}"
+            if n_denoise > 0:
+                graph_key_parts["denoise"] = n_denoise
+            graph_key = make_graph_key(graph_key_parts)
+
     # Eigenpairs
     laplacian_op = GraphLaplacianOperator(
         edge_value, edge_index, knn.x.shape[0],
@@ -914,6 +967,7 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         graphbandwidth_init=args["graphbandwidth_init"],
         diffusion_scale_init=args.get("diffusion_scale_init", 1.0),
         learn_diffusion_scale=args.get("learn_diffusion_scale", False),
+        learn_spectral_weights=args.get("learn_spectral_weights", False),
     ).to(args["device"])
     manifold_kernel.eval()
 
@@ -1272,6 +1326,7 @@ def train_lipid_batch(
                     graphbandwidth_init=float(mk.graphbandwidth),
                     diffusion_scale_init=float(mk.diffusion_scale),
                     learn_diffusion_scale=args.get("learn_diffusion_scale", False),
+                    learn_spectral_weights=args.get("learn_spectral_weights", False),
                 ).to(device)
                 for _ in range(n_tasks)
             ]

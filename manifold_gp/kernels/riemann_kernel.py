@@ -55,6 +55,10 @@ class RiemannKernel(gpytorch.kernels.Kernel):
         diffusion_scale_prior: Optional[Prior] = None,
         diffusion_scale_constraint: Optional[Interval] = None,
         learn_diffusion_scale: bool = False,
+        # ---- Free per-mode spectral weights ----
+        learn_spectral_weights: bool = False,
+        spectral_weights_prior: Optional[Prior] = None,
+        spectral_weights_constraint: Optional[Interval] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -192,7 +196,40 @@ class RiemannKernel(gpytorch.kernels.Kernel):
 
         if not learn_diffusion_scale:
             self.raw_diffusion_scale.requires_grad_(False)
- 
+
+        # ---- Free per-mode spectral weights: learn ONE positive weight per mode
+        #      instead of tying them to the monotone Matern density
+        #      S_k = (2*nu/l^2 + diffusion_scale*lambda_k)^-nu. This makes the prior
+        #      spectral density ANISOTROPIC in lambda — it can up-weight the specific
+        #      (possibly high-frequency) modes that discriminate a region boundary,
+        #      which a monotone S_k cannot. The subclass (RiemannMaternKernel) returns
+        #      these from spectral_density() when enabled, and warm-starts them AT the
+        #      Matern density so training begins exactly at the tied kernel. Registered
+        #      ONLY when enabled, so existing (tied-density) checkpoints stay byte-
+        #      identical. With one knob per mode a smoothness prior over the mode index
+        #      (spectral_weights_prior) is recommended to avoid overfitting.
+        self.learn_spectral_weights = learn_spectral_weights
+        if learn_spectral_weights:
+            if spectral_weights_constraint is None:
+                spectral_weights_constraint = Positive()
+            self.register_parameter(
+                name="raw_spectral_weights",
+                parameter=torch.nn.Parameter(
+                    torch.zeros(*self.batch_shape, 1, self.num_modes)),
+            )
+            self.register_constraint("raw_spectral_weights", spectral_weights_constraint)
+            self._set_spectral_weights(
+                torch.ones(*self.batch_shape, 1, self.num_modes))
+            if spectral_weights_prior is not None:
+                if not isinstance(spectral_weights_prior, Prior):
+                    raise TypeError(
+                        "Expected gpytorch.priors.Prior but got "
+                        + type(spectral_weights_prior).__name__)
+                self.register_prior(
+                    "spectral_weights_prior", spectral_weights_prior,
+                    self._spectral_weights_param, self._spectral_weights_closure,
+                )
+
     # ----------------------------------------------------------------------
     # Bandwidth plumbing
     # ----------------------------------------------------------------------
@@ -276,6 +313,32 @@ class RiemannKernel(gpytorch.kernels.Kernel):
     @diffusion_scale.setter
     def diffusion_scale(self, value: Tensor):
         self._set_diffusion_scale(value)
+
+    # ----------------------------------------------------------------------
+    # Free per-mode spectral-weight plumbing (params registered only when
+    # learn_spectral_weights=True; see __init__).
+    # ----------------------------------------------------------------------
+    def _spectral_weights_param(self, m) -> Tensor:
+        return m.spectral_weights
+
+    def _spectral_weights_closure(self, m, v: Tensor) -> Tensor:
+        return m._set_spectral_weights(v)
+
+    def _set_spectral_weights(self, value: Tensor):
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value)
+        value = value.to(self.raw_spectral_weights)
+        self.initialize(
+            raw_spectral_weights=self.raw_spectral_weights_constraint.inverse_transform(value)
+        )
+
+    @property
+    def spectral_weights(self) -> Tensor:
+        return self.raw_spectral_weights_constraint.transform(self.raw_spectral_weights)
+
+    @spectral_weights.setter
+    def spectral_weights(self, value: Tensor):
+        self._set_spectral_weights(value)
 
 
     # ----------------------------------------------------------------------

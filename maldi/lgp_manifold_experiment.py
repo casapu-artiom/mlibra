@@ -25,7 +25,8 @@ from manifold_gp.utils.nearest_neighbors import (
 )
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
-    labels_for_nodes_from_template_clustering,
+    labels_for_nodes_from_template_clustering, dissolve_root_labels,
+    denoise_labels_majority_vote, prune_cross_region_edges,
 )
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from l3di.lgp_manifold import LatentRiemannGP, ManifoldLGP
@@ -118,6 +119,22 @@ def parse_args():
                         help="(faiss_cluster_weighted) nodes agglomerated before nearest-node propagation.")
     parser.add_argument("--cluster-seed", dest="cluster_seed", type=int, default=0,
                         help="(faiss_cluster_weighted) RNG seed for the template clustering.")
+    parser.add_argument("--root-handling", dest="root_handling", type=str, default="dissolve",
+                        choices=["dissolve", "ignore", "cross"],
+                        help="(faiss_atlas_weighted) how to treat the atlas label-0 'root' "
+                             "catch-all tissue. 'dissolve' (default): reassign each root node to "
+                             "its nearest real region before inflating (frees interiors, keeps "
+                             "region↔region confinement). 'ignore': keep root, don't inflate "
+                             "root-touching edges. 'cross': legacy (inflate all root edges; "
+                             "reuses old eigvec caches).")
+    parser.add_argument("--denoise-labels", dest="denoise_labels", type=int, default=0,
+                        help="Majority-vote label smoothing passes over the graph before the "
+                             "prune (absorbs speck nodes). 0 = off. NOTE: erodes thin real "
+                             "boundaries — prefer --root-handling dissolve for the catch-all.")
+    parser.add_argument("--prune-cross-region", dest="prune_cross_region", type=float, default=0.0,
+                        help="Fraction of cross-region edges to HARD-remove (vs the soft "
+                             "--cross-region-inflation), connectivity-preserving. 0 = off. "
+                             "Changes edges → distinct eigvec cache key.")
     parser.add_argument("--laplacian-norm", dest="laplacian_norm", type=str, default="symmetric",
                         choices=["symmetric", "randomwalk"])
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
@@ -374,17 +391,25 @@ def setup_experiment(args):
                 f"and graph nodes ({knn.x.shape[0]}). Check that atlas and "
                 f"reference template were cropped/strided identically."
             )
-        # ---- 3. Inflate cross-region edges --------------------------
+        # ---- 3. Root handling + inflate cross-region edges ----------
+        # The atlas label-0 'root' is real tissue, not background; dissolving it
+        # into the nearest region (default) stops the soft prior from spraying
+        # through interiors. 'cross' = legacy treat_zero_as_cross=True.
+        root_mode = str(args.get("root_handling", "dissolve"))
+        if root_mode == "dissolve":
+            node_labels = dissolve_root_labels(
+                node_labels, reference_nodes.detach().cpu().numpy())
         inflation = float(args.get("cross_region_inflation", 10.0))
         edge_index, edge_value, _info = inflate_cross_region_edges(
             edge_index, edge_value, node_labels,
-            inflation=inflation, treat_zero_as_cross=True,
+            inflation=inflation, treat_zero_as_cross=(root_mode == "cross"),
         )
         # ---- 4. Re-key so the eigvec cache doesn't collide with
         #         vanilla faiss runs (same topology, different weights).
+        _base_wt = (f"atlas_x{inflation:g}" if _legacy_atlas
+                    else f"{atlas_stem}_x{inflation:g}")
         graph_key_parts["weighting"] = (
-            f"atlas_x{inflation:g}" if _legacy_atlas else f"{atlas_stem}_x{inflation:g}"
-        )
+            _base_wt if root_mode == "cross" else f"{_base_wt}_root{root_mode}")
         graph_key = make_graph_key(graph_key_parts)
     elif knn_method == "faiss_cluster_weighted":
         # Same soft-inflation as faiss_atlas_weighted, but the node labels are
@@ -432,6 +457,25 @@ def setup_experiment(args):
         graph_key = make_graph_key(graph_key_parts)
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
+
+    # ---- Label denoise + hard prune (weighted methods, after inflation) ----
+    # Refine the HARD topology on the region labels the graph was weighted on.
+    # Prune changes edges → the eigvecs change, so prune (+ the denoise that
+    # shaped it) go into the eigvec cache key; denoise alone leaves edges intact.
+    if knn_method in ("faiss_atlas_weighted", "faiss_cluster_weighted"):
+        n_denoise = int(args.get("denoise_labels", 0) or 0)
+        prune = float(args.get("prune_cross_region", 0.0) or 0.0)
+        if n_denoise > 0:
+            node_labels = denoise_labels_majority_vote(
+                node_labels, edge_index, n_denoise)
+        if prune > 0.0:
+            edge_index, edge_value = prune_cross_region_edges(
+                edge_index, edge_value, node_labels, prune,
+                zero_is_region=(knn_method == "faiss_cluster_weighted"))
+            graph_key_parts["prune"] = f"{prune:g}"
+            if n_denoise > 0:
+                graph_key_parts["denoise"] = n_denoise
+            graph_key = make_graph_key(graph_key_parts)
 
     # Optionally REPLACE the inducing points with a density/MALDI blend over the
     # UNALTERED (strided) graph: ~density_frac from the densest graph nodes + the

@@ -8,7 +8,7 @@ them. Recognised families:
     * lgp             — ``lgp_experiment.py``            (Euclidean latent GP)
     * manifold        — ``lgp_manifold_experiment.py``   (Riemann inducing-point GP)
     * spectral        — ``spectral_lgp_manifold_experiment.py`` (weight-space spectral GP)
-    * gplfr-<base>    — ``run_gplfr.sh`` -> ``gplfr_experiment.py``, split by the
+    * gplfr-<base>    — ``run_sota.sh MODEL=gplfr`` -> ``sota/gplfr_experiment.py``, split by the
                         latent-GP kernel: gplfr-euclidean / gplfr-riemann / gplfr-spectral
     * baseline-<model>— ``experiment_baselines.py``: baseline-mean / -linear /
                         -xgboost / -mlp / -mlp_eigen / -gcn / -gcn_faiss

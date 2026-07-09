@@ -20,6 +20,12 @@
 # pinned at the init (1.0 = identity). Adds -learndiff to EXP_NAME when learned.
 : "${DIFFUSION_SCALE_INIT:=1.0}"
 : "${LEARN_DIFFUSION_SCALE:=0}"
+# Free per-mode spectral weights: learn ONE positive weight per Laplacian mode
+# instead of the tied monotone Matern density S_k=(2*nu/l^2+diffusion_scale*lambda_k)^-nu.
+# Makes the prior spectral density anisotropic in lambda (can up-weight boundary-
+# discriminating modes). Warm-started AT the Matern density. LEARN_SPECTRAL_WEIGHTS=1
+# enables it; adds -learnspecw to EXP_NAME so it doesn't clobber the tied-density run.
+: "${LEARN_SPECTRAL_WEIGHTS:=0}"
 : "${NU:=2}"
 : "${KNN_K:=15}"
 : "${BUMP_SCALE:=1.0}"
@@ -48,6 +54,14 @@
 : "${CLUSTER_SPATIAL_WEIGHT:=1.0}"
 : "${CLUSTER_FIT_SUBSAMPLE:=40000}"
 : "${CLUSTER_SEED:=0}"
+# --- atlas root handling + label denoise + hard prune (faiss_atlas_weighted) ---
+# ROOT_HANDLING: dissolve (default) | ignore | cross (legacy). DENOISE_LABELS:
+# majority-vote passes before prune (0=off). PRUNE_CROSS_REGION: fraction of
+# cross-region edges hard-removed (0=off). Non-cross root / any prune → fresh
+# eigvec cache key.
+: "${ROOT_HANDLING:=dissolve}"
+: "${DENOISE_LABELS:=0}"
+: "${PRUNE_CROSS_REGION:=0.0}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=FOLD-2-STATIC-INDP}"
 : "${LAPLACIAN_NORM:=randomwalk}"
@@ -139,6 +153,21 @@ case "$KNN_METHOD" in
         ;;
 esac
 
+# Atlas root handling + label denoise + hard prune: reflect in the dir name so
+# runs with different graph refinements don't clobber. Only tagged when they
+# actually change the graph (root!=cross for the atlas method; denoise>0;
+# prune>0), so legacy dir names stay valid. Mirrors the Python eigvec cache-key
+# suffixes (_root{mode} / denoise / prune).
+if [ "$KNN_METHOD" = "faiss_atlas_weighted" ] && [ "$ROOT_HANDLING" != "cross" ]; then
+    EXP_NAME="$EXP_NAME-root$ROOT_HANDLING"
+fi
+if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
+    EXP_NAME="$EXP_NAME-dn$DENOISE_LABELS"
+fi
+if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
+    EXP_NAME="$EXP_NAME-prune$PRUNE_CROSS_REGION"
+fi
+
 # Diffusion scale: always pass the init (1.0 = identity); learn it only when asked.
 # Encode the INIT VALUE in the tag (not just a boolean) so a sweep over inits gets
 # distinct dirs. Frozen-at-1.0 (the default) adds no suffix => unchanged dir names.
@@ -148,6 +177,14 @@ if [ "$LEARN_DIFFUSION_SCALE" = "1" ]; then
     EXP_NAME="$EXP_NAME-learndiff$DIFFUSION_SCALE_INIT"
 elif [ "$DIFFUSION_SCALE_INIT" != "1.0" ]; then
     EXP_NAME="$EXP_NAME-diff$DIFFUSION_SCALE_INIT"
+fi
+
+# Free per-mode spectral weights: append the flag + a dir tag only when enabled,
+# so tied-density dir names stay unchanged (mirrors the diffusion-scale handling).
+SPECTRAL_W_ARGS=""
+if [ "$LEARN_SPECTRAL_WEIGHTS" = "1" ]; then
+    SPECTRAL_W_ARGS="--learn-spectral-weights"
+    EXP_NAME="$EXP_NAME-learnspecw"
 fi
 
 python $SRC_PATH/maldi/spectral_lgp_manifold_experiment.py \
@@ -178,8 +215,12 @@ python $SRC_PATH/maldi/spectral_lgp_manifold_experiment.py \
     --graphbandwidth-init $GRAPHBANDWIDTH \
     --lengthscale-init $LENGTHSCALE_INIT \
     $DIFF_ARGS \
+    $SPECTRAL_W_ARGS \
     --knn-method $KNN_METHOD \
     --cross-region-inflation $CROSS_REGION_INFLATION \
+    --root-handling $ROOT_HANDLING \
+    --denoise-labels $DENOISE_LABELS \
+    --prune-cross-region $PRUNE_CROSS_REGION \
     $CLUSTER_ARGS \
     --knn-k $KNN_K \
     --n-list "$N_LIST" \

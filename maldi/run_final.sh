@@ -8,11 +8,11 @@
 : "${SEED:=416465}"
 : "${KERNEL:=matern}"
 : "${MODE:=lgp}"
-: "${NO_RSAMPLE:=false}"
-: "${LEARN_INDUCING:=false}"   # true -> learn inducing-point locations (else fixed)
-: "${ARD:=false}"              # true -> per-axis ARD lengthscales (else isotropic)
+: "${NO_RSAMPLE:=true}"
+: "${LEARN_INDUCING:=true}"   # true -> learn inducing-point locations (else fixed)
+: "${ARD:=true}"              # true -> per-axis ARD lengthscales (else isotropic)
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
-: "${OUTPUT_DIR:=/home/casap/mlibra/output}"
+: "${OUTPUT_DIR:=/home/casap/mlibra/output/lgp}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"

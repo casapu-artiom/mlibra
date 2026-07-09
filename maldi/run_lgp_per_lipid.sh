@@ -19,7 +19,7 @@
 # =============================================================================
 
 # ---- which kernel ----
-: "${KERNEL_FAMILY:=manifold}"          # euclidean | manifold | eigenmap | spectral
+: "${KERNEL_FAMILY:=spectral}"          # euclidean | manifold | eigenmap | spectral
 : "${KERNEL:=matern}"                   # only used for euclidean / eigenmap
 # eigenmap: project coords into the leading EMBED_DIM Laplacian eigenfunctions,
 # then a Euclidean ARD Matern GP over that embedding (needs EIGENVECTOR_DIR).
@@ -34,11 +34,11 @@
 : "${NO_ARD:=1}"
 
 # ---- GP hyperparameters ----
-: "${NU:=2.5}"
+: "${NU:=2}"
 : "${NUM_INDUCING:=1000}"
 : "${INDUCING_SOURCE:=reference}"
 : "${LIPID_BATCH_SIZE:=10}"
-: "${EPOCHS:=2}"
+: "${EPOCHS:=20}"
 : "${LEARNING_RATE:=0.005}"
 : "${BATCH_SIZE:=2048}"
 : "${SEED:=42}"
@@ -85,6 +85,14 @@
 : "${CLUSTER_SPATIAL_WEIGHT:=1.0}"
 : "${CLUSTER_FIT_SUBSAMPLE:=40000}"
 : "${CLUSTER_SEED:=0}"
+# --- atlas root handling + label denoise + hard prune (faiss_atlas_weighted) ---
+# ROOT_HANDLING: dissolve (default) | ignore | cross (legacy). DENOISE_LABELS:
+# majority-vote passes before prune (0=off). PRUNE_CROSS_REGION: fraction of
+# cross-region edges hard-removed (0=off). Non-cross root / any prune → fresh
+# eigvec cache key.
+: "${ROOT_HANDLING:=dissolve}"
+: "${DENOISE_LABELS:=0}"
+: "${PRUNE_CROSS_REGION:=0.0}"
 : "${LAPLACIAN_NORM:=randomwalk}"
 # Cosine/correlation kernel (manifold only, 1=on): L2-normalize the Riemann
 # feature rows so the prior variance is constant (diagonal=1) and the
@@ -148,6 +156,12 @@
 # When learned, encoded in the TAG as -learndiff.
 : "${DIFFUSION_SCALE_INIT:=1.0}"
 : "${LEARN_DIFFUSION_SCALE:=1}"
+# Free per-mode spectral weights: learn ONE positive weight per Laplacian mode
+# instead of the tied monotone Matern density (anisotropic-in-lambda kernel,
+# warm-started at the Matern density). Applies to 'manifold' and 'spectral'
+# families. LEARN_SPECTRAL_WEIGHTS=1 enables it and adds -learnspecw to the TAG so
+# it does not clobber the tied-density run's output dir.
+: "${LEARN_SPECTRAL_WEIGHTS:=0}"
 
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -231,6 +245,8 @@ run_one() {
         [ "$PER_TASK_LENGTHSCALE" = "1" ] && TAG="${TAG}-ptls"
         # Learned diffusion scale (multiplicative spectral scale) → distinct dirs.
         [ "$LEARN_DIFFUSION_SCALE" = "1" ] && TAG="${TAG}-learndiff"
+        # Free per-mode spectral weights → distinct dirs.
+        [ "$LEARN_SPECTRAL_WEIGHTS" = "1" ] && TAG="${TAG}-learnspecw"
         # Cosine/correlation kernel (unit-norm features) → distinct dirs.
         [ "$NORMALIZE_FEATURES" = "1" ] && TAG="${TAG}-cos"
     elif [ "$FAMILY" = "eigenmap" ]; then
@@ -238,6 +254,7 @@ run_one() {
     elif [ "$FAMILY" = "spectral" ]; then
         TAG="spectral-nu${NU_}-K${NMODES_}-stride${STRIDE}-bw${BW_}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
         [ "$LEARN_DIFFUSION_SCALE" = "1" ] && TAG="${TAG}-learndiff"
+        [ "$LEARN_SPECTRAL_WEIGHTS" = "1" ] && TAG="${TAG}-learnspecw"
     else
         TAG="euclidean-${ARD_TAG}-${KERNEL}-nu${NU_}-ind${INDU_}-${THRESHOLD}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     fi
@@ -250,6 +267,19 @@ run_one() {
             [ "$_atlas_stem" != "level_15annot" ] && TAG="${TAG}-$_atlas_stem"
             ;;
     esac
+    # Atlas root handling + label denoise + hard prune: distinct dirs so graph
+    # refinements don't clobber. Only tagged when they change the graph (root!=cross
+    # for the atlas method; denoise>0; prune>0), mirroring the Python eigvec
+    # cache-key suffixes; default/off leaves existing dir names unchanged.
+    if [ "$KMETHOD_" = "faiss_atlas_weighted" ] && [ "$ROOT_HANDLING" != "cross" ]; then
+        TAG="${TAG}-root${ROOT_HANDLING}"
+    fi
+    if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
+        TAG="${TAG}-dn${DENOISE_LABELS}"
+    fi
+    if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
+        TAG="${TAG}-prune${PRUNE_CROSS_REGION}"
+    fi
     # Learned vs anchored inducing points → distinct output dirs (both families).
     [ "$LEARN_INDUCING" = "1" ] && TAG="${TAG}-learnind"
     # VNNGP runs get their own tag suffix so they don't clobber the analytic ones.
@@ -286,6 +316,9 @@ run_one() {
             $augment_args \
             --knn-method $KMETHOD_ \
             --cross-region-inflation $CROSS_REGION_INFLATION \
+            --root-handling $ROOT_HANDLING \
+            --denoise-labels $DENOISE_LABELS \
+            --prune-cross-region $PRUNE_CROSS_REGION \
             --cluster-k $CLUSTER_K \
             --cluster-spatial-weight $CLUSTER_SPATIAL_WEIGHT \
             --cluster-fit-subsample $CLUSTER_FIT_SUBSAMPLE \
@@ -306,6 +339,8 @@ run_one() {
             manifold_args="$manifold_args --diffusion-scale-init $DIFFUSION_SCALE_INIT"
             [ "$LEARN_DIFFUSION_SCALE" = "1" ] && \
                 manifold_args="$manifold_args --learn-diffusion-scale"
+            [ "$LEARN_SPECTRAL_WEIGHTS" = "1" ] && \
+                manifold_args="$manifold_args --learn-spectral-weights"
         fi
         # Lengthscale init / per-task lengthscale are applied in the manifold
         # training branch only.

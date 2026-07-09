@@ -398,6 +398,148 @@ def labels_for_nodes_from_sub_atlas(
     return sub_atlas[mask].astype(np.int64)
 
 
+def dissolve_root_labels(
+    node_labels: np.ndarray,
+    coords: np.ndarray,
+    root_label: int = 0,
+) -> np.ndarray:
+    """Reassign every ``root_label`` (unlabeled / catch-all) node to the region
+    of its nearest real-region node, so the atlas has no catch-all left.
+
+    The ``level_15annot`` atlas leaves a fraction of *tissue* nodes with label 0
+    ("root") threaded throughout the brain. With ``treat_zero_as_cross=True`` in
+    ``inflate_cross_region_edges`` every edge touching one of those nodes is
+    inflated, which sprays the soft prior through region interiors (fragmenting
+    the kernel) while adding almost nothing to real region↔region confinement.
+    Dissolving root — snapping each label-0 node to the nearest labelled region
+    by Euclidean distance — folds that tissue into the region it physically sits
+    in, so it smooths normally inside a region and any true boundary running
+    through former-root gets inflated properly. One-shot nearest-labelled-node
+    assignment (a KD-tree query), so a root node deep in a root pocket still
+    reaches the closest real region regardless of intervening root nodes.
+
+    Args:
+      node_labels: (N,) int array of atlas labels in node order (0 = root).
+      coords:      (N, d) node coordinates (any consistent space — normalized
+                   reference coords or voxel indices; only relative distance
+                   matters).
+      root_label:  the catch-all label to dissolve (default 0).
+
+    Returns:
+      (N,) int64 labels with no ``root_label`` entries (unless *every* node is
+      root, in which case the input is returned unchanged).
+    """
+    from scipy.spatial import cKDTree
+
+    labels = np.asarray(node_labels).astype(np.int64).copy()
+    coords = np.asarray(coords, dtype=np.float32)
+    root = labels == root_label
+    n_root = int(root.sum())
+    if n_root == 0 or root.all():
+        return labels
+    real = ~root
+    tree = cKDTree(coords[real])
+    _, nn = tree.query(coords[root], k=1)
+    labels[root] = labels[real][nn]
+    logging.info(
+        f"  dissolve_root_labels: reassigned {n_root:,}/{labels.size:,} "
+        f"({100.0 * n_root / labels.size:.1f}%) root nodes to nearest region "
+        f"({np.unique(node_labels).size} -> {np.unique(labels).size} regions)"
+    )
+    return labels
+
+
+def denoise_labels_majority_vote(node_labels: np.ndarray,
+                                 edge_index,
+                                 n_iters: int) -> np.ndarray:
+    """Majority-vote label smoothing over the graph.
+
+    Each node adopts the most common label among its graph neighbours (+ itself),
+    iterated — so speck / 'polluted' minority nodes are absorbed into the region
+    they physically sit in and the partition becomes spatially coherent. The
+    self-vote breaks ties toward staying put. ``edge_index`` may be a torch tensor
+    or a (2, E) numpy array; both edge directions are counted.
+
+    NOTE: this erodes thin real boundaries (small regions shrink), so it can
+    WEAKEN region confinement — prefer ``dissolve_root_labels`` for the atlas
+    catch-all. Kept because it feeds the hard prune.
+    """
+    if hasattr(edge_index, "detach"):
+        ei = edge_index.detach().cpu().numpy()
+    else:
+        ei = np.asarray(edge_index)
+    lab = np.asarray(node_labels).astype(np.int64).copy()
+    N = lab.shape[0]
+    for it in range(int(n_iters)):
+        uniq, comp = np.unique(lab, return_inverse=True)      # compact ids 0..K-1
+        votes = np.zeros((N, uniq.size), dtype=np.int32)
+        np.add.at(votes, (ei[0], comp[ei[1]]), 1)             # neighbour votes (both dirs)
+        np.add.at(votes, (ei[1], comp[ei[0]]), 1)
+        np.add.at(votes, (np.arange(N), comp), 1)             # self-vote (tie -> stay)
+        new = uniq[votes.argmax(1)]
+        changed = int((new != lab).sum())
+        lab = new
+        logging.info(f"  denoise-labels iter {it + 1}: {changed:,} nodes relabelled")
+        if changed == 0:
+            break
+    return lab
+
+
+def prune_cross_region_edges(edge_index, edge_value,
+                             node_labels: np.ndarray, prune: float,
+                             zero_is_region: bool, seed: int = 0):
+    """Hard-remove a fraction of cross-region edges, connectivity-preserving.
+
+    A HARD cut, vs ``inflate_cross_region_edges``' soft down-weight: removes
+    ``prune`` of the edges whose endpoints lie in different regions. Any node the
+    prune would ISOLATE keeps its single strongest incident edge (a bridge), so
+    the graph stays connected (no disconnected-component NaNs, no specks) instead
+    of shattering. On a clean partition this makes the boundary a real spectral
+    bottleneck. ``zero_is_region`` = whether label 0 is a real region (template
+    clusters) or a background/gap that is never a within/cross endpoint (atlas).
+
+    Returns ``(edge_index, edge_value)`` as torch tensors on the input device.
+    """
+    device = edge_index.device
+    ei_np = edge_index.detach().cpu().numpy()
+    ev_np = edge_value.detach().cpu().numpy()
+    Nn = int(node_labels.shape[0])
+    if zero_is_region:
+        cross = node_labels[ei_np[0]] != node_labels[ei_np[1]]
+    else:  # label 0 = background/gap: never treat as a within/cross region pair
+        cross = ((node_labels[ei_np[0]] != node_labels[ei_np[1]])
+                 & (node_labels[ei_np[0]] > 0) & (node_labels[ei_np[1]] > 0))
+    drop = np.zeros(cross.shape, bool)
+    cidx = np.where(cross)[0]
+    n_req = int(round(float(prune) * cidx.size))
+    if n_req:
+        drop[np.random.default_rng(seed).choice(cidx, n_req, replace=False)] = True
+    # connectivity-preserving: restore one (strongest) bridge per would-be-isolated node
+    deg = np.zeros(Nn)
+    np.add.at(deg, ei_np[0][~drop], 1); np.add.at(deg, ei_np[1][~drop], 1)
+    iso = deg == 0
+    n_iso0 = int(iso.sum())
+    if n_iso0:
+        ic = np.where((iso[ei_np[0]] | iso[ei_np[1]]) & drop)[0]
+        owner = np.where(iso[ei_np[0][ic]], ei_np[0][ic], ei_np[1][ic])
+        order = np.lexsort((ev_np[ic], owner))                # per owner, smallest ev first
+        firstm = np.ones(order.size, bool)
+        firstm[1:] = owner[order][1:] != owner[order][:-1]
+        drop[ic[order][firstm]] = False
+    keep_mask = torch.as_tensor(~drop, device=device)
+    n_before = edge_index.shape[1]
+    edge_index = edge_index[:, keep_mask]
+    edge_value = edge_value[keep_mask]
+    deg2 = np.zeros(Nn)
+    np.add.at(deg2, ei_np[0][~drop], 1); np.add.at(deg2, ei_np[1][~drop], 1)
+    logging.info(
+        f"  prune_cross_region_edges: pruned {int(drop.sum()):,}/{int(cross.sum()):,} "
+        f"cross-region edges (frac={prune:g}) — {n_before:,} -> "
+        f"{edge_index.shape[1]:,} edges; isolated nodes {n_iso0:,} -> "
+        f"{int((deg2 == 0).sum()):,} after bridges")
+    return edge_index, edge_value
+
+
 def labels_for_nodes_from_template_clustering(
     sub_volume: np.ndarray,
     threshold: float,
