@@ -161,12 +161,19 @@ esac
 if [ "$KNN_METHOD" = "faiss_atlas_weighted" ] && [ "$ROOT_HANDLING" != "cross" ]; then
     EXP_NAME="$EXP_NAME-root$ROOT_HANDLING"
 fi
-if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
-    EXP_NAME="$EXP_NAME-dn$DENOISE_LABELS"
-fi
-if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
-    EXP_NAME="$EXP_NAME-prune$PRUNE_CROSS_REGION"
-fi
+# denoise + prune only apply to the weighted methods (the Python side gates them
+# on faiss_atlas_weighted|faiss_cluster_weighted); tag the dir only there so a
+# faiss/anatomical run with a stray DENOISE_LABELS/PRUNE value isn't mislabelled.
+case "$KNN_METHOD" in
+    faiss_atlas_weighted|faiss_cluster_weighted)
+        if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
+            EXP_NAME="$EXP_NAME-dn$DENOISE_LABELS"
+        fi
+        if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
+            EXP_NAME="$EXP_NAME-prune$PRUNE_CROSS_REGION"
+        fi
+        ;;
+esac
 
 # Diffusion scale: always pass the init (1.0 = identity); learn it only when asked.
 # Encode the INIT VALUE in the tag (not just a boolean) so a sweep over inits gets

@@ -274,12 +274,18 @@ run_one() {
     if [ "$KMETHOD_" = "faiss_atlas_weighted" ] && [ "$ROOT_HANDLING" != "cross" ]; then
         TAG="${TAG}-root${ROOT_HANDLING}"
     fi
-    if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
-        TAG="${TAG}-dn${DENOISE_LABELS}"
-    fi
-    if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
-        TAG="${TAG}-prune${PRUNE_CROSS_REGION}"
-    fi
+    # denoise + prune only apply to the weighted methods (Python gates them there);
+    # tag only for those so a faiss/anatomical run isn't mislabelled by a stray value.
+    case "$KMETHOD_" in
+        faiss_atlas_weighted|faiss_cluster_weighted)
+            if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
+                TAG="${TAG}-dn${DENOISE_LABELS}"
+            fi
+            if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
+                TAG="${TAG}-prune${PRUNE_CROSS_REGION}"
+            fi
+            ;;
+    esac
     # Learned vs anchored inducing points → distinct output dirs (both families).
     [ "$LEARN_INDUCING" = "1" ] && TAG="${TAG}-learnind"
     # VNNGP runs get their own tag suffix so they don't clobber the analytic ones.
