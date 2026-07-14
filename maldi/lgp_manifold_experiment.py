@@ -137,6 +137,15 @@ def parse_args():
                              "Changes edges → distinct eigvec cache key.")
     parser.add_argument("--laplacian-norm", dest="laplacian_norm", type=str, default="symmetric",
                         choices=["symmetric", "randomwalk"])
+    parser.add_argument("--surface-kernel", dest="surface_kernel", action="store_true",
+                        help="Multiply the manifold kernel by a depth (distance-to-surface) "
+                             "factor: k = k_manifold(x) * k_depth(d_surface(x)). d_surface is "
+                             "computed once at startup (EDT on the tissue mask) and appended as "
+                             "the last input column that SurfaceRiemannMaternKernel reads.")
+    parser.add_argument("--surface-depth-lengthscale", dest="surface_depth_lengthscale",
+                        type=float, default=1.0,
+                        help="(--surface-kernel) init lengthscale of the depth factor "
+                             "(standardized-depth units). Large -> depth factor ~1 (opt out).")
     parser.add_argument("--stride", dest="stride", type=int, default=4, help="Stride to downsample the template.")
     parser.add_argument("--augment-maldi-nodes", dest="augment_maldi_nodes", action='store_true',
                         help="Add the measured MALDI voxels to the graph node set so every "
@@ -257,6 +266,25 @@ def setup_experiment(args):
     reference_nodes = torch.tensor(reference_ccf, dtype=torch.float32)
     reference_nodes = (reference_nodes - coord_mean) / coord_std
     reference_nodes = reference_nodes.to(config.device).contiguous()
+
+    # --- Surface depth feature (computed ONCE, on the strided grid nodes) ----
+    # d_surface = EDT distance-to-tissue-surface per node, standardized. The
+    # sampler maps any query/inducing coord to its nearest strided node's depth,
+    # so the SurfaceRiemannMaternKernel gets a consistent depth column at train
+    # AND predict time. Built here (before MALDI augmentation) so its node set
+    # matches reference_ccf's np.argwhere order.
+    surface_sampler = None
+    if bool(args.get("surface_kernel", False)):
+        from manifold_gp.utils.surface_depth import node_surface_depth, DepthSampler
+        node_vox = np.argwhere(sub_volume > threshold)
+        node_depth = node_surface_depth(
+            sub_volume, threshold, node_vox,
+            mm_per_voxel=float(voxel_scale_mm) * float(stride))
+        surface_sampler = DepthSampler(
+            reference_nodes.detach().cpu().numpy(), node_depth)
+        logging.info(
+            f"surface-kernel: d_surface for {node_vox.shape[0]:,} nodes "
+            f"(mean={surface_sampler.mean:.3f}mm std={surface_sampler.std:.3f}mm)")
 
     # Optionally add the measured MALDI voxels to the node set BEFORE the KNN
     # graph is built, so every measurement is an exact graph node (no

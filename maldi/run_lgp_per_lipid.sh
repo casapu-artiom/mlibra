@@ -19,7 +19,7 @@
 # =============================================================================
 
 # ---- which kernel ----
-: "${KERNEL_FAMILY:=spectral}"          # euclidean | manifold | eigenmap | spectral
+: "${KERNEL_FAMILY:=manifold}"          # euclidean | manifold | eigenmap | spectral
 : "${KERNEL:=matern}"                   # only used for euclidean / eigenmap
 # eigenmap: project coords into the leading EMBED_DIM Laplacian eigenfunctions,
 # then a Euclidean ARD Matern GP over that embedding (needs EIGENVECTOR_DIR).
@@ -36,9 +36,9 @@
 # ---- GP hyperparameters ----
 : "${NU:=2}"
 : "${NUM_INDUCING:=1000}"
-: "${INDUCING_SOURCE:=reference}"
+: "${INDUCING_SOURCE:=data}"
 : "${LIPID_BATCH_SIZE:=10}"
-: "${EPOCHS:=20}"
+: "${EPOCHS:=10}"
 : "${LEARNING_RATE:=0.005}"
 : "${BATCH_SIZE:=2048}"
 : "${SEED:=42}"
@@ -91,8 +91,8 @@
 # cross-region edges hard-removed (0=off). Non-cross root / any prune → fresh
 # eigvec cache key.
 : "${ROOT_HANDLING:=dissolve}"
-: "${DENOISE_LABELS:=0}"
-: "${PRUNE_CROSS_REGION:=0.0}"
+: "${DENOISE_LABELS:=3}"
+: "${PRUNE_CROSS_REGION:=0.97}"
 : "${LAPLACIAN_NORM:=randomwalk}"
 # Cosine/correlation kernel (manifold only, 1=on): L2-normalize the Riemann
 # feature rows so the prior variance is constant (diagonal=1) and the
@@ -117,7 +117,7 @@
 # so you can keep the graph at stride (AUGMENT_MALDI_NODES=0) and still blend.
 # Defaults to follow AUGMENT_MALDI_NODES only for backward compatibility; set it
 # to 1 explicitly to blend on a strided graph.
-: "${INDUCING_FROM_MALDI_NODES:=$AUGMENT_MALDI_NODES}"
+: "${INDUCING_FROM_MALDI_NODES:=1}"
 # Fraction of inducing points from the densest graph nodes (rest from
 # cheapest-to-snap MALDI nodes). Default 0.8 → 80/20 blend.
 : "${INDUCING_DENSITY_FRAC:=0.8}"
@@ -138,7 +138,7 @@
 #                 lengthscale from its own default init.
 # The chosen mode is encoded in the run TAG (fixls<val> | learnls) so the two
 # modes never clobber each other's output dir.
-: "${FIXED_LENGTHSCALE:=1}"
+: "${FIXED_LENGTHSCALE:=0}"
 : "${LENGTHSCALE_INIT:=8.0}"
 # Per-task lengthscale (manifold only, 1=on): each lipid in the batch gets its
 # OWN learnable lengthscale (PerTaskRiemannWrapper) instead of one shared across
@@ -162,6 +162,8 @@
 # families. LEARN_SPECTRAL_WEIGHTS=1 enables it and adds -learnspecw to the TAG so
 # it does not clobber the tied-density run's output dir.
 : "${LEARN_SPECTRAL_WEIGHTS:=0}"
+: "${SURFACE_KERNEL:=0}"                # 1 = multiply manifold kernel by a depth (d_surface) factor
+: "${SURFACE_DEPTH_LENGTHSCALE:=1.0}"   # (surface) init lengthscale of the depth factor
 
 # ---- data paths (same as run_manifold.sh) ----
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -249,6 +251,7 @@ run_one() {
         [ "$LEARN_SPECTRAL_WEIGHTS" = "1" ] && TAG="${TAG}-learnspecw"
         # Cosine/correlation kernel (unit-norm features) → distinct dirs.
         [ "$NORMALIZE_FEATURES" = "1" ] && TAG="${TAG}-cos"
+        [ "$SURFACE_KERNEL" = "1" ] && TAG="${TAG}-surf-dls${SURFACE_DEPTH_LENGTHSCALE}"
     elif [ "$FAMILY" = "eigenmap" ]; then
         TAG="eigenmap-r${EMBED_DIM}-${ARD_TAG}-${KERNEL}-nu${NU_}-K${NMODES_}-stride${STRIDE}-knn${KNN_}-${KMETHOD_}-${THRESHOLD}-${LN_}-ind${INDU_}-lr${LR_}-ep${EPS_}-lbs${LBS_}"
     elif [ "$FAMILY" = "spectral" ]; then
@@ -357,6 +360,8 @@ run_one() {
                 manifold_args="$manifold_args --per-task-lengthscale"
             [ "$NORMALIZE_FEATURES" = "1" ] && \
                 manifold_args="$manifold_args --normalize-features"
+            [ "$SURFACE_KERNEL" = "1" ] && \
+                manifold_args="$manifold_args --surface-kernel --surface-depth-lengthscale $SURFACE_DEPTH_LENGTHSCALE"
         fi
         # Eigenmap embedding dimension.
         if [ "$FAMILY" = "eigenmap" ]; then

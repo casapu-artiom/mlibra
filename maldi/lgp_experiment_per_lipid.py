@@ -89,6 +89,7 @@ from manifold_gp.utils.anatomical_knn import (
     denoise_labels_majority_vote, prune_cross_region_edges,
 )
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
+from manifold_gp.kernels.surface_kernels import SurfaceRiemannMaternKernel
 
 
 # =============================================================================
@@ -386,6 +387,18 @@ def parse_args() -> dict:
                         "Warm-started at the Matern density. Applies to the manifold and "
                         "spectral families; with one knob per mode, use more epochs / a "
                         "smoothness prior to avoid overfitting.")
+    p.add_argument("--surface-kernel", dest="surface_kernel", action="store_true",
+                   help="Multiply the manifold kernel by a depth (distance-to-surface) "
+                        "factor: k = k_manifold(x) * k_depth(d_surface(x)), i.e. use "
+                        "SurfaceRiemannMaternKernel. d_surface = EDT distance-to-tissue-"
+                        "surface, computed once at startup; the kernel samples it from "
+                        "the (unchanged 3-D) coords internally (nearest node), so the "
+                        "coords/inducing/predict paths are untouched. Manifold family only.")
+    p.add_argument("--surface-depth-lengthscale", dest="surface_depth_lengthscale",
+                   type=float, default=1.0,
+                   help="(--surface-kernel) init lengthscale of the depth factor "
+                        "(standardized-depth units). Large -> depth factor ~1 (opt out); "
+                        "learnable, one per task under --per-task-lengthscale.")
     p.add_argument("--bump-scale", type=float, default=20.0)
     p.add_argument("--bump-decay", type=float, default=0.01)
     p.add_argument("--num-modes", type=int, default=1300)
@@ -470,7 +483,7 @@ def parse_args() -> dict:
                          "informative). At or above the threshold, the "
                          "step is skipped entirely — too much zeroing "
                          "means moving in an essentially random "
-                         "direction. Default 0.01 (1% of params). Set "
+                         "direction. Default 0.01 (1%% of params). Set "
                          "higher (e.g. 0.1) to tolerate more zeroing; "
                          "set lower (e.g. 0.001) to skip more "
                          "aggressively."))
@@ -956,8 +969,30 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         allow_larger_modes=True,
     )
 
-    # Kernel
-    manifold_kernel = RiemannMaternKernel(
+    # --- optional surface (distance-to-surface) depth factor ---
+    # d_surface = EDT depth per strided node; SurfaceRiemannMaternKernel samples it
+    # from the coords INTERNALLY (nearest node), so inducing snap / learn-inducing /
+    # predict all stay unchanged (coords remain 3-D). DepthSampler z-scores depth,
+    # so the mm_per_voxel scale is irrelevant. Built on the strided grid nodes
+    # (reference_nodes[:n_atlas_nodes]) so it's independent of any MALDI augmentation.
+    surface_sampler = None
+    if args.get("surface_kernel", False):
+        from manifold_gp.utils.surface_depth import node_surface_depth, DepthSampler
+        node_vox = np.argwhere(sub_volume > args["threshold"])
+        node_depth = node_surface_depth(
+            sub_volume, args["threshold"], node_vox, mm_per_voxel=float(voxel_scale_mm))
+        surface_sampler = DepthSampler(
+            reference_nodes[:n_atlas_nodes].detach().cpu().numpy(), node_depth)
+        log.info(f"surface-kernel: d_surface for {node_vox.shape[0]:,} nodes "
+                 f"(mean={surface_sampler.mean:.3f} std={surface_sampler.std:.3f}); "
+                 f"depth_lengthscale_init={args.get('surface_depth_lengthscale', 1.0)}")
+
+    # Kernel: SurfaceRiemannMaternKernel when --surface-kernel, else RiemannMaternKernel.
+    _KernelCls = SurfaceRiemannMaternKernel if surface_sampler is not None else RiemannMaternKernel
+    _surf_kw = (dict(depth_sampler=surface_sampler,
+                     depth_lengthscale=float(args.get("surface_depth_lengthscale", 1.0)))
+                if surface_sampler is not None else {})
+    manifold_kernel = _KernelCls(
         nu=args["nu"], knn=knn, edge_index=edge_index, edge_value=edge_value,
         eigval=eigval, eigvec=eigvec,
         nearest_neighbors=args["knn_k"], num_modes=args["num_modes"],
@@ -968,6 +1003,7 @@ def setup_manifold_kernel(args, config, coord_mean, coord_std, log):
         diffusion_scale_init=args.get("diffusion_scale_init", 1.0),
         learn_diffusion_scale=args.get("learn_diffusion_scale", False),
         learn_spectral_weights=args.get("learn_spectral_weights", False),
+        **_surf_kw,
     ).to(args["device"])
     manifold_kernel.eval()
 
@@ -1315,8 +1351,14 @@ def train_lipid_batch(
             # One RiemannMaternKernel per task, *sharing* the eigenpairs/graph
             # tensors (passed by reference) but with an independent lengthscale.
             mk = manifold_kernel
+            # Match the base kernel's class; carry the surface depth factor (shared
+            # sampler, per-task learnable depth_lengthscale) when it's a surface kernel.
+            _KernelCls = type(mk)
+            _surf_kw = (dict(depth_sampler=mk._depth_sampler,
+                             depth_lengthscale=float(mk.depth_lengthscale))
+                        if isinstance(mk, SurfaceRiemannMaternKernel) else {})
             manifold_arg = [
-                RiemannMaternKernel(
+                _KernelCls(
                     nu=mk.nu, knn=mk.knn, edge_index=mk.edge_index,
                     edge_value=mk.edge_value, eigval=mk.eigval, eigvec=mk.eigvec,
                     nearest_neighbors=mk.nearest_neighbors, num_modes=mk.num_modes,
@@ -1327,6 +1369,7 @@ def train_lipid_batch(
                     diffusion_scale_init=float(mk.diffusion_scale),
                     learn_diffusion_scale=args.get("learn_diffusion_scale", False),
                     learn_spectral_weights=args.get("learn_spectral_weights", False),
+                    **_surf_kw,
                 ).to(device)
                 for _ in range(n_tasks)
             ]

@@ -437,6 +437,23 @@ class KnnGraphCache:
             `threshold`, `atlas_volume`, and `coords` (one row per tissue
             voxel, in `np.where(mask)` order).
         """
+        # 0. Guard against the nprobe=1 + IVF footgun. An IVF index (nlist>1)
+        #    with nprobe=1 searches only ONE Voronoi cell, so the built graph
+        #    fragments into ~nlist disconnected components (neighbours never cross
+        #    cells) AND prediction-time searches have terrible recall. nprobe is
+        #    NOT part of the cache key, so a graph built this way silently poisons
+        #    the shared cache under a "good" key. Fail the whole run rather than
+        #    build/return a broken graph. nprobe=1 is only valid with nlist=1
+        #    (exact flat index).
+        if nlist is not None and nlist > 1 and nprobe == 1:
+            raise ValueError(
+                f"KnnGraphCache.train_or_load: nlist={nlist} (>1 -> IVF index) with "
+                f"nprobe=1 builds a FRAGMENTED graph (~{nlist} disconnected "
+                f"components) and gives poor search recall. Pass nprobe>=8 (e.g. "
+                f"nprobe=8, or nprobe='sqrt' -> {resolve_nprobe('sqrt', nlist)}). "
+                f"nprobe=1 is only valid with nlist=1 (exact flat index)."
+            )
+
         # 1. Try cache
         if not force_recompute:
             hit = self.load(key, device=device)

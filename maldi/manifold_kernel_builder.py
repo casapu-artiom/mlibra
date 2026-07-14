@@ -29,6 +29,7 @@ from manifold_gp.utils.nearest_neighbors import (
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
     labels_for_nodes_from_template_clustering,
+    dissolve_root_labels, denoise_labels_majority_vote, prune_cross_region_edges,
 )
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 
@@ -75,6 +76,19 @@ def add_manifold_args(parser):
     parser.add_argument("--cross-region-inflation", dest="cross_region_inflation", type=float, default=10.0,
                         help="(--knn-method faiss_atlas_weighted|faiss_cluster_weighted) "
                              "cross-region edge-weight inflation.")
+    parser.add_argument("--root-handling", dest="root_handling", type=str, default="dissolve",
+                        choices=["dissolve", "ignore", "cross"],
+                        help="(faiss_atlas_weighted) atlas label-0 'root' handling: "
+                             "'dissolve' folds it into the nearest region (default), "
+                             "'ignore' keeps it as its own region, 'cross' treats it as "
+                             "background gap (legacy treat_zero_as_cross=True). Non-'cross' "
+                             "changes the eigvec cache key.")
+    parser.add_argument("--denoise-labels", dest="denoise_labels", type=int, default=0,
+                        help="(weighted methods) majority-vote label smoothing passes "
+                             "before the hard prune (0=off).")
+    parser.add_argument("--prune-cross-region", dest="prune_cross_region", type=float, default=0.0,
+                        help="(weighted methods) fraction of cross-region edges to HARD-remove "
+                             "after inflation (0=off). Changes the eigvec cache key.")
     parser.add_argument("--cluster-k", dest="cluster_k", type=int, default=64,
                         help="(--knn-method faiss_cluster_weighted) number of template-clustering "
                              "regions used as node labels (no annotations-file needed).")
@@ -222,14 +236,23 @@ def build_manifold_graph(args, config, coord_mean, coord_std):
                 f"and graph nodes ({knn.x.shape[0]}). Check that atlas and "
                 f"reference template were cropped/strided identically."
             )
+        # Root handling: the atlas label-0 'root' is real tissue, not background;
+        # 'dissolve' (default) folds it into the nearest region so the soft prior
+        # doesn't spray through interiors. 'cross' = legacy treat_zero_as_cross=True.
+        root_mode = str(args.get("root_handling", "dissolve"))
+        if root_mode == "dissolve":
+            node_labels = dissolve_root_labels(
+                node_labels, reference_nodes.detach().cpu().numpy())
         inflation = float(args.get("cross_region_inflation", 10.0))
         edge_index, edge_value, _info = inflate_cross_region_edges(
             edge_index, edge_value, node_labels,
-            inflation=inflation, treat_zero_as_cross=True,
+            inflation=inflation, treat_zero_as_cross=(root_mode == "cross"),
         )
-        graph_key_parts["weighting"] = (
+        _base_wt = (
             f"atlas_x{inflation:g}" if _legacy_atlas else f"{atlas_stem}_x{inflation:g}"
         )
+        graph_key_parts["weighting"] = (
+            _base_wt if root_mode == "cross" else f"{_base_wt}_root{root_mode}")
         graph_key = make_graph_key(graph_key_parts)
     elif knn_method == "faiss_cluster_weighted":
         # Data-driven, whole-brain, lipid-free labels: cluster the reference
@@ -272,6 +295,25 @@ def build_manifold_graph(args, config, coord_mean, coord_std):
         graph_key = make_graph_key(graph_key_parts)
     else:
         raise ValueError(f"Unknown knn_method: {knn_method!r}")
+
+    # ---- Label denoise + hard prune (weighted methods, after inflation) ----
+    # Refine the HARD topology on the region labels the graph was weighted on.
+    # Prune changes edges → the eigvecs change, so prune (+ the denoise that
+    # shaped it) go into the eigvec cache key; denoise alone leaves edges intact.
+    if knn_method in ("faiss_atlas_weighted", "faiss_cluster_weighted"):
+        n_denoise = int(args.get("denoise_labels", 0) or 0)
+        prune = float(args.get("prune_cross_region", 0.0) or 0.0)
+        if n_denoise > 0:
+            node_labels = denoise_labels_majority_vote(
+                node_labels, edge_index, n_denoise)
+        if prune > 0.0:
+            edge_index, edge_value = prune_cross_region_edges(
+                edge_index, edge_value, node_labels, prune,
+                zero_is_region=(knn_method == "faiss_cluster_weighted"))
+            graph_key_parts["prune"] = f"{prune:g}"
+            if n_denoise > 0:
+                graph_key_parts["denoise"] = n_denoise
+            graph_key = make_graph_key(graph_key_parts)
 
     return knn, edge_index, edge_value, graph_key
 

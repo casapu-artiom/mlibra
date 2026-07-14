@@ -45,6 +45,8 @@ Usage
     python maldi/lgp_report.py /home/casap/mlibra/output
     python maldi/lgp_report.py out_a out_b out_c            # multiple roots pooled
     python maldi/lgp_report.py /path/to/out --split test --metric r2
+    python maldi/lgp_report.py /path/to/out --fold fold_3               # one fold
+    python maldi/lgp_report.py /path/to/out --fold fold_2 difficult     # several
     python maldi/lgp_report.py /path/to/out --family gplfr --csv-dir ./lgp_report_out
     python maldi/lgp_report.py /path/to/out --lipid-names-file .../available_lipids.npy
 """
@@ -264,6 +266,10 @@ def main() -> int:
     ap.add_argument("--family", default=None,
                     help="Only include runs whose family contains this substring "
                          "(e.g. manifold, lgp, baseline).")
+    ap.add_argument("--fold", nargs="+", default=None, metavar="FOLD",
+                    help="Only include runs whose fold contains one of these substrings "
+                         "(e.g. --fold fold_2 fold_3, or --fold difficult). The fold label "
+                         "is the run's slices_dataset_file stem, so '3' matches 'fold_3'.")
     ap.add_argument("--sort", default="fold",
                     help="Column to sort the per-run table by (default 'fold').")
     ap.add_argument("--lipid-names-file", type=Path, default=None,
@@ -307,8 +313,18 @@ def main() -> int:
         print(f"No {args.split}/predictions.npy found anywhere under {roots_str}", file=sys.stderr)
         return 1
 
+    fold_pats = [f.lower() for f in args.fold] if args.fold else None
+
     runs = []
+    skipped_folds: set[str] = set()
     for d in run_dirs:
+        # The fold is derivable from args.npy alone, so filter BEFORE load_run —
+        # that skips the (expensive) metric recompute for folds we don't want.
+        run_args = _load_args(d)
+        fold = derive_fold(d, run_args)
+        if fold_pats and not any(p in fold.lower() for p in fold_pats):
+            skipped_folds.add(fold)
+            continue
         r = load_run(d, args.split, args.chunk_rows, lipid_names, args.force,
                      source=run_dir_to_source[d])
         if r is None:
@@ -319,8 +335,16 @@ def main() -> int:
         runs.append(r)
     if not runs:
         roots_str = ", ".join(str(r) for r in roots)
+        filters = []
+        if args.family:
+            filters.append(f"family~='{args.family}'")
+        if args.fold:
+            filters.append(f"fold~='{' | '.join(args.fold)}'")
         print(f"Found {args.split} arrays under {roots_str} but none were usable"
-              + (f" for family~='{args.family}'." if args.family else "."), file=sys.stderr)
+              + (f" for {', '.join(filters)}." if filters else "."), file=sys.stderr)
+        if skipped_folds:
+            print(f"  folds present but filtered out: {', '.join(sorted(skipped_folds))}",
+                  file=sys.stderr)
         return 1
 
     long_df, per_run, per_fold, per_lipid_model = build_tables(runs, args.metric)
@@ -336,6 +360,15 @@ def main() -> int:
     print(f"  runs: {len(runs)}   folds: {long_df['fold'].nunique()}   "
           f"families: {long_df['family'].nunique()}   lipid-rows: {len(long_df)}   "
           f"failed: {n_failed}")
+    if args.fold or args.family:
+        bits = []
+        if args.fold:
+            bits.append(f"fold~={' | '.join(args.fold)}")
+        if args.family:
+            bits.append(f"family~={args.family}")
+        kept = ", ".join(sorted(long_df["fold"].unique()))
+        print(f"  filtered: {'   '.join(bits)}   -> folds kept: {kept}"
+              + (f"   (skipped: {', '.join(sorted(skipped_folds))})" if skipped_folds else ""))
     print("=" * 100)
 
     print("\n### PER-FOLD x FAMILY SUMMARY (lipids pooled)")
