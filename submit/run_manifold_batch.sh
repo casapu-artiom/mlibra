@@ -50,7 +50,7 @@ N_PROBE=${N_PROBE:-8}
 N_EPOCHS=30
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_long_cv"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_cv_prune_low_bw"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -58,7 +58,7 @@ S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
 # The run script keys graph/eigenvector caches by the file's stem, and tags the
 # output dir with it, so level5 vs level15 never collide. Re-invoke with a
 # different ATLAS_LEVEL to run the other level (upload level_5annot.npy to S3 first).
-ATLAS_LEVEL=${ATLAS_LEVEL:-5}
+ATLAS_LEVEL=${ATLAS_LEVEL:-15}
 S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_${ATLAS_LEVEL}annot.npy"
 S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
@@ -71,7 +71,7 @@ SRC_PATH="/myhome/mlibra"
 # RECONSTRUCTION_LIPIDS_FILE=... ./submit/run_manifold_batch.sh
 RECON_LIPIDS_FILE="${RECONSTRUCTION_LIPIDS_FILE:-$SRC_PATH/maldi/data/lipid_subset.txt}"
 
-EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
+EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')-2"
 
 submit() {
     local job_name=$1 template=$2 ref=$3 annot=$4 infl=$5 threshold=$6 knn=$7 knn_k=$8 laplacian_norm=$9 nu=${10} graphbandwidth=${11} bumpscale=${12} bumpdecay=${13} prefix=${14} slice=${15} stride=${16} num_modes=${17} ind_source=${18} diffusion_init=${19} learn_diffusion=${20} product_ard=${21} product_ard_nu=${22}
@@ -79,7 +79,7 @@ submit() {
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
-        -i artiomartiom/sdsc:withfaiss \
+        -i artiomartiom/sdsc:maldi_manifold_all_latest \
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
@@ -127,6 +127,9 @@ submit() {
         -e CLUSTER_SPATIAL_WEIGHT="${CLUSTER_SPATIAL_WEIGHT:-1.0}" \
         -e CLUSTER_FIT_SUBSAMPLE="${CLUSTER_FIT_SUBSAMPLE:-40000}" \
         -e CLUSTER_SEED="${CLUSTER_SEED:-0}" \
+        -e ROOT_HANDLING="${ROOT_HANDLING:-dissolve}" \
+        -e DENOISE_LABELS="${DENOISE_LABELS:-3}" \
+        -e PRUNE_CROSS_REGION="${PRUNE_CROSS_REGION:-0.0}" \
         -- ./maldi/run_manifold.sh "${extra_args[@]}"
 }
 
@@ -143,19 +146,31 @@ submit() {
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.1 1.0)
 
-FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
+#FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
+FOLDS=("fold-2" "fold-7")           # lowercase, dashed
 KNN_K=(15)
 # Graph methods to sweep. Override at submit time (space-separated), e.g.
 #   MAN_KNN_METHODS_STR="faiss faiss_cluster_weighted" ATLAS_LEVEL=5 ./submit/run_manifold_batch.sh
 #   'faiss'                = plain kNN, no prior
 #   'faiss_atlas_weighted' = atlas-region inflation (uses ATLAS_LEVEL's annotation volume)
 #   'faiss_cluster_weighted' = template-clustering inflation (no atlas; CLUSTER_* knobs)
-MAN_KNN_METHODS=(faiss faiss_atlas_weighted faiss_cluster_weighted)
+MAN_KNN_METHODS=(faiss_atlas_weighted)
 # Cross-region inflation, used by faiss_atlas_weighted AND faiss_cluster_weighted.
 MAN_INFLATIONS=(50)
+# ---- graph-refinement sweeps (weighted methods only) ----------------------
+# Swept independently, like MAN_INFLATIONS. Non-weighted methods (plain faiss)
+# collapse to the no-op single value so they aren't submitted redundantly.
+#   ROOT_HANDLINGS: faiss_atlas_weighted only — dissolve / ignore / cross.
+#   MAN_DENOISE_LABELS: majority-vote label-smoothing passes (0 = off).
+#   MAN_PRUNE_CROSS_REGIONS: fraction of cross-region edges hard-cut (0.0 = off).
+# Each distinct value gets its own dir tag (-root/-dn/-prune), so a sweep never
+# clobbers. e.g. MAN_PRUNE_CROSS_REGIONS=(0.0 0.5 0.9) compares off / mild / hard.
+ROOT_HANDLINGS=("dissolve")
+MAN_DENOISE_LABELS=(3)
+MAN_PRUNE_CROSS_REGIONS=(0.95 0.97)
 LAPLACIAN_NORMS=("randomwalk")
-GRAPH_BANDWIDTHS=(0.1)
-BUMP_SCALES=(1.0)
+GRAPH_BANDWIDTHS=(0.05)
+BUMP_SCALES=(1.0 3.0 6.0)
 BUMP_DECAYS=(0.01)
 # BUMP_SCALES=(1 20 80)
 # BUMP_DECAYS=(0.1 1.0
@@ -187,6 +202,7 @@ PRODUCT_ARD=("0:2.5")
 #   (2) stride=8, num_modes=6000
 #STRIDE_NUM_MODES=("4:1300" "8:6000")
 #STRIDE_NUM_MODES=("4:50" "4:100" "4:300" "4:1300" "4:2300")
+#STRIDE_NUM_MODES=("4:1300")
 STRIDE_NUM_MODES=("4:100" "4:300")
 
 # Fixed across the whole sweep
@@ -228,10 +244,25 @@ for fold in "${FOLDS[@]}"; do
                                                 INDUCING_DENSITY_FRAC=0.8
                                                 ind_source_arg=$ind_src
                                             fi
+                                            # Graph-prior lists apply only to the weighted
+                                            # methods; plain faiss collapses each to its
+                                            # no-op single value (1 / dissolve / 0 / 0.0) so
+                                            # it isn't submitted once per prune/denoise value.
                                             if [ "$knn_method" = "faiss_atlas_weighted" ] || [ "$knn_method" = "faiss_cluster_weighted" ]; then
                                                 infl_list=("${MAN_INFLATIONS[@]}")
+                                                denoise_list=("${MAN_DENOISE_LABELS[@]}")
+                                                prune_list=("${MAN_PRUNE_CROSS_REGIONS[@]}")
                                             else
                                                 infl_list=(1)
+                                                denoise_list=(0)
+                                                prune_list=(0.0)
+                                            fi
+                                            # root handling is atlas-only (cluster id 0 is a
+                                            # real region; faiss has no labels) → single value.
+                                            if [ "$knn_method" = "faiss_atlas_weighted" ]; then
+                                                root_list=("${ROOT_HANDLINGS[@]}")
+                                            else
+                                                root_list=(dissolve)
                                             fi
                                             for infl in "${infl_list[@]}"; do
                                               for diff in "${DIFFUSION_SCALES[@]}"; do
@@ -240,17 +271,26 @@ for fold in "${FOLDS[@]}"; do
                                                for prod in "${PRODUCT_ARD[@]}"; do
                                                 product_ard=${prod%%:*}
                                                 product_ard_nu=${prod##*:}
+                                                for ROOT_HANDLING in "${root_list[@]}"; do
+                                                 for DENOISE_LABELS in "${denoise_list[@]}"; do
+                                                  for PRUNE_CROSS_REGION in "${prune_list[@]}"; do
+                                                    # ROOT_HANDLING/DENOISE_LABELS/PRUNE_CROSS_REGION
+                                                    # are read by submit() via its -e ${VAR:-…}
+                                                    # lines (same idiom as INDUCING_FROM_MALDI_NODES).
 
-                                                job_name="gp-manifold-${EXP_SUFFIX}-${exp_num}"
+                                                    job_name="gp-manifold-${EXP_SUFFIX}-${exp_num}"
 
-                                                # Map exp_num -> config, so you can read it back from terminal/logs
-                                                printf "  exp %2d: fold=%-10s stride=%s modes=%s ind=%-9s gb=%-5s bs=%-4s bd=%s diff=%s(learn=%s) prodard=%s(nu=%s)\n" \
-                                                    "$exp_num" "$fold" "$stride" "$num_modes" "$ind_src" "$gb" "$bs" "$bd" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
+                                                    # Map exp_num -> config, so you can read it back from terminal/logs
+                                                    printf "  exp %2d: fold=%-10s stride=%s modes=%s ind=%-9s gb=%-5s bs=%-4s bd=%s diff=%s(learn=%s) prodard=%s(nu=%s) root=%s dn=%s prune=%s\n" \
+                                                        "$exp_num" "$fold" "$stride" "$num_modes" "$ind_src" "$gb" "$bs" "$bd" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu" "$ROOT_HANDLING" "$DENOISE_LABELS" "$PRUNE_CROSS_REGION"
 
-                                                run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" "$infl" "$threshold" \
-                                                    "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$ind_source_arg" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
+                                                    run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" "$infl" "$threshold" \
+                                                        "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$ind_source_arg" "$diffusion_init" "$learn_diffusion" "$product_ard" "$product_ard_nu"
 
-                                                exp_num=$((exp_num + 1))
+                                                    exp_num=$((exp_num + 1))
+                                                  done
+                                                 done
+                                                done
                                                done
                                               done
                                             done

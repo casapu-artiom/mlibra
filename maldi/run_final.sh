@@ -21,6 +21,14 @@
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=FOLD-2}"
 
+# Reconstruct only the voxels the composite render actually reads (slice planes +
+# the 3D MIP's stride): ~5.5x fewer voxels, near-identical figure. Writes sparse
+# volumes to volume_sparse/ instead of the dense volume/ that napari + the
+# analysis scripts consume -- so set it to 0 if you need the full 3D volumes.
+: "${RENDER_VOXELS_ONLY:=1}"
+RENDER_ARGS=""
+[ "$RENDER_VOXELS_ONLY" != "0" ] && RENDER_ARGS="--render-voxels-only"
+
 if [ "$NO_RSAMPLE" = "true" ] || [ "$NO_RSAMPLE" = "1" ]; then
     SAMPLING_TAG="MEAN"         # Update this to whatever you want the name to be without rsample
     SAMPLING_FLAG="--no-rsample" # The flag to pass to your python script
@@ -104,5 +112,6 @@ python $SRC_PATH/maldi/lgp_experiment.py \
     --mode "$MODE" \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
+    $RENDER_ARGS \
     $LEARN_INDUCING_FLAG $ARD_FLAG \
     $SAMPLING_FLAG "$@"

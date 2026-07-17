@@ -1,0 +1,9 @@
+# Faithful DeepSpatial (transport mode) dependencies.
+# NOTE: this is a HEAVY dependency set (Lightning, POT, torchdiffeq, timm,
+# scanpy/anndata, pyvista) intentionally kept OUT of the main requirements.txt /
+# Dockerfile so the pure-torch container for NTF / Spa3D / the manifold GP stays
+# light. Install only for the DeepSpatial transport experiment (Dockerfile.deepspatial).
+#
+# Pulls the transitive chain: pytorch-lightning, POT, torchdiffeq, timm, einops,
+# scanpy, anndata, pyvista, umap-learn, numba, ...
+deepspatial==1.0.0

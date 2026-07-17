@@ -84,6 +84,14 @@ FAISS_CPU_ARGS=""
 [ "$FAISS_CPU_SEARCH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-search"
 [ "$FAISS_CPU_RECON" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-recon"
 
+# Reconstruct only the voxels the composite render actually reads (slice planes +
+# the 3D MIP's stride): ~5.5x fewer voxels, near-identical figure. Writes sparse
+# volumes to volume_sparse/ instead of the dense volume/ that napari + the
+# analysis scripts consume -- so set it to 0 if you need the full 3D volumes.
+: "${RENDER_VOXELS_ONLY:=1}"
+RENDER_ARGS=""
+[ "$RENDER_VOXELS_ONLY" != "0" ] && RENDER_ARGS="--render-voxels-only"
+
 # Force a fresh KNN-graph build (bypass the cache) -- needed to actually time
 # graph construction; otherwise the cached graph is just reloaded.
 : "${FORCE_RECOMPUTE_GRAPH:=0}"
@@ -263,4 +271,5 @@ python $SRC_PATH/maldi/lgp_manifold_experiment.py \
     --n-probe "$N_PROBE" \
     --available-lipids-file $AVAILABLE_LIPIDS_FILE \
     --do-brain-reconstruction \
+    $RENDER_ARGS \
     $FAISS_CPU_ARGS $SAMPLING_FLAG "$@"

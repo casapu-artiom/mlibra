@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Submit the SOTA 3D-reconstruction papers (NTF / Spa3D / DeepSpatial) on MALDI
-# to run:ai, one job per (model, fold). Mirrors run_submit_baselines.sh.
+# Submit the SOTA 3D-reconstruction papers (NTF / Spa3D / DeepSpatial / GPLFR) on
+# MALDI to run:ai, one job per (fold, model, sweep-config). Mirrors
+# run_submit_baselines.sh.
+#
+# Structure:
+#   * FOLDS is a single CV list, shared across ALL models (outer loop).
+#   * each model has its OWN sweep grid (sweep_for_model) over the knobs that
+#     actually matter for it -- so a CV run also sweeps the right hyperparams.
+#   * the sweep TAG is folded into the job name AND EXP_PREFIX, so every
+#     (fold, model, config) writes to a distinct output dir (no clobbering).
 #
 # The runner (sota/run_sota.sh) already specifies every input/output path with a
-# LOCAL default; this script just overrides the I/O env vars (-e DATA_PATH,
-# OUTPUT_DIR, MALDI_FILE, ...) to point at the S3-mounted dirs. Each job does
-# whole-brain reconstruction + renders + per-lipid true-vs-pred scatterplots
-# (RECONSTRUCT=whole_brain), so outputs are comparable to the manifold/baseline
-# runs.
+# LOCAL default; this script overrides the I/O env vars to point at the
+# S3-mounted dirs. Each job does whole-brain reconstruction + renders + per-lipid
+# diagnostics (RECONSTRUCT=whole_brain), comparable to the manifold/baseline runs.
 #
-#   ./submit/run_sota_batch.sh                    # all models, default fold(s)
-#   MODELS="ntf" ./submit/run_sota_batch.sh       # just NTF
-#   FOLDS="fold-1 fold-2" ./submit/run_sota_batch.sh
-#   DRY_RUN=1 ./submit/run_sota_batch.sh          # print the runai commands only
+#   ./submit/run_sota_batch.sh                          # default models, folds, full sweep
+#   MODELS="ntf" ./submit/run_sota_batch.sh             # just NTF (still swept)
+#   MODELS="ntf spa3d deepspatial gplfr" ...            # add GPLFR (needs EIGENVECTOR_DIR)
+#   FOLDS="fold-1 fold-2 fold-3" ./submit/run_sota_batch.sh
+#   SWEEP=0 ./submit/run_sota_batch.sh                  # one default config per model (no sweep)
+#   DRY_RUN=1 ./submit/run_sota_batch.sh                # print the runai commands + job count only
 set -euo pipefail
 
 DRY_RUN=${DRY_RUN:-0}
+SWEEP=${SWEEP:-1}                     # 1 = full per-model grid; 0 = single default config
+N_JOBS=0
 
 run_or_echo() {
     if [ "$DRY_RUN" = "1" ]; then
@@ -45,13 +55,6 @@ GPU=0.5
 WANDB=${WANDB:-1}
 WANDB_PROJECT=${WANDB_PROJECT:-sota_maldi}
 
-# DeepSpatial (generative flow) converges slowest; give it more epochs.
-N_EPOCHS=${N_EPOCHS:-30}
-N_EPOCHS_DEEPSPATIAL=${N_EPOCHS_DEEPSPATIAL:-60}
-BATCH_SIZE=${BATCH_SIZE:-16384}
-# Spa3D uses per-batch KNN (O(batch^2) cdist), so it wants a smaller batch.
-BATCH_SIZE_SPA3D=${BATCH_SIZE_SPA3D:-4096}
-
 # ---- S3-mounted I/O overrides (the runner defaults are LOCAL) --------------
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_OUTPUT_DIR=${S3_OUTPUT_DIR:-"/s3/mlibra/mlibra-data/artiom/sota_batch"}
@@ -59,16 +62,65 @@ S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
 S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_15annot.npy"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
+# Precomputed eigenvectors -- only GPLFR's riemann/spectral bases need these.
+S3_EIGENVECTOR_DIR=${S3_EIGENVECTOR_DIR:-"/s3/mlibra/mlibra-data/artiom/eigenvectors"}
 SRC_PATH="/myhome/mlibra"
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
+# ---------------------------------------------------------------------------
+# Per-model sweep grids. One config per "echo" line: "TAG:ENV1=v1 ENV2=v2 ...".
+#   - TAG (lowercase, dash-safe) is folded into the job name + EXP_PREFIX.
+#   - every param (incl. N_EPOCHS + BATCH_SIZE) is spelled out ON THE LINE, so a
+#     line is fully self-contained: comment it out to drop that config, copy it to
+#     add one, edit any value in place. Duplication is intentional (readability).
+# SWEEP=0 runs only the FIRST line of each model's grid.
+# Knobs chosen (see the design discussion): NTF -> regularization (weight-decay/TV);
+# Spa3D -> z_weight (3D-ness) + SPE on/off; DeepSpatial -> pairing + UOT sharpness;
+# GPLFR -> the base GP (riemann/spectral need EIGENVECTOR_DIR).
+# ---------------------------------------------------------------------------
+sweep_for_model() {
+    case "$1" in
+        ntf)
+            echo "wd1e4-tv05:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.05"
+            echo "wd1e3-tv05:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.001 NTF_TV_WEIGHT=0.05"
+            echo "wd1e2-tv05:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.01 NTF_TV_WEIGHT=0.05"
+            echo "wd1e3-tv20:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.001 NTF_TV_WEIGHT=0.2"
+            echo "wd1e3-tv00:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.001 NTF_TV_WEIGHT=0.0"
+            ;;
+        spa3d)
+            echo "zw03-alft:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=alft"
+            echo "zw06-alft:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.6 SPA3D_SPE=alft"
+            echo "zw10-alft:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=1.0 SPA3D_SPE=alft"
+            echo "zw03-none:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=none"
+            ;;
+        deepspatial)
+            echo "cross-reg03:N_EPOCHS=100 BATCH_SIZE=256 DS_PAIRING=cross-mouse DS_UOT_REG=0.3 DS_MAX_CELLS=8000"
+            echo "cross-reg08:N_EPOCHS=100 BATCH_SIZE=256 DS_PAIRING=cross-mouse DS_UOT_REG=0.8 DS_MAX_CELLS=8000"
+            echo "within-reg03:N_EPOCHS=100 BATCH_SIZE=256 DS_PAIRING=within-mouse DS_UOT_REG=0.3 DS_MAX_CELLS=8000"
+            ;;
+        gplfr)
+            echo "euclidean:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=euclidean"
+            echo "riemann:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=riemann"
+            echo "spectral:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=spectral"
+            ;;
+        *)
+            echo "ERROR: no sweep grid defined for model '$1'" >&2
+            return 1
+            ;;
+    esac
+}
+
 submit() {
-    local job_name=$1 model=$2 slices=$3 prefix=$4 epochs=$5 batch=$6
-    shift 6
-    local extra_args=("$@")
-    echo ">>> Submitting $job_name (model=$model, epochs=$epochs, batch=$batch)"
+    local job_name=$1 model=$2 slices=$3 prefix=$4 env_str=$5
+    shift 5
+    local extra_args=("$@")           # forwarded verbatim to run_sota.sh
+    # env_str carries N_EPOCHS / BATCH_SIZE (from the per-model base) plus the
+    # config's own knobs -- all passed straight through as -e vars.
+    local sweep_env=()
+    for kv in $env_str; do sweep_env+=(-e "$kv"); done
+    echo ">>> Submitting $job_name (model=$model, sweep='$env_str')"
     runai training submit "$job_name" \
-        -i artiomartiom/sdsc:maldi_manifold_latest \
+        -i artiomartiom/sdsc:maldi_manifold_all_latest \
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
@@ -83,28 +135,38 @@ submit() {
         -e TEMPLATE_NAME="reference" \
         -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
         -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
+        -e EIGENVECTOR_DIR="$S3_EIGENVECTOR_DIR" \
         -e SRC_PATH="$SRC_PATH" \
-        -e N_EPOCHS="$epochs" \
-        -e BATCH_SIZE="$batch" \
         -e WANDB="$WANDB" \
         -e WANDB_PROJECT="$WANDB_PROJECT" \
+        "${sweep_env[@]}" \
         -- ./sota/run_sota.sh "${extra_args[@]}"
 }
 
-MODELS=${MODELS:-"ntf spa3d deepspatial"}
-FOLDS=(${FOLDS:-"fold-3"})           # lowercase, dashed; e.g. FOLDS="fold-1 fold-2"
+MODELS=${MODELS:-"ntf spa3d deepspatial"}   # add 'gplfr' to also sweep the latent-GP
+FOLDS=(${FOLDS:-"fold-1 fold-2 fold-3"})    # shared CV list; e.g. FOLDS="fold-1 fold-2 ... fold-8"
 
+# Outer loop: folds shared across all models. Inner: per-model sweep grid.
 for fold in "${FOLDS[@]}"; do
     fold_upper=${fold^^}
     fold_file=${fold//-/_}
     SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/${fold_file}.json"
     for model in $MODELS; do
-        epochs=$N_EPOCHS
-        batch=$BATCH_SIZE
-        [ "$model" = "deepspatial" ] && epochs=$N_EPOCHS_DEEPSPATIAL
-        [ "$model" = "spa3d" ] && batch=$BATCH_SIZE_SPA3D
-        job="sota-${model}-${fold}-${EXP_SUFFIX}"
-        run_or_echo submit "$job" "$model" "$SLICES_DATASET_FILE" \
-            "${fold_upper}" "$epochs" "$batch" "$@"
+        configs=$(sweep_for_model "$model")
+        [ "$SWEEP" = "0" ] && configs=$(echo "$configs" | head -1)   # first config only
+        while IFS= read -r cfg; do
+            [ -z "$cfg" ] && continue
+            tag=${cfg%%:*}                 # part before the first ':'
+            env_str=${cfg#*:}              # "N_EPOCHS=.. BATCH_SIZE=.. KEY=VAL .."
+            tag_upper=${tag^^}
+            prefix="${fold_upper}-${tag_upper}"
+            job="sota-${model}-${tag}-${fold}-${EXP_SUFFIX}"
+            run_or_echo submit "$job" "$model" "$SLICES_DATASET_FILE" \
+                "$prefix" "$env_str" "$@"
+            N_JOBS=$((N_JOBS + 1))
+        done <<<"$configs"
     done
 done
+
+echo "=== ${N_JOBS} job(s) $([ "$DRY_RUN" = "1" ] && echo 'would be ' )submitted"\
+     "(models='$MODELS', folds='${FOLDS[*]}', sweep=$SWEEP) ==="

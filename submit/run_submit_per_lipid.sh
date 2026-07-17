@@ -7,7 +7,7 @@
 #
 # What it does:
 #   - Loops over a small cross-product of hyperparameters
-#     (KNN_METHOD × KNN_K × INFLATION × …)
+#     (KNN_METHOD × KNN_K × INFLATION × PRUNE × …)
 #   - Submits one runai job per config, each running
 #     ./maldi/run_lgp_per_lipid.sh inside the standard container
 #   - Each job trains only the lipids listed in $LIPIDS_FILE
@@ -66,9 +66,9 @@ N_PROBE=${N_PROBE:-8}
 # Per-lipid run knobs. EPOCHS=20 is the published default; drop to 5 for
 # quick smoke-tests in the early-sweep phase. LIPID_BATCH_SIZE=10 fits
 # our 10-lipid subset in a single GP fit.
-EPOCHS=10
+EPOCHS=20
 LIPID_BATCH_SIZE=10
-NUM_INDUCING=2000
+NUM_INDUCING=1000
 LEARNING_RATE=0.05
 BATCH_SIZE=2048
 STRIDE_BUMP=20.0   # bump_scale — default; overridden per-job by MAN_BUMP_PAIRS
@@ -83,7 +83,7 @@ STRIDE_DECAY=0.01  # bump_decay — default; overridden per-job by MAN_BUMP_PAIR
 # -learndiff when learned.
 #   LEARN_DIFFUSION_SCALE=1 ./submit/run_submit_per_lipid.sh
 DIFFUSION_SCALE_INIT=${DIFFUSION_SCALE_INIT:-1.0}
-LEARN_DIFFUSION_SCALE=${LEARN_DIFFUSION_SCALE:-1}
+LEARN_DIFFUSION_SCALE=${LEARN_DIFFUSION_SCALE:-0}
 
 # Cosine/correlation kernel (manifold only). NORMALIZE_FEATURES=1 L2-normalizes
 # the Riemann feature rows so the prior variance is constant (diagonal=1) and the
@@ -100,11 +100,15 @@ LIPIDS_FILE="/myhome/mlibra/maldi/data/lipid_subset.txt"
 # ---- S3-mounted paths inside the container --------------------------------
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_batch_15"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/per_lipid_cv"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
-S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_15annot.npy"
+# Atlas level: ATLAS_LEVEL=5|15 (default 15) selects the annotation volume on S3.
+# Cache keys + output TAG are tagged by the file stem, so levels never collide.
+# Re-invoke with a different ATLAS_LEVEL for the other level.
+ATLAS_LEVEL=${ATLAS_LEVEL:-15}
+S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_${ATLAS_LEVEL}annot.npy"
 S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
 SRC_PATH="/myhome/mlibra"
@@ -161,6 +165,9 @@ submit() {
         -e LAPLACIAN_NORM="$laplacian_norm" \
         -e GRAPHBANDWIDTH="$graphbandwidth" \
         -e CROSS_REGION_INFLATION="$inflation" \
+        -e ROOT_HANDLING="${ROOT_HANDLING:-dissolve}" \
+        -e DENOISE_LABELS="${DENOISE_LABELS:-0}" \
+        -e PRUNE_CROSS_REGION="${PRUNE_CROSS_REGION:-0.0}" \
         -e BUMP_SCALE="$STRIDE_BUMP" \
         -e BUMP_DECAY="$STRIDE_DECAY" \
         -e NUM_MODES="$modes" \
@@ -185,6 +192,7 @@ submit() {
         -e NORMALIZE_FEATURES="${NORMALIZE_FEATURES:-0}" \
         -e DIFFUSION_SCALE_INIT="${DIFFUSION_SCALE_INIT:-1.0}" \
         -e LEARN_DIFFUSION_SCALE="${LEARN_DIFFUSION_SCALE:-0}" \
+        -e LEARN_SPECTRAL_WEIGHTS="${LEARN_SPECTRAL_WEIGHTS:-0}" \
         -e WANDB="${WANDB:-0}" \
         -e WANDB_PROJECT="${WANDB_PROJECT:-l3di_maldi_per_lipid}" \
         -e FAISS_CPU_GRAPH="$FAISS_CPU_GRAPH" \
@@ -211,7 +219,7 @@ submit() {
 # permutation that the value would otherwise duplicate over.
 # =============================================================================
 
-FOLDS=("fold-2")
+FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
 
 # ---- Euclidean sweep ------------------------------------------------------
 # Euclidean Matern only has nu as a meaningful hyperparameter — the GP
@@ -221,7 +229,7 @@ EUC_NU=(1.5)
 # ARD modes (euclidean only): 1 → isotropic (--no-ard), 0 → per-axis ARD.
 # Both are submitted so isotropic vs per-axis can be compared head-to-head.
 EUC_NO_ARD=(1 0)
-RUN_EUCLIDEAN=1   # 0 = skip the euclidean loop entirely
+RUN_EUCLIDEAN=0   # 0 = skip the euclidean loop entirely
 
 # ---- Manifold sweep -------------------------------------------------------
 MAN_NU=(2)
@@ -230,11 +238,30 @@ MAN_LAPLACIAN_NORMS=("randomwalk")
 MAN_GRAPH_BANDWIDTHS=(0.1)
 MAN_KNN_K=(15)
 MAN_KNN_METHODS=("faiss_atlas_weighted")
-MAN_INFLATIONS=(10 50)   # only used when knn_method=faiss_atlas_weighted
+MAN_INFLATIONS=(50)   # only used when knn_method=faiss_atlas_weighted
+
+# ---- hard prune of cross-region edges (weighted knn methods only) ----------
+# PRUNE_CROSS_REGION = fraction of cross-region (inter-atlas-region) edges hard-
+# REMOVED from the graph, on top of the soft CROSS_REGION_INFLATION down-weighting.
+# 0.0 = off (inflation only); 0.95 = drop 95% of them. Each value gets its own job;
+# run_lgp_per_lipid.sh appends "-prune<val>" to the TAG so dirs never collide.
+# Edit the list in place to sweep, e.g. MAN_PRUNE=(0.0 0.95 0.97) — it is a bash
+# array, so unlike the scalar knobs above it can NOT be set from the environment.
+#
+# Two gotchas this sweep is built around:
+#   * The Python side gates prune to the WEIGHTED methods (faiss_atlas_weighted /
+#     faiss_cluster_weighted) and so does the TAG. Under a plain faiss/anatomical
+#     method every prune value would collapse to the SAME output dir, so the loop
+#     below sweeps a single placeholder there instead of submitting duplicates.
+#   * Prune runs AFTER the label denoise, so a large DENOISE_LABELS erases much of
+#     the true region boundary before prune ever sees it — sweep prune with
+#     DENOISE_LABELS=0 if you want to read the prune effect on its own.
+MAN_PRUNE=(0.0 0.9 0.95 0.97)
+DENOISE_LABELS=${DENOISE_LABELS:-3}
 # ---- (stride : num_modes) pairs to sweep (manifold only) ------------------
 # Coarser strides need fewer eigenmodes to span the graph; finer strides need
 # more. Each entry is "STRIDE:NUM_MODES" and gets its own job.
-MAN_STRIDE_MODES=("4:2300")
+MAN_STRIDE_MODES=("4:100" "4:300")
 
 # ---- (bump_scale : bump_decay) pairs to sweep (manifold only) -------------
 # The bump function shapes the kernel's local support on the graph. Each entry
@@ -246,7 +273,7 @@ MAN_BUMP_PAIRS=("1.0:0.01")
 # 1 → fixed lengthscale (--lengthscale-init 8.0 --lengthscale-no-decay)
 # 0 → learned lengthscale (no flags; GP trains it).
 # Both modes are submitted so they can be compared head-to-head.
-MAN_FIXED_LS=(0 1)
+MAN_FIXED_LS=(0)
 
 # ---- per-task lengthscale (manifold only) ---------------------------------
 # 1 → each lipid gets its OWN learnable lengthscale (PerTaskRiemannWrapper);
@@ -290,7 +317,7 @@ EIGENMAP_EMBED_DIMS=(10)
 # ARD modes over the eigenfunction embedding: 1 → isotropic (--no-ard),
 # 0 → per-axis ARD (one lengthscale per eigenfunction dim).
 EIGENMAP_NO_ARD=(0)
-RUN_EIGENMAP=1
+RUN_EIGENMAP=0
 
 # ---- Spectral sweep -------------------------------------------------------
 # 'spectral' fits a weight-space SpectralLatentGP over the manifold spectrum,
@@ -315,6 +342,7 @@ for fold in "${FOLDS[@]}"; do
             AUGMENT_MALDI_NODES=0   # euclidean ignores it; reset for clean logs
             INDUCING_FROM_MALDI_NODES=0   # manifold-only; reset for clean logs
             PER_TASK_LENGTHSCALE=0  # manifold-only; reset for clean logs
+            PRUNE_CROSS_REGION=0.0  # graph-only; clear whatever the manifold loop left
             LEARN_INDUCING=$learn_ind   # sweep anchored vs learned inducing
             job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
             if [ "$no_ard" = "1" ]; then ard_tag="no-ard"; else ard_tag="ard"; fi
@@ -352,7 +380,20 @@ for fold in "${FOLDS[@]}"; do
                                 else
                                     infl_list=(1)
                                 fi
+                                # Prune is gated to the weighted methods on the
+                                # Python side AND in the TAG, so under any other
+                                # method every prune value would land in the SAME
+                                # output dir. Sweep one placeholder there.
+                                case "$km" in
+                                    faiss_atlas_weighted|faiss_cluster_weighted)
+                                        prune_list=("${MAN_PRUNE[@]}") ;;
+                                    *)
+                                        prune_list=(0.0) ;;
+                                esac
                                 for infl in "${infl_list[@]}"; do
+                                 for prune in "${prune_list[@]}"; do
+                                  # Read by submit() as -e PRUNE_CROSS_REGION.
+                                  PRUNE_CROSS_REGION="$prune"
                                   for sm in "${MAN_STRIDE_MODES[@]}"; do
                                     stride="${sm%%:*}"
                                     modes="${sm##*:}"
@@ -405,8 +446,8 @@ for fold in "${FOLDS[@]}"; do
                                         if [ "$blend" = "1" ]; then blend_tag="blend"; else blend_tag="kmeans"; fi
                                         if [ "$ptls" = "1" ]; then ptls_tag="ptls"; else ptls_tag="shared"; fi
                                         prefix="${fold_upper}-${ls_tag}"
-                                        printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s stride=%s modes=%s bs=%s bd=%s ls=%s aug=%s ind=%s blend=%s ptls=%s\n" \
-                                            "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$stride" "$modes" "$bump_scale" "$bump_decay" "$ls_tag" "$aug_tag" "$li_tag" "$blend_tag" "$ptls_tag"
+                                        printf "  exp %2d: %-22s nu=%s knn_k=%-3s ln=%s gb=%s infl=%s prune=%-4s stride=%s modes=%s bs=%s bd=%s ls=%s aug=%s ind=%s blend=%s ptls=%s\n" \
+                                            "$exp_num" "$km" "$nu" "$knn" "$ln" "$gb" "$infl" "$prune" "$stride" "$modes" "$bump_scale" "$bump_decay" "$ls_tag" "$aug_tag" "$li_tag" "$blend_tag" "$ptls_tag"
                                         # no_ard is euclidean-only; pass a
                                         # placeholder the manifold path ignores.
                                         submit "$job_name" "manifold" "$nu" \
@@ -421,6 +462,7 @@ for fold in "${FOLDS[@]}"; do
                                     done
                                    done
                                   done
+                                 done
                                 done
                             done
                         done
@@ -443,6 +485,14 @@ for fold in "${FOLDS[@]}"; do
         INDUCING_FROM_MALDI_NODES=0    # manifold-only; reset for clean logs
         PER_TASK_LENGTHSCALE=0         # manifold-only; reset for clean logs
         LEARN_INDUCING=0
+        # Eigenmap consumes the same graph, so it takes the first prune value
+        # (like the other MAN_* knobs) rather than sweeping it.
+        case "$em_km" in
+            faiss_atlas_weighted|faiss_cluster_weighted)
+                PRUNE_CROSS_REGION="${MAN_PRUNE[0]}" ;;
+            *)
+                PRUNE_CROSS_REGION=0.0 ;;
+        esac
         for nu in "${EIGENMAP_NU[@]}"; do
           for ed in "${EIGENMAP_EMBED_DIMS[@]}"; do
             for no_ard in "${EIGENMAP_NO_ARD[@]}"; do
@@ -475,6 +525,14 @@ for fold in "${FOLDS[@]}"; do
         INDUCING_FROM_MALDI_NODES=0    # manifold-only; reset for clean logs
         PER_TASK_LENGTHSCALE=0         # manifold-only; reset for clean logs
         LEARN_INDUCING=0
+        # Spectral consumes the same graph, so it takes the first prune value
+        # (like the other MAN_* knobs) rather than sweeping it.
+        case "$sp_km" in
+            faiss_atlas_weighted|faiss_cluster_weighted)
+                PRUNE_CROSS_REGION="${MAN_PRUNE[0]}" ;;
+            *)
+                PRUNE_CROSS_REGION=0.0 ;;
+        esac
         for nu in "${SPECTRAL_NU[@]}"; do
             job_name="gp-perlipid-${EXP_SUFFIX}-${exp_num}"
             printf "  exp %2d: %-22s nu=%-4s stride=%s modes=%s fold=%s\n" \

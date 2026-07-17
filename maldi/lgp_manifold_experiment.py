@@ -189,6 +189,7 @@ def parse_args():
                              "Smaller favours more local covariance.")
     parser.add_argument("--no-rsample", dest="no_rsample", action='store_false', help="Use rsample instead of mean.")
     parser.add_argument("--do-brain-reconstruction", dest="do_brain_reconstruction", action='store_true', help="Perform whole brain prediction")
+    parser.add_argument("--render-voxels-only", dest="render_voxels_only", action="store_true", help="Reconstruct only the voxels the composite render reads (slice planes + 3D MIP stride): ~5.5x fewer voxels, near-identical figure. Writes sparse volumes to volume_sparse/ with a _sparse suffix; the dense volume/ dir is not produced.")
     parser.add_argument(
         "--reconstruction-lipids", dest="reconstruction_lipids",
         nargs="+", default=None,

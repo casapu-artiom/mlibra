@@ -118,6 +118,14 @@ def parse_args():
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log-transform", dest="log_transform", action="store_true")
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=4096)
+    # Reconstruction is a pure forward pass over millions of voxels, so it wants a
+    # far larger batch than training's SGD minibatch — but --batch-size drives BOTH
+    # (and is baked into EXP_NAME), so raising that to speed up inference would
+    # silently change the optimization. Hence a separate knob.
+    parser.add_argument("--inference-batch-size", dest="inference_batch_size",
+                        type=int, default=65536,
+                        help="Batch size for the reconstruction forward pass only "
+                             "(training minibatch is --batch-size).")
     parser.add_argument("--load-args", dest="load_args", action="store_true")
     parser.add_argument("--use-diffusion", dest="use_diffusion", action="store_true")
     parser.add_argument(
@@ -175,6 +183,16 @@ def parse_args():
                         choices=["none", "auto", "whole_brain", "region"],
                         help="auto = whole_brain if no bbox, region if bbox.")
     parser.add_argument("--reconstruct-threshold", type=float, default=5.0)
+    # Opt-in: reconstruct only the voxels the composite render reads (the slice
+    # planes + the 3D MIP's stride) instead of the whole brain — ~5.5x fewer
+    # voxels, near-identical figure. Off by default so the dense volumes (which
+    # napari/analysis scripts consume) are still produced unless asked otherwise.
+    parser.add_argument("--render-voxels-only", dest="render_voxels_only",
+                        action="store_true",
+                        help="Reconstruct only the voxels the render reads "
+                             "(slice planes + MIP stride). Writes sparse volumes "
+                             "to volume_sparse/ with a _sparse suffix; the dense "
+                             "volume/ dir is not produced.")
     parser.add_argument("--skip-training", action="store_true",
                         help="Skip fitting; only run reconstruction from a saved model.")
     parser.add_argument(
@@ -971,7 +989,7 @@ def _write_per_lipid_volumes(volume_path, predictions, indices, template_shape,
 
 def reconstruct(model, config, template_volume, coord_mean, coord_std,
                 col_means, col_stds, mode: str, region_bbox, threshold: float,
-                batch_size: int, lipid_filter=None):
+                batch_size: int, lipid_filter=None, render_voxels_only: bool = False):
     """One-pass reconstruction. Accumulates filtered predictions in RAM,
     writes consolidated `predictions{tag}.npy` + per-lipid volumes.
 
@@ -995,11 +1013,30 @@ def reconstruct(model, config, template_volume, coord_mean, coord_std,
 
     # --- Resolve voxel set + paths ---
     if mode == "whole_brain":
-        volume_path = config.exp_path / "volume"
-        suffix = ""
+        keep = template_volume > threshold
+        n_full = int(keep.sum())
+        if render_voxels_only:
+            # Sparse volumes go to their own dir AND carry their own suffix: the
+            # dense volume/*_volume.npy files are read by napari/analysis scripts
+            # that would silently get a hollow volume if we overwrote them.
+            from render_lipid_volumes import render_voxel_mask
+            keep = keep & render_voxel_mask(template_volume.shape)
+            volume_path = config.exp_path / "volume_sparse"
+            suffix = "_sparse"
+        else:
+            volume_path = config.exp_path / "volume"
+            suffix = ""
         volume_path.mkdir(parents=True, exist_ok=True)
-        non_zero_indices = np.argwhere(template_volume > threshold).astype(np.int32)
-        logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
+        non_zero_indices = np.argwhere(keep).astype(np.int32)
+        n_keep = non_zero_indices.shape[0]
+        if render_voxels_only:
+            logging.info(
+                f"Render-voxels-only reconstruction: {n_keep:,} voxels "
+                f"({n_full / max(n_keep, 1):.1f}x fewer than whole-brain's {n_full:,}). "
+                f"Renders read {suffix!r} volumes; dense volume/ is NOT written."
+            )
+        else:
+            logging.info(f"Whole-brain reconstruction: {n_keep:,} voxels")
     elif mode == "region":
         if region_bbox is None:
             raise ValueError("--reconstruct region requires --region-bbox")
@@ -1055,18 +1092,18 @@ def reconstruct(model, config, template_volume, coord_mean, coord_std,
     non_zero_ccf = torch.tensor(non_zero_ccf, dtype=torch.float32)
     non_zero_ccf = (non_zero_ccf - coord_mean) / coord_std
 
-    ccf_dataset = torch.utils.data.TensorDataset(
-        non_zero_ccf, torch.tensor(non_zero_indices, dtype=torch.int32),
-    )
-    ccf_loader = torch.utils.data.DataLoader(
-        ccf_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
-    )
+    # Slice the coord tensor directly rather than going through a
+    # DataLoader/TensorDataset: that calls __getitem__ once PER VOXEL and then
+    # collates, which at 34M voxels costs more than the forward pass itself (and
+    # gets *worse* with a bigger batch, since the collate stacks more tensors).
+    # The dataset's second column (indices) was built and collated but never read.
 
     # --- Pre-allocate (filtered width only) ---
     pred_bytes = n_voxels * n_lipids_out * 4
     logging.info(
         f"Allocating {pred_bytes / 1e9:.2f} GB for predictions "
-        f"({n_voxels:,} voxels × {n_lipids_out} lipid{'s' if n_lipids_out != 1 else ''})"
+        f"({n_voxels:,} voxels × {n_lipids_out} lipid{'s' if n_lipids_out != 1 else ''}); "
+        f"inference batch {batch_size:,} -> {(n_voxels + batch_size - 1) // batch_size:,} batches"
     )
     all_preds = np.empty((n_voxels, n_lipids_out), dtype=np.float32)
 
@@ -1075,8 +1112,10 @@ def reconstruct(model, config, template_volume, coord_mean, coord_std,
     col_stds_np  = col_stds.cpu().numpy()[col_indices]
 
     cursor = 0
-    for batch in tqdm(ccf_loader, desc=f"reconstruct[{mode}]"):
-        coords_batch = batch[0]
+    n_batches = (n_voxels + batch_size - 1) // batch_size
+    for start in tqdm(range(0, n_voxels, batch_size), total=n_batches,
+                      desc=f"reconstruct[{mode}]"):
+        coords_batch = non_zero_ccf[start:start + batch_size]
         pred_norm = model.predict(coords_batch)        # (B, n_lipids_total)
         full_preds_np = pred_norm.detach().cpu().numpy()
 
@@ -1312,8 +1351,9 @@ def main():
             col_means=col_means, col_stds=col_stds,
             mode=rec_mode, region_bbox=region_bbox,
             threshold=args["reconstruct_threshold"],
-            batch_size=args["batch_size"],
+            batch_size=args["inference_batch_size"] or args["batch_size"],
             lipid_filter=lipid_filter,
+            render_voxels_only=args["render_voxels_only"],
         )
 
         # ---- Render per-lipid composites + diagnostics ----

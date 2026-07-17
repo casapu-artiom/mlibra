@@ -622,6 +622,23 @@ class MaldiExperiment:
         ax.set_ylabel(f"{lipid} (predicted)")
         plt.show()
 
+    def _recon_suffix(self):
+        """Filename suffix for whole-brain reconstruction artifacts.
+
+        Composes the diffusion marker with the sparse (--render-voxels-only)
+        marker, so sparse volumes can never collide with dense ones on disk.
+        With the flag off this returns exactly what it always did.
+        """
+        base = "_diffusion" if self.config.use_diffusion else ""
+        return base + ("_sparse" if self.config.render_voxels_only else "")
+
+    def _volume_dirname(self):
+        """Directory for whole-brain volumes. Sparse runs get their own dir so
+        the napari/analysis scripts globbing volume/*_volume.npy can't pick up
+        a hollow, render-only volume."""
+        base = "volume_diffusion" if self.config.use_diffusion else "volume"
+        return base + ("_sparse" if self.config.render_voxels_only else "")
+
     def whole_brain_reconstruction(self, lipid_indices=None, lipid_names=None):
         """One-pass reconstruction. By default reconstructs all lipids; pass
         lipid_indices (list of int) or lipid_names (list of str) to restrict.
@@ -639,14 +656,27 @@ class MaldiExperiment:
         """
         if not self._load_model_for_reconstruction():
             return
-        suffix = "_diffusion" if self.config.use_diffusion else ""
-        volume_path = self.config.exp_path / ("volume_diffusion"
-                                            if self.config.use_diffusion else "volume")
+        suffix = self._recon_suffix()
+        volume_path = self.config.exp_path / self._volume_dirname()
         volume_path.mkdir(parents=True, exist_ok=True)
         self.config.reference_file
         template_volume = np.load(self.config.reference_file)
-        non_zero_indices = np.argwhere(template_volume > 5).astype(np.int32)
-        logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
+        keep = template_volume > 5
+        n_full = int(keep.sum())
+        if self.config.render_voxels_only:
+            # Only the voxels render_selected_lipids actually reads; mask comes
+            # from the renderer so it can't drift from what the figure needs.
+            from render_lipid_volumes import render_voxel_mask
+            keep = keep & render_voxel_mask(template_volume.shape)
+        non_zero_indices = np.argwhere(keep).astype(np.int32)
+        if self.config.render_voxels_only:
+            logging.info(
+                f"Render-voxels-only reconstruction: {non_zero_indices.shape[0]:,} voxels "
+                f"({n_full / max(non_zero_indices.shape[0], 1):.1f}x fewer than "
+                f"whole-brain's {n_full:,}); sparse volumes -> {volume_path.name}/"
+            )
+        else:
+            logging.info(f"Whole-brain reconstruction: {non_zero_indices.shape[0]:,} voxels")
 
         lipid_filter = self._resolve_lipid_filter(lipid_indices, lipid_names)
         # faiss_cpu_recon() pins KNN searches to CPU iff --faiss-cpu-recon is set.
@@ -933,7 +963,11 @@ class MaldiExperiment:
         from render_lipid_volumes import (
             render_selected_lipids, render_lipid_diagnostics, render_error_slice,
         )
-        suffix = "_diffusion" if self.config.use_diffusion else region_suffix
+        # region_suffix arrives fully composed from whole_brain_reconstruction
+        # (diffusion marker + the _sparse marker when --render-voxels-only), so
+        # trust it: recomputing here would drop _sparse and then look for dense
+        # filenames that a sparse run never wrote. Fall back only if unset.
+        suffix = region_suffix or ("_diffusion" if self.config.use_diffusion else "")
         renders_dir = self.config.exp_path / "renders"
 
         render_selected_lipids(

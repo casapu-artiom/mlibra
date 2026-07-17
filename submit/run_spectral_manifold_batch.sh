@@ -59,7 +59,7 @@ N_PROBE=${N_PROBE:-8}
 N_EPOCHS=100
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_long_cv"
+S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_cv_prune"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -79,7 +79,7 @@ SRC_PATH="/myhome/mlibra"
 # RECONSTRUCTION_LIPIDS_FILE=... ./submit/run_spectral_manifold_batch.sh
 RECON_LIPIDS_FILE="${RECONSTRUCTION_LIPIDS_FILE:-$SRC_PATH/maldi/data/lipid_subset.txt}"
 
-EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
+EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')-2"
 
 submit() {
     local job_name=$1 template=$2 ref=$3 annot=$4 infl=$5 threshold=$6 knn=$7 knn_k=$8 laplacian_norm=$9 nu=${10} graphbandwidth=${11} bumpscale=${12} bumpdecay=${13} prefix=${14} slice=${15} stride=${16} num_modes=${17} diffusion_init=${18} learn_diffusion=${19} lengthscale=${20}
@@ -87,7 +87,7 @@ submit() {
 	local extra_args=("$@")    # everything remaining goes here
     echo ">>> Submitting $job_name"
     runai training submit "$job_name" \
-        -i artiomartiom/sdsc:withfaiss \
+        -i artiomartiom/sdsc:maldi_manifold_all_latest \
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
@@ -111,6 +111,7 @@ submit() {
         -e GRAPHBANDWIDTH="$graphbandwidth" \
         -e DIFFUSION_SCALE_INIT="$diffusion_init" \
         -e LEARN_DIFFUSION_SCALE="$learn_diffusion" \
+        -e LEARN_SPECTRAL_WEIGHTS="${LEARN_SPECTRAL_WEIGHTS:-1}" \
         -e LENGTHSCALE_INIT="$lengthscale" \
         -e BUMP_SCALE="$bumpscale" \
         -e BUMP_DECAY="$bumpdecay" \
@@ -124,6 +125,9 @@ submit() {
         -e CLUSTER_SPATIAL_WEIGHT="${CLUSTER_SPATIAL_WEIGHT:-1.0}" \
         -e CLUSTER_FIT_SUBSAMPLE="${CLUSTER_FIT_SUBSAMPLE:-40000}" \
         -e CLUSTER_SEED="${CLUSTER_SEED:-0}" \
+        -e ROOT_HANDLING="${ROOT_HANDLING:-dissolve}" \
+        -e DENOISE_LABELS="${DENOISE_LABELS:-3}" \
+        -e PRUNE_CROSS_REGION="${PRUNE_CROSS_REGION:-0.0}" \
         -e FAISS_CPU_GRAPH="$FAISS_CPU_GRAPH" \
         -e FAISS_CPU_SEARCH="$FAISS_CPU_SEARCH" \
         -e FAISS_CPU_RECON="$FAISS_CPU_RECON" \
@@ -143,6 +147,13 @@ KNN_K=(15)
 MAN_KNN_METHODS=(faiss_atlas_weighted)
 # Cross-region inflation, used by faiss_atlas_weighted AND faiss_cluster_weighted.
 MAN_INFLATIONS=(50)
+# ---- graph-refinement sweeps (weighted methods only) ----------------------
+# Swept like MAN_INFLATIONS; non-weighted methods collapse to the no-op value so
+# they aren't submitted redundantly. Each distinct value gets its own -root/-dn/
+# -prune dir tag, so a sweep never clobbers. ROOT_HANDLINGS is atlas-only.
+ROOT_HANDLINGS=("dissolve")
+MAN_DENOISE_LABELS=(3)
+MAN_PRUNE_CROSS_REGIONS=(0.97)
 LAPLACIAN_NORMS=("randomwalk")
 GRAPH_BANDWIDTHS=(0.1)
 BUMP_SCALES=(1.0)
@@ -168,7 +179,7 @@ DIFFUSION_SCALES=("1:1.0")
 #   (1) stride=4, num_modes=1300
 #   (2) stride=8, num_modes=6000
 #STRIDE_NUM_MODES=("4:1300" "8:6000")
-STRIDE_NUM_MODES=("4:2300" "8:6000")
+STRIDE_NUM_MODES=("4:100" "4:300" "4:1300")
 
 # Fixed across the whole sweep
 TEMPLATE="reference"
@@ -195,27 +206,45 @@ for fold in "${FOLDS[@]}"; do
                             for laplacian_norm in "${LAPLACIAN_NORMS[@]}"; do
                                 for nu in ${NU[@]}; do
                                     for threshold in ${THRESHOLDS[@]}; do
+                                        # Graph-prior lists apply only to weighted methods;
+                                        # plain faiss collapses each to its no-op value.
                                         if [ "$knn_method" = "faiss_atlas_weighted" ] || [ "$knn_method" = "faiss_cluster_weighted" ]; then
                                             infl_list=("${MAN_INFLATIONS[@]}")
+                                            denoise_list=("${MAN_DENOISE_LABELS[@]}")
+                                            prune_list=("${MAN_PRUNE_CROSS_REGIONS[@]}")
                                         else
                                             infl_list=(1)
+                                            denoise_list=(0)
+                                            prune_list=(0.0)
+                                        fi
+                                        if [ "$knn_method" = "faiss_atlas_weighted" ]; then
+                                            root_list=("${ROOT_HANDLINGS[@]}")
+                                        else
+                                            root_list=(dissolve)
                                         fi
                                         for infl in "${infl_list[@]}"; do
                                           for ls in "${LENGTHSCALES[@]}"; do
                                            for diff in "${DIFFUSION_SCALES[@]}"; do
                                             learn_diffusion=${diff%%:*}
                                             diffusion_init=${diff##*:}
+                                            for ROOT_HANDLING in "${root_list[@]}"; do
+                                             for DENOISE_LABELS in "${denoise_list[@]}"; do
+                                              for PRUNE_CROSS_REGION in "${prune_list[@]}"; do
+                                                # read by submit() via its -e ${VAR:-…} lines.
 
-                                            job_name="gp-spectral-${EXP_SUFFIX}-${exp_num}"
+                                                job_name="gp-spectral-${EXP_SUFFIX}-${exp_num}"
 
-                                            # Map exp_num -> config, so you can read it back from terminal/logs
-                                            printf "  exp %2d: fold=%-10s stride=%s modes=%s ls=%-5s gb=%-5s bs=%-4s bd=%s diff=%s(learn=%s)\n" \
-                                                "$exp_num" "$fold" "$stride" "$num_modes" "$ls" "$gb" "$bs" "$bd" "$diffusion_init" "$learn_diffusion"
+                                                # Map exp_num -> config, so you can read it back from terminal/logs
+                                                printf "  exp %2d: fold=%-10s stride=%s modes=%s ls=%-5s gb=%-5s bs=%-4s bd=%s diff=%s(learn=%s) root=%s dn=%s prune=%s\n" \
+                                                    "$exp_num" "$fold" "$stride" "$num_modes" "$ls" "$gb" "$bs" "$bd" "$diffusion_init" "$learn_diffusion" "$ROOT_HANDLING" "$DENOISE_LABELS" "$PRUNE_CROSS_REGION"
 
-                                            run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" "$infl" "$threshold" \
-                                                "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$diffusion_init" "$learn_diffusion" "$ls"
+                                                run_or_echo submit "$job_name" "$TEMPLATE" "$REF" "$ANNOT" "$infl" "$threshold" \
+                                                    "$knn_method" "$knn_k" "$laplacian_norm" "$nu" "$gb" "$bs" "$bd" "$fold_upper" "$SLICES_DATASET_FILE" "$stride" "$num_modes" "$diffusion_init" "$learn_diffusion" "$ls"
 
-                                            exp_num=$((exp_num + 1))
+                                                exp_num=$((exp_num + 1))
+                                              done
+                                             done
+                                            done
                                            done
                                           done
                                         done

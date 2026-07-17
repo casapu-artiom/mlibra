@@ -42,6 +42,13 @@ class MaldiConfig:
     available_lipids: List[str]
     selected_channels: List[int]
     use_diffusion: bool = False
+    # Reconstruct only the voxels the composite render reads (slice planes + the
+    # 3D MIP's stride) instead of the whole brain: ~5.5x fewer voxels, near-
+    # identical figure. Writes sparse volumes to volume_sparse/ with a _sparse
+    # suffix, leaving the dense volume/ that napari + the analysis scripts read
+    # untouched. Off by default; entrypoints without the flag get False via
+    # from_args' .get(), so this is safe to read unconditionally.
+    render_voxels_only: bool = False
     do_brain_reconstruction: bool = False
     reconstruction_lipids: list = None
     reconstruction_lipids_by_index: bool = False
@@ -173,6 +180,7 @@ class MaldiConfig:
                            selected_channels=selected_channels,
                            available_lipids=available_lipids,
                            use_diffusion=use_diffusion,
+                           render_voxels_only=args.get("render_voxels_only", False),
                            do_brain_reconstruction=do_brain_reconstruction,
                            reconstruction_lipids=reconstruction_lipids,
                            reconstruction_lipids_by_index=reconstruction_lipids_by_index,

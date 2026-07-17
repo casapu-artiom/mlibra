@@ -62,9 +62,35 @@ S3_ANNOTATION_FILE="${S3_ANNOTATION_FILE:-${S3_DATA_DIR}/level_${ATLAS_LEVEL}ann
 SRC_PATH="${SRC_PATH:-/myhome/mlibra}"
 BANDWIDTH="${BANDWIDTH:-0.1}"
 
+# faiss_atlas_weighted root handling + label denoise + hard prune -- applied to
+# EVERY faiss_atlas_weighted job in this batch (ignored by faiss / anatomical_
+# atlas). They mirror the per-lipid training pipeline so the eigvec cache is a
+# drop-in hit. Defaults reproduce the legacy behaviour (root=cross, no denoise/
+# prune) -> existing atlas_x<infl> cache keys are unchanged. To pre-bake caches
+# for the current TRAINING default set ROOT_HANDLING=dissolve (and e.g.
+# DENOISE_LABELS=3 PRUNE_CROSS_REGION=0.95 to match a pruned run). Sweep them by
+# re-running the batch with different values.
+ROOT_HANDLING="${ROOT_HANDLING:-cross}"          # dissolve | ignore | cross
+DENOISE_LABELS="${DENOISE_LABELS:-0}"            # majority-vote passes (0 = off)
+PRUNE_CROSS_REGION="${PRUNE_CROSS_REGION:-0.0}"  # hard-prune fraction (0 = off)
+
 BUILD_IF_MISSING="${BUILD_IF_MISSING:-1}"   # rank 0 builds the graph (CPU faiss) if absent
 FACTOR_SOLVER="${FACTOR_SOLVER:-mumps}"     # parallel direct solver for the shift-invert
 TARGET="${TARGET:-0.0}"                     # shift-invert target (bottom of the spectrum)
+# Spectral transform. 1 (default) = SHIFT-INVERT + MUMPS: fast convergence at the
+# clustered bottom of the spectrum, but the direct factor DOMINATES RAM (this is
+# why MEM is set so high) and its fill-in scales badly at small stride. 0 =
+# matrix-free Krylov-Schur SR: NO factorization, so memory collapses to the
+# sparse Laplacian + the Krylov basis -- far less RAM, and it lets you push MODES
+# much higher, at the cost of SLOWER convergence (bare Lanczos on the clustered
+# low spectrum). With SHIFT_INVERT=0 you can drop MEM sharply and lean on MPD to
+# cap the basis; TARGET / FACTOR_SOLVER are then ignored. This is the "more modes,
+# slower, less RAM" lever.
+SHIFT_INVERT="${SHIFT_INVERT:-1}"
+# Krylov convergence tolerance. Shift-invert converges tightly and cheaply, so
+# 1e-4 is plenty; the matrix-free path (SHIFT_INVERT=0) often needs a looser tol
+# to converge in reasonable time when MODES is large.
+TOL="${TOL:-1e-4}"
 # KNN graph method (global; one method per run). faiss_atlas_weighted builds the
 # plain-faiss graph then inflates cross-region edges by the PER-JOB inflation arg
 # to submit_one -- matches the lgp per-lipid runs, so the eigvec cache (keyed
@@ -151,11 +177,29 @@ submit_one() {
             [ "$atlas_stem" != "level_15annot" ] && atag="_${atlas_stem}"
             ;;
     esac
-    local run_slug="str${stride}_t${threshold}_k${knn_k}_bw1p0_${norm}_nm${modes}${mtag}${atag}${ltag}_si"
+    # Transform tag (log dir / job slug only -- NOT part of the eigvec cache key,
+    # which is derived from graph params in slepc_eigensolve.py). _si = shift-invert,
+    # _ks = matrix-free Krylov-Schur SR, so the two paths' logs don't collide.
+    local xform_tag xform_desc
+    if [ "$SHIFT_INVERT" = "1" ]; then
+        xform_tag="_si"; xform_desc="shift-invert"
+    else
+        xform_tag="_ks"; xform_desc="krylov-schur SR (matrix-free, low-RAM)"
+    fi
+    # Root-handling / denoise / prune tag (faiss_atlas_weighted only) so log dirs
+    # for different priors don't collide. Untagged at the legacy defaults
+    # (root=cross, no denoise/prune) to keep existing slugs unchanged.
+    local rptag=""
+    if [ "$knn_method" = "faiss_atlas_weighted" ]; then
+        [ "$ROOT_HANDLING" != "cross" ] && rptag="${rptag}_rh${ROOT_HANDLING}"
+        awk "BEGIN{exit !($DENOISE_LABELS>0)}"     && rptag="${rptag}_dn${DENOISE_LABELS}"
+        awk "BEGIN{exit !($PRUNE_CROSS_REGION>0)}" && rptag="${rptag}_pr${PRUNE_CROSS_REGION/./p}"
+    fi
+    local run_slug="str${stride}_t${threshold}_k${knn_k}_bw${BANDWIDTH}p0_${norm}_nm${modes}${mtag}${atag}${ltag}${rptag}${xform_tag}"
     n_submitted=$((n_submitted + 1))
     local job_name="slepcsi-${EXP_SUFFIX}-$(printf '%03d' "$n_submitted")"
 
-    echo ">>> [$n_submitted] $job_name -> $run_slug  (ranks=$RANKS, cores=$cpu, omp=$OMP_THREADS, shift-invert)"
+    echo ">>> [$n_submitted] $job_name -> $run_slug  (ranks=$RANKS, cores=$cpu, omp=$OMP_THREADS, $xform_desc)"
     run_or_echo runai training submit "$job_name" \
         -i "$IMAGE" \
         --cpu-core-limit "$cpu"   --cpu-core-request   "$cpu" \
@@ -178,13 +222,16 @@ submit_one() {
         -e NLIST="$nlist" \
         -e NPROBE="$N_PROBE" \
         -e CROSS_REGION_INFLATION="$inflation" \
+        -e ROOT_HANDLING="$ROOT_HANDLING" \
+        -e DENOISE_LABELS="$DENOISE_LABELS" \
+        -e PRUNE_CROSS_REGION="$PRUNE_CROSS_REGION" \
         -e MODES="$modes" \
         -e NORMALIZATION="$norm" \
-        -e SHIFT_INVERT="1" \
+        -e SHIFT_INVERT="$SHIFT_INVERT" \
         -e TARGET="$TARGET" \
         -e MPD="$MPD" \
         -e BANDWIDTH="$BANDWIDTH" \
-        -e TOL="1e-4" \
+        -e TOL="$TOL" \
         -e FACTOR_SOLVER="$FACTOR_SOLVER" \
         -- ./slepc/slepc_eigensolve.sh
 }
@@ -221,21 +268,24 @@ submit_one() {
 submit_one    4   5   15    2300   randomwalk  faiss 0
 submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  10
 submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  50
+submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  100
 submit_one    4   40   15    2300   randomwalk  faiss 0
 submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  10
 submit_one    4   40   15    2300   randomwalk  faiss_atlas_weighted  50
+submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  100
 submit_one    4   50   15    2300   randomwalk  faiss 0
 submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  10
 submit_one    4   50   15    2300   randomwalk  faiss_atlas_weighted  50
-submit_one    8   5   15    6300   randomwalk  faiss 0
-submit_one    8   5   15    6300   randomwalk  faiss_atlas_weighted  10
-submit_one    8   5   15    6300   randomwalk  faiss_atlas_weighted  50
-submit_one    8   40   15    6300   randomwalk  faiss 0
-submit_one    8   40   15    6300   randomwalk  faiss_atlas_weighted  10
-submit_one    8   40   15    6300   randomwalk  faiss_atlas_weighted  50
-submit_one    8   50   15    6300   randomwalk  faiss 0
-submit_one    8   50   15    6300   randomwalk  faiss_atlas_weighted  10
-submit_one    8   50   15    6300   randomwalk  faiss_atlas_weighted  50
+submit_one    4   5   15    2300   randomwalk  faiss_atlas_weighted  100
+# submit_one    8   5   15    6300   randomwalk  faiss 0
+# submit_one    8   5   15    6300   randomwalk  faiss_atlas_weighted  10
+# submit_one    8   5   15    6300   randomwalk  faiss_atlas_weighted  50
+# submit_one    8   40   15    6300   randomwalk  faiss 0
+# submit_one    8   40   15    6300   randomwalk  faiss_atlas_weighted  10
+# submit_one    8   40   15    6300   randomwalk  faiss_atlas_weighted  50
+# submit_one    8   50   15    6300   randomwalk  faiss 0
+# submit_one    8   50   15    6300   randomwalk  faiss_atlas_weighted  10
+# submit_one    8   50   15    6300   randomwalk  faiss_atlas_weighted  50
 
 # submit_one    2   5   15    300   randomwalk  faiss 0
 # submit_one    2   5   15    300   randomwalk  faiss_atlas_weighted  10

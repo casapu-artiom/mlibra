@@ -10,7 +10,10 @@
 #   gcn_faiss — Graph Conv Net over the FAISS reference-node manifold graph
 #               (needs the graph pipeline; set EIGENVECTOR_DIR + graph knobs)
 : "${BATCH_SIZE:=256}"
-: "${N_EPOCHS:=100}"
+# Reconstruction forward pass only; NOT the training minibatch (that's BATCH_SIZE,
+# which is also baked into EXP_NAME, so don't repurpose it to speed up inference).
+: "${INFERENCE_BATCH_SIZE:=65536}"
+: "${N_EPOCHS:=10}"
 : "${LEARNING_RATE:=0.001}"
 : "${SEED:=416465}"
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -20,7 +23,7 @@
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
-: "${MODEL:=gcn_faiss}"
+: "${MODEL:=mlp}"
 : "${RIDGE_ALHPA:=1.0}"
 # mlp_bottleneck is a run_baseline preset: an MLP with a narrow middle
 # (bottleneck) layer. It maps to --model mlp with a bottleneck MLP_HIDDEN default
@@ -31,11 +34,17 @@ if [ "$MODEL" = "mlp_bottleneck" ]; then
     ACTUAL_MODEL="mlp"
     : "${MLP_HIDDEN:=256 5 256 256 128}"
 fi
-: "${MLP_HIDDEN:=512 512 256}"
+: "${MLP_HIDDEN:=256 256 128}"
 : "${MLP_DROPOUT:=0.1}"
 : "${XGB_N_ESTIMATORS:=400}"
 : "${XGB_MAX_DEPTH:=6}"
 : "${XGB_LR:=0}"
+
+# Reconstruct only the voxels the composite render actually reads (slice planes +
+# the 3D MIP's stride): ~5.5x fewer voxels, near-identical figure. Writes sparse
+# volumes to volume_sparse/ instead of the dense volume/ that napari + the
+# analysis scripts consume — so leave it 0 if you need the full 3D volumes.
+: "${RENDER_VOXELS_ONLY:=1}"
 
 # --- GCN knobs (MODEL=gcn / gcn_faiss) --------------------------------------
 : "${GCN_HIDDEN:=512 512 256}"
@@ -154,6 +163,11 @@ if [ -n "$FEAT_SCRATCH_DIR" ]; then
     SCRATCH_ARGS="--feat-scratch-dir $FEAT_SCRATCH_DIR"
 fi
 
+RENDER_ARGS=""
+if [ "$RENDER_VOXELS_ONLY" != "0" ]; then
+    RENDER_ARGS="--render-voxels-only"
+fi
+
 IFS='
 '
 set -- --reconstruction-lipids $RECON_LIPIDS "$@"
@@ -167,6 +181,7 @@ python $SRC_PATH/maldi/experiment_baselines.py \
     --template-name "reference" \
     --reference-file $REFERENCE_FILE \
     --batch-size $BATCH_SIZE \
+    --inference-batch-size $INFERENCE_BATCH_SIZE \
     --epochs $N_EPOCHS \
     --learning-rate $LEARNING_RATE \
     --latent-dim 5 \
@@ -190,5 +205,6 @@ python $SRC_PATH/maldi/experiment_baselines.py \
     --gcn-faiss-node-batch $GCN_FAISS_NODE_BATCH \
     $EIGEN_ARGS \
     $SCRATCH_ARGS \
+    $RENDER_ARGS \
     --reconstruct whole_brain \
     "$@"
