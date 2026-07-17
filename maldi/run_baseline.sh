@@ -10,7 +10,7 @@
 #   gcn_faiss — Graph Conv Net over the FAISS reference-node manifold graph
 #               (needs the graph pipeline; set EIGENVECTOR_DIR + graph knobs)
 : "${BATCH_SIZE:=256}"
-: "${N_EPOCHS:=50}"
+: "${N_EPOCHS:=100}"
 : "${LEARNING_RATE:=0.001}"
 : "${SEED:=416465}"
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
@@ -31,7 +31,7 @@ if [ "$MODEL" = "mlp_bottleneck" ]; then
     ACTUAL_MODEL="mlp"
     : "${MLP_HIDDEN:=256 5 256 256 128}"
 fi
-: "${MLP_HIDDEN:=256 256 128}"
+: "${MLP_HIDDEN:=512 512 256}"
 : "${MLP_DROPOUT:=0.1}"
 : "${XGB_N_ESTIMATORS:=400}"
 : "${XGB_MAX_DEPTH:=6}"
@@ -48,6 +48,9 @@ fi
 
 # --- Manifold graph/eigenbasis knobs (MODEL=mlp_eigen|gcn_faiss); ignored otherwise --
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
+# mlp_eigen stages its feature memmap here; must be LOCAL disk (mmap is
+# unsupported on the S3/FUSE mounts). Empty = python falls back to TMPDIR.
+: "${FEAT_SCRATCH_DIR:=}"
 : "${NUM_MODES:=300}"
 : "${STRIDE:=4}"
 : "${THRESHOLD:=5}"
@@ -144,6 +147,13 @@ if [ "$MODEL" = "mlp_eigen" ] || [ "$MODEL" = "gcn_faiss" ]; then
         --nu $NU"
 fi
 
+# Only forwarded when set; unset lets python default to TMPDIR (an empty
+# --feat-scratch-dir would swallow the next flag as its value).
+SCRATCH_ARGS=""
+if [ -n "$FEAT_SCRATCH_DIR" ]; then
+    SCRATCH_ARGS="--feat-scratch-dir $FEAT_SCRATCH_DIR"
+fi
+
 IFS='
 '
 set -- --reconstruction-lipids $RECON_LIPIDS "$@"
@@ -179,5 +189,6 @@ python $SRC_PATH/maldi/experiment_baselines.py \
     --gcn-faiss-iters $GCN_FAISS_ITERS \
     --gcn-faiss-node-batch $GCN_FAISS_NODE_BATCH \
     $EIGEN_ARGS \
+    $SCRATCH_ARGS \
     --reconstruct whole_brain \
     "$@"

@@ -144,6 +144,13 @@ def parse_args():
     parser.add_argument("--xgb-n-estimators", type=int, default=400)
     parser.add_argument("--xgb-max-depth", type=int, default=6)
     parser.add_argument("--xgb-lr", type=float, default=0.05)
+    # (--model mlp_eigen) Where the on-disk feature memmap is staged. Must be a
+    # LOCAL filesystem: mmap is unsupported on the S3/FUSE mounts (OSError 95),
+    # and training reads it in random order every epoch, so network storage would
+    # crawl even where mmap works. Default: TMPDIR (never --output-dir).
+    parser.add_argument("--feat-scratch-dir", dest="feat_scratch_dir", type=str, default=None,
+                        help="(--model mlp_eigen) local dir for the feature memmap "
+                             "(default: TMPDIR). Needs ~N*(3+num_modes)*4 bytes free.")
     # GCN knobs (--model gcn): per-batch KNN graph over coords.
     parser.add_argument("--gcn-hidden", dest="gcn_hidden", type=int, nargs="+", default=[128, 128, 128])
     parser.add_argument("--gcn-dropout", dest="gcn_dropout", type=float, default=0.1)
@@ -518,9 +525,16 @@ class MLPEigenBaseline(MLPBaseline):
         Ytr = y_train.cpu().numpy()
         n = coords_train.shape[0]
         bs = args["batch_size"]
-        feat_dir = tempfile.mkdtemp(prefix="mlp_eigen_feat_",
-                                    dir=args.get("output_dir") or None)
+        # Stage the memmap on LOCAL disk: --output-dir is typically an S3/FUSE
+        # mount, where mmap fails outright (OSError 95).
+        scratch_dir = args.get("feat_scratch_dir") or None
+        if scratch_dir:
+            os.makedirs(scratch_dir, exist_ok=True)
+        feat_dir = tempfile.mkdtemp(prefix="mlp_eigen_feat_", dir=scratch_dir)
         feat_path = os.path.join(feat_dir, "train_feats.f32")
+        need = n * (3 + self.num_modes) * 4
+        logging.info(f"  mlp_eigen feature memmap: {need/1e9:.1f} GB -> {feat_path}")
+        Xtr = None
         try:
             Xtr = self._featurize_to_memmap(coords_train.cpu(), feat_path)
             pbar = tqdm(range(args["epochs"]), desc="mlp_eigen")
@@ -546,6 +560,8 @@ class MLPEigenBaseline(MLPBaseline):
             pred_tr = self._forward_memmap(Xtr)
             pred_te = self._predict_coords(coords_test)
         finally:
+            # Guard the del: if _featurize_to_memmap raised, Xtr never bound and an
+            # UnboundLocalError here would mask the real exception.
             del Xtr
             try:
                 os.remove(feat_path)
