@@ -31,16 +31,46 @@ SLICE_FRACTIONS = (0.05, 0.15, 0.25, 0.35, 0.45,
 SLICE_LABELS = ("5%", "15%", "25%", "35%", "45%",
                 "55%", "65%", "75%", "85%", "95%")
 
+# Stride the 3D MIP row subsamples the volume by. Exported (rather than left as a
+# bare default) because --render-voxels-only reconstructs exactly
+# SLICE_FRACTIONS ∪ this stride: if the two drift apart the MIP silently reads
+# unreconstructed voxels and renders holes.
+MIP_DOWNSAMPLE = 2
+
+
+def render_voxel_mask(shape):
+    """Boolean mask of the voxels a composite render actually reads.
+
+    Rows 0-2 of the figure are slice planes at SLICE_FRACTIONS along each axis;
+    row 3 is a 3D MIP that subsamples by MIP_DOWNSAMPLE before projecting. Any
+    voxel outside (planes ∪ stride) is reconstructed and then discarded, so
+    --render-voxels-only restricts reconstruction to this mask (~5.5x fewer
+    voxels on the Allen template, near-identical figure).
+
+    Lives here, next to the constants it depends on, so every pipeline that
+    reconstructs for rendering (experiment_baselines, MaldiExperiment) derives
+    the mask from the same definition the renderer uses.
+    """
+    Z, Y, X = shape
+    m = np.zeros(shape, dtype=bool)
+    for f in SLICE_FRACTIONS:
+        m[:, int(Y * f), :] = True          # row 0: coronal
+        m[int(Z * f), :, :] = True          # row 1: axial
+        m[:, :, int(X * f)] = True          # row 2: sagittal
+    m[::MIP_DOWNSAMPLE, ::MIP_DOWNSAMPLE, ::MIP_DOWNSAMPLE] = True   # row 3: MIP
+    return m
+
 
 # -----------------------------------------------------------------------------
 # Volume normalization
 # -----------------------------------------------------------------------------
 
 def _normalize_volume(volume: np.ndarray,
-                       robust: bool = False) -> tuple[np.ndarray, float, float]:
-    """Map to [0, 1]. Default uses nanmin/nanmax (matches the original
-    napari look). robust=True uses 2nd/98th percentiles when outliers
-    crush contrast. NaNs preserved either way."""
+                       robust: bool = True) -> tuple[np.ndarray, float, float]:
+    """Map to [0, 1]. Default (robust=True) uses 2nd/98th percentiles so a
+    handful of outlier voxels (e.g. negative denorm artifacts) don't crush
+    the contrast of the bulk tissue. robust=False falls back to nanmin/nanmax
+    (the original napari look). NaNs preserved either way."""
     if robust:
         finite = volume[np.isfinite(volume)]
         if finite.size == 0:
@@ -175,8 +205,8 @@ def render_lipid_volume(
     anatomy: np.ndarray | None = None,
     n_rotation_frames: int = 10,
     cmap: str = "inferno",
-    robust_normalize: bool = False,
-    downsample_3d: int = 2,
+    robust_normalize: bool = True,
+    downsample_3d: int = MIP_DOWNSAMPLE,
     elevation_deg: float = 25.0,
     dpi: int = 200,
 ):
