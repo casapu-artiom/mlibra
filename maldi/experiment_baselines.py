@@ -63,7 +63,9 @@ Usage examples:
         --skip-training --reconstruct whole_brain
 """
 import logging
+import os
 import pickle
+import tempfile
 import time
 from argparse import ArgumentParser
 from pathlib import Path
@@ -153,6 +155,10 @@ def parse_args():
                         help="(--model gcn_faiss) number of full-graph gradient steps.")
     parser.add_argument("--gcn-faiss-node-batch", dest="gcn_faiss_node_batch", type=int, default=65536,
                         help="(--model gcn_faiss) training measurements sampled per step.")
+    parser.add_argument("--gcn-faiss-interp-k", dest="gcn_faiss_interp_k", type=int, default=8,
+                        help="(--model gcn_faiss) nearest reference nodes blended by "
+                             "inverse-distance (Shepard) interpolation at read-out. "
+                             "1 = the old nearest-node lookup.")
 
     # Reconstruction
     parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="Template name.")
@@ -448,6 +454,9 @@ class MLPEigenBaseline(MLPBaseline):
     # materializes a (rows, k, num_modes) transient, which OOMs on the full
     # multi-million-row train set — so we interpolate in chunks and concatenate.
     eigen_chunk = 50_000
+    # Rows per model forward pass for the whole-split eval/prediction passes, which
+    # would OOM if run in one shot regardless of the training batch size.
+    forward_chunk = 100_000
 
     def _eigenvectors(self, x):
         outs = []
@@ -464,6 +473,38 @@ class MLPEigenBaseline(MLPBaseline):
             U = self._eigenvectors(x)                    # (B, num_modes), chunked
         return torch.cat([x, U], dim=1)
 
+    def _predict_coords(self, coords_std):
+        """Model forward over raw coords, featurizing + forwarding in chunks and
+        returning predictions on the CPU. The full ``(N, 3+num_modes)`` feature
+        matrix is never materialized — only one ``eigen_chunk`` slice at a time —
+        so this stays bounded in both VRAM and host RAM for multi-million-row
+        splits (train/test eval and whole_brain reconstruction)."""
+        self.model.eval()
+        outs = []
+        with torch.no_grad():
+            for i in range(0, coords_std.shape[0], self.eigen_chunk):
+                xb = self._inputs(coords_std[i:i + self.eigen_chunk])
+                outs.append(self.model(xb).cpu())
+        return torch.cat(outs, dim=0)
+
+    def _featurize_to_memmap(self, coords_std, path):
+        """Featurize the whole split ONCE into an on-disk float32 memmap
+        ``(N, 3+num_modes)`` and return it. The eigenbasis is frozen during MLP
+        training, so per-epoch re-featurization is wasted work; precomputing once
+        removes it. The matrix is far too big for VRAM/RAM at thousands of modes,
+        so it lives on disk — training streams minibatches back, RAM bounded by the
+        OS page cache and it scales to any mode count (limited by disk, not RAM)."""
+        n = coords_std.shape[0]
+        width = 3 + self.num_modes
+        mm = np.memmap(path, dtype=np.float32, mode="w+", shape=(n, width))
+        with tqdm(total=n, desc="mlp_eigen featurize", unit="row", unit_scale=True) as pbar:
+            for i in range(0, n, self.eigen_chunk):
+                feats = self._inputs(coords_std[i:i + self.eigen_chunk]).cpu().numpy()
+                mm[i:i + feats.shape[0]] = feats
+                pbar.update(feats.shape[0])
+        mm.flush()
+        return mm
+
     def fit(self, coords_train, y_train, coords_test, y_test, args):
         self.device = torch.device(args["device"])
         p = y_train.shape[1]
@@ -471,35 +512,63 @@ class MLPEigenBaseline(MLPBaseline):
         self.model = self._build(p, args["mlp_hidden"], args["mlp_dropout"], self.device, in_dim=in_dim)
         opt = torch.optim.Adam(self.model.parameters(), lr=args["learning_rate"])
 
-        Xtr = self._inputs(coords_train); Ytr = y_train.to(self.device)
-        Xte = self._inputs(coords_test);  Yte = y_test.to(self.device)
-        n = Xtr.shape[0]
+        # Precompute train eigenfeatures ONCE to a disk-backed memmap, then stream
+        # minibatches — instead of re-featurizing every epoch. Test features are
+        # only needed at the (infrequent) eval, so those stay on the fly.
+        Ytr = y_train.cpu().numpy()
+        n = coords_train.shape[0]
         bs = args["batch_size"]
-        pbar = tqdm(range(args["epochs"]), desc="mlp_eigen")
-        for epoch in pbar:
-            self.model.train()
-            perm = torch.randperm(n, device=self.device)
-            loss_sum = 0.0
-            for i in range(0, n, bs):
-                idx = perm[i:i + bs]
-                loss = F.mse_loss(self.model(Xtr[idx]), Ytr[idx])
-                opt.zero_grad(); loss.backward(); opt.step()
-                loss_sum += loss.item() * idx.shape[0]
-            pbar.set_postfix(train=f"{loss_sum/n:.4g}")
-            if (epoch + 1) % 25 == 0 or epoch == args["epochs"] - 1:
-                self.model.eval()
-                with torch.no_grad():
-                    te = F.mse_loss(self.model(Xte), Yte).item()
-                logging.info(f"  mlp_eigen epoch {epoch+1}/{args['epochs']}  "
-                             f"train={loss_sum/n:.6g}  test={te:.6g}")
+        feat_dir = tempfile.mkdtemp(prefix="mlp_eigen_feat_",
+                                    dir=args.get("output_dir") or None)
+        feat_path = os.path.join(feat_dir, "train_feats.f32")
+        try:
+            Xtr = self._featurize_to_memmap(coords_train.cpu(), feat_path)
+            pbar = tqdm(range(args["epochs"]), desc="mlp_eigen")
+            for epoch in pbar:
+                self.model.train()
+                perm = np.random.permutation(n)
+                loss_sum = 0.0
+                for i in range(0, n, bs):
+                    # Sort within the batch so the memmap reads are near-sequential
+                    # (order within a batch is irrelevant to the mean-reduced loss).
+                    idx = np.sort(perm[i:i + bs])
+                    xb = torch.from_numpy(np.ascontiguousarray(Xtr[idx])).to(self.device)
+                    yb = torch.from_numpy(Ytr[idx]).to(self.device)
+                    loss = F.mse_loss(self.model(xb), yb)
+                    opt.zero_grad(); loss.backward(); opt.step()
+                    loss_sum += loss.item() * idx.shape[0]
+                pbar.set_postfix(train=f"{loss_sum/n:.4g}")
+                if (epoch + 1) % 25 == 0 or epoch == args["epochs"] - 1:
+                    te = F.mse_loss(self._predict_coords(coords_test), y_test.cpu()).item()
+                    logging.info(f"  mlp_eigen epoch {epoch+1}/{args['epochs']}  "
+                                 f"train={loss_sum/n:.6g}  test={te:.6g}")
+            # Final predictions: train from the memmap (already computed), test on the fly.
+            pred_tr = self._forward_memmap(Xtr)
+            pred_te = self._predict_coords(coords_test)
+        finally:
+            del Xtr
+            try:
+                os.remove(feat_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(feat_dir)
+            except OSError:
+                pass
+        return pred_tr, pred_te
+
+    def _forward_memmap(self, Xmm):
+        """Model forward over a memmap feature matrix, chunked, returned on CPU."""
         self.model.eval()
+        outs = []
         with torch.no_grad():
-            return self.model(Xtr).cpu(), self.model(Xte).cpu()
+            for i in range(0, Xmm.shape[0], self.forward_chunk):
+                xb = torch.from_numpy(np.ascontiguousarray(Xmm[i:i + self.forward_chunk])).to(self.device)
+                outs.append(self.model(xb).cpu())
+        return torch.cat(outs, dim=0)
 
     def predict(self, coords_std):
-        self.model.eval()
-        with torch.no_grad():
-            return self.model(self._inputs(coords_std)).cpu()
+        return self._predict_coords(coords_std)
 
     def load(self, path, p, args):
         self.device = torch.device(args["device"])
@@ -528,7 +597,14 @@ def _knn_edge_index(x, k):
 
 
 class _GCNNet(nn.Module):
-    """Stacked GCNConv layers + a linear read-out (coords -> lipids)."""
+    """Stacked GCNConv layers + a linear read-out (features -> lipids).
+
+    Two anti-oversmoothing measures: (1) a residual connection on every
+    width-preserving layer, so repeated neighbourhood averaging can't wash the
+    signal out to the graph mean; (2) an optional per-edge ``edge_weight`` so
+    message passing follows the manifold graph's affinities instead of a plain
+    unweighted neighbour mean. ``edge_weight=None`` recovers the original
+    behaviour (used by the per-batch ``gcn`` baseline)."""
     def __init__(self, in_dim, hidden, p, dropout):
         super().__init__()
         dims = [in_dim] + list(hidden)
@@ -538,11 +614,14 @@ class _GCNNet(nn.Module):
         self.dropout = dropout
         self.head = nn.Linear(dims[-1], p)
 
-    def forward(self, x, edge_index):
+    def forward(self, x, edge_index, edge_weight=None):
         for conv in self.convs:
-            x = F.silu(conv(x, edge_index))
+            h = F.silu(conv(x, edge_index, edge_weight))
             if self.dropout > 0:
-                x = F.dropout(x, p=self.dropout, training=self.training)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            # Residual only where the layer preserves width (every layer but
+            # the first, which lifts in_dim -> hidden).
+            x = h + x if h.shape[-1] == x.shape[-1] else h
         return self.head(x)
 
 
@@ -656,27 +735,56 @@ class GCNFaissBaseline:
         self.dropout = None
         self.knn = None            # KnnGraph: .x (N,3), .search(x, k)
         self.edge_index = None     # (2, E)
+        self.edge_weight = None    # (E,) heat-kernel affinities from edge_value
         self.node_x = None         # (N, 3) node features
+        self.interp_k = 8          # nearest nodes averaged at read-out
         self._node_preds = None    # cached (N, p) node predictions (eval)
 
-    def attach_graph(self, knn, edge_index, device):
+    def attach_graph(self, knn, edge_index, edge_value, device, interp_k=8):
         self.device = torch.device(device)
         self.knn = knn
         self.edge_index = edge_index.to(self.device)
         self.node_x = knn.x.to(self.device).float()
+        self.interp_k = int(interp_k)
+        # edge_value holds SQUARED distances; turn them into affinities with a
+        # heat kernel whose bandwidth is the median edge (self-scaling, so the
+        # weights sit in a sane range regardless of stride/coordinate units).
+        # GCNConv applies its own symmetric degree normalization on top.
+        ev = edge_value.to(self.device).float()
+        sigma2 = torch.median(ev).clamp_min(1e-12)
+        self.edge_weight = torch.exp(-ev / sigma2)
 
-    def _nearest_node(self, coords):
-        """(B,) long node indices for query coords (reference frame)."""
+    def _interp_weights(self, coords, k=None):
+        """Shepard (inverse-distance) interpolation over the k nearest reference
+        nodes. Returns (idx (B,k) long, w (B,k) float) with weights normalized to
+        sum 1 per query. Guards the approximate FAISS search's -1 padding."""
+        k = self.interp_k if k is None else k
         # faiss's torch search requires a contiguous input; sliced/normalized
         # coord tensors often aren't. .contiguous() is a no-op when already so.
         q = coords.to(self.node_x.device).contiguous()
-        _, idx = self.knn.search(q, 1)
-        return idx.reshape(-1).long()
+        d2, idx = self.knn.search(q, k)          # d2: squared distances
+        valid = idx >= 0
+        idx = idx.long().clamp_min(0)
+        d2 = d2.clamp_min(0.0)
+        w = torch.where(valid, 1.0 / (torch.sqrt(d2) + 1e-8),
+                        torch.zeros_like(d2))
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return idx, w
+
+    @staticmethod
+    def _readout(node_preds, idx, w):
+        """Weighted gather: (B,k) node indices + (B,k) weights -> (B, p). Loops
+        over the (small) k to avoid materializing the (B, k, p) intermediate."""
+        out = node_preds.new_zeros((idx.shape[0], node_preds.shape[1]))
+        for j in range(idx.shape[1]):
+            out = out + w[:, j:j + 1] * node_preds[idx[:, j]]
+        return out
 
     def _refresh_node_preds(self):
         self.model.eval()
         with torch.no_grad():
-            self._node_preds = self.model(self.node_x, self.edge_index)
+            self._node_preds = self.model(self.node_x, self.edge_index,
+                                          self.edge_weight)
 
     def fit(self, coords_train, y_train, coords_test, y_test, args):
         if not HAVE_PYG:
@@ -689,8 +797,11 @@ class GCNFaissBaseline:
         self.model = _GCNNet(3, self.hidden, p, self.dropout).to(self.device)
         opt = torch.optim.Adam(self.model.parameters(), lr=args["learning_rate"])
 
-        nn_tr = self._nearest_node(coords_train)
-        nn_te = self._nearest_node(coords_test)
+        # Each measurement reads out from its k nearest reference nodes (Shepard
+        # interpolation) instead of snapping to a single nearest node, so the
+        # supervision — and the reconstruction — vary smoothly below node scale.
+        tr_idx, tr_w = self._interp_weights(coords_train)
+        te_idx, te_w = self._interp_weights(coords_test)
         Ytr = y_train.to(self.device); Yte = y_test.to(self.device)
 
         # Full-graph transductive training. Each step is ONE full-graph forward +
@@ -698,36 +809,42 @@ class GCNFaissBaseline:
         # minibatch baselines that take n/batch_size steps per epoch) would leave
         # this drastically undertrained. Instead run a dedicated iteration budget
         # (gcn_faiss_iters), each on a stochastic minibatch of training
-        # measurements (mapped to their nearest node) for SGD noise + bounded
-        # memory on the (n_tr, p) gather.
-        n_tr = nn_tr.shape[0]
+        # measurements (interpolated from their nearest nodes) for SGD noise +
+        # bounded memory on the (mb, p) read-out.
+        n_tr = tr_idx.shape[0]
         n_iters = int(args.get("gcn_faiss_iters", 2000))
         mb = min(int(args.get("gcn_faiss_node_batch", 65536)), n_tr)
         log_every = max(1, n_iters // 20)
         pbar = tqdm(range(n_iters), desc="gcn_faiss")
         for it in pbar:
             self.model.train()
-            node_preds = self.model(self.node_x, self.edge_index)   # (N, p)
+            node_preds = self.model(self.node_x, self.edge_index,
+                                    self.edge_weight)               # (N, p)
             sel = torch.randint(0, n_tr, (mb,), device=self.device)
-            loss = F.mse_loss(node_preds[nn_tr[sel]], Ytr[sel])
+            pred = self._readout(node_preds, tr_idx[sel], tr_w[sel])
+            loss = F.mse_loss(pred, Ytr[sel])
             opt.zero_grad(); loss.backward(); opt.step()
             pbar.set_postfix(train=f"{loss.item():.4g}")
             if (it + 1) % log_every == 0 or it == n_iters - 1:
                 self.model.eval()
                 with torch.no_grad():
+                    node_preds_e = self.model(self.node_x, self.edge_index,
+                                              self.edge_weight)
                     te = F.mse_loss(
-                        self.model(self.node_x, self.edge_index)[nn_te], Yte
+                        self._readout(node_preds_e, te_idx, te_w), Yte
                     ).item()
                 logging.info(f"  gcn_faiss iter {it+1}/{n_iters}  "
                              f"train={loss.item():.6g}  test={te:.6g}")
 
         self._refresh_node_preds()
-        return (self._node_preds[nn_tr].cpu(), self._node_preds[nn_te].cpu())
+        return (self._readout(self._node_preds, tr_idx, tr_w).cpu(),
+                self._readout(self._node_preds, te_idx, te_w).cpu())
 
     def predict(self, coords_std):
         if self._node_preds is None:
             self._refresh_node_preds()
-        return self._node_preds[self._nearest_node(coords_std)].cpu()
+        idx, w = self._interp_weights(coords_std)
+        return self._readout(self._node_preds, idx, w).cpu()
 
     def save(self, path):
         torch.save({"state_dict": self.model.state_dict(),
@@ -1057,10 +1174,11 @@ def main():
         manifold_kernel, _knn = build_manifold_kernel(args, config, ref_mean, ref_std)
         model.attach_kernel(manifold_kernel)
     if needs_graph:
-        knn, edge_index, _edge_value, _gk = build_manifold_graph(
+        knn, edge_index, edge_value, _gk = build_manifold_graph(
             args, config, ref_mean, ref_std,
         )
-        model.attach_graph(knn, edge_index, args["device"])
+        model.attach_graph(knn, edge_index, edge_value, args["device"],
+                           interp_k=args["gcn_faiss_interp_k"])
 
     model_path = config.exp_path / "model.pth"
     coord_mean_path = config.exp_path / "coord_mean.pth"

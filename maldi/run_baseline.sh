@@ -10,11 +10,11 @@
 #   gcn_faiss — Graph Conv Net over the FAISS reference-node manifold graph
 #               (needs the graph pipeline; set EIGENVECTOR_DIR + graph knobs)
 : "${BATCH_SIZE:=256}"
-: "${N_EPOCHS:=10}"
+: "${N_EPOCHS:=50}"
 : "${LEARNING_RATE:=0.001}"
 : "${SEED:=416465}"
 : "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
-: "${OUTPUT_DIR:=/home/casap/mlibra/output}"
+: "${OUTPUT_DIR:=/home/casap/mlibra/output/baseline}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
 : "${ANNOTATION_FILE:=/home/casap/mlibra/mlibra_data/level_15annot.npy}"
@@ -38,7 +38,7 @@ fi
 : "${XGB_LR:=0}"
 
 # --- GCN knobs (MODEL=gcn / gcn_faiss) --------------------------------------
-: "${GCN_HIDDEN:=256 256 128}"
+: "${GCN_HIDDEN:=512 512 256}"
 : "${GCN_DROPOUT:=0.1}"
 : "${GCN_KNN_K:=15}"
 # gcn_faiss is full-graph (1 step/forward), so it needs its own iteration budget
@@ -48,14 +48,21 @@ fi
 
 # --- Manifold graph/eigenbasis knobs (MODEL=mlp_eigen|gcn_faiss); ignored otherwise --
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
-: "${NUM_MODES:=100}"
+: "${NUM_MODES:=300}"
 : "${STRIDE:=4}"
 : "${THRESHOLD:=5}"
 : "${KNN_K:=15}"
 : "${LAPLACIAN_NORM:=randomwalk}"
 : "${KNN_METHOD:=faiss_atlas_weighted}"
 # Cross-region edge-weight inflation; only takes effect with KNN_METHOD=faiss_atlas_weighted.
-: "${CROSS_REGION_INFLATION:=10.0}"
+: "${CROSS_REGION_INFLATION:=50.0}"
+# Atlas root handling + label denoise + hard prune (faiss_atlas_weighted; mirror run_manifold.sh).
+# ROOT_HANDLING: dissolve (default) | ignore | cross. DENOISE_LABELS: majority-vote passes (0=off).
+# PRUNE_CROSS_REGION: fraction of cross-region edges to HARD-remove (0=off). Non-cross root and
+# any prune change the eigvec cache key (fresh solve).
+: "${ROOT_HANDLING:=dissolve}"
+: "${DENOISE_LABELS:=3}"
+: "${PRUNE_CROSS_REGION:=0.97}"
 : "${GRAPHBANDWIDTH_INIT:=0.1}"
 : "${BUMP_SCALE:=1.0}"
 : "${BUMP_DECAY:=0.01}"
@@ -71,6 +78,23 @@ cd $SRC_PATH
 # all landing in one hardcoded path and clobbering each other.
 MODEL_TAG=$(echo "$MODEL" | tr '[:lower:]' '[:upper:]')
 EXP_NAME="$EXP_PREFIX-BASELINES-$MODEL_TAG-$BATCH_SIZE"
+
+# Reflect root/denoise/prune in the exp name (only for the manifold-aware models on
+# the atlas-weighted graph) so a prune-config sweep gets distinct dirs instead of
+# clobbering. Mirrors run_manifold.sh; 'cross' root + zero denoise/prune stay unsuffixed
+# so legacy names remain valid.
+if { [ "$MODEL" = "mlp_eigen" ] || [ "$MODEL" = "gcn_faiss" ]; } \
+   && [ "$KNN_METHOD" = "faiss_atlas_weighted" ]; then
+    if [ "$ROOT_HANDLING" != "cross" ]; then
+        EXP_NAME="$EXP_NAME-root$ROOT_HANDLING"
+    fi
+    if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
+        EXP_NAME="$EXP_NAME-dn$DENOISE_LABELS"
+    fi
+    if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
+        EXP_NAME="$EXP_NAME-prune$PRUNE_CROSS_REGION"
+    fi
+fi
 
 # ---- reconstruction lipids from the curated subset file (mirror run_manifold) ----
 : "${RECONSTRUCTION_LIPIDS_FILE:=/home/casap/mlibra_git/maldi/data/lipid_subset.txt}"
@@ -111,6 +135,9 @@ if [ "$MODEL" = "mlp_eigen" ] || [ "$MODEL" = "gcn_faiss" ]; then
         --knn-method $KNN_METHOD \
         --annotations-file $ANNOTATION_FILE \
         --cross-region-inflation $CROSS_REGION_INFLATION \
+        --root-handling $ROOT_HANDLING \
+        --denoise-labels $DENOISE_LABELS \
+        --prune-cross-region $PRUNE_CROSS_REGION \
         --graphbandwidth-init $GRAPHBANDWIDTH_INIT \
         --bump-scale $BUMP_SCALE \
         --bump-decay $BUMP_DECAY \
