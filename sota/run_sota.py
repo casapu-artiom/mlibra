@@ -93,6 +93,14 @@ def parse_args():
     parser.add_argument("--reconstruct", type=str, default="auto",
                         choices=["none", "auto", "whole_brain", "region"])
     parser.add_argument("--reconstruct-threshold", type=float, default=5.0)
+    # Mirror experiment_baselines: reconstruction forward-pass batch (not training)
+    # and the render-voxels-only sparse reconstruction. Kept here because eb.main()
+    # uses THIS parser (run_sota rebinds eb.parse_args), so a flag missing here is a
+    # KeyError in eb.main, not just an unavailable option.
+    parser.add_argument("--inference-batch-size", dest="inference_batch_size",
+                        type=int, default=65536)
+    parser.add_argument("--render-voxels-only", dest="render_voxels_only",
+                        action="store_true")
     parser.add_argument("--skip-training", action="store_true")
     # Early stopping (best-checkpoint on a val split carved from TRAIN; the
     # held-out test set is never used for model selection). Shared by all models.
@@ -129,8 +137,16 @@ def parse_args():
     g.add_argument("--ntf-features", type=int, default=2)
     g.add_argument("--ntf-log2-hashmap", type=int, default=19)
     g.add_argument("--ntf-base-res", type=int, default=16)
-    g.add_argument("--ntf-max-res", type=int, default=1024)
+    g.add_argument("--ntf-max-res", type=int, default=256,
+                   help="Finest hash-grid resolution. Kept moderate: on a sparse, "
+                        "cross-mouse split too high a value lets the grid memorise "
+                        "per-voxel detail and hurts held-out generalization.")
     g.add_argument("--ntf-hidden", type=int, nargs="+", default=[128, 128])
+    g.add_argument("--ntf-grid-lr", type=float, default=1e-2,
+                   help="Dedicated LR for the hash-grid embeddings (InstantNGP "
+                        "recipe): much higher than the MLP LR, with a tiny Adam eps "
+                        "and no weight decay, so the sparse grid gradients actually "
+                        "move the near-zero-init tables off the constant field.")
     g.add_argument("--ntf-tv-weight", type=float, default=0.01,
                    help="Spatial smoothness / TV regulariser weight.")
     g.add_argument("--ntf-tv-eps", type=float, default=0.01,
@@ -139,8 +155,10 @@ def parse_args():
                    help="Max number of z (coronal) section bins for the bias.")
     g.add_argument("--ntf-zero-inflation", action="store_true")
     g.add_argument("--ntf-weight-decay", type=float, default=0.0,
-                   help="Adam weight decay (L2), incl. the hash embeddings -- a "
-                        "strong INR regulariser against per-voxel memorization.")
+                   help="Adam weight decay (L2) on the MLP heads only. The hash "
+                        "embeddings are explicitly excluded (weight decay collapses "
+                        "them to a constant field); regularise the grid via "
+                        "--ntf-max-res and --ntf-tv-weight instead.")
     # ---- ported from the official NTF models.py ----
     g.add_argument("--ntf-features-z", type=int, default=16,
                    help="Latent-z width feeding the variance (sigma) net.")

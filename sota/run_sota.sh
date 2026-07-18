@@ -44,6 +44,14 @@ fi
 # whole_brain reconstruction => renders + per-lipid true-vs-pred scatterplots +
 # value-distribution diagnostics (parity with run_manifold / run_baseline).
 : "${RECONSTRUCT:=whole_brain}"
+# Reconstruct only the voxels the composite render reads (slice planes + 3D MIP
+# stride): ~5.5x fewer voxels, near-identical figure. Writes sparse volumes to
+# volume_sparse/. Applies to ntf/spa3d/gplfr (they go through eb.main /
+# MaldiExperiment); deepspatial's own driver reconstructs onto a transported CCF
+# grid and does not support it, so the flag is not forwarded there.
+: "${RENDER_VOXELS_ONLY:=1}"
+RENDER_ARGS=""
+[ "$RENDER_VOXELS_ONLY" != "0" ] && RENDER_ARGS="--render-voxels-only"
 # Early stopping: best-checkpoint restore of the best epoch (never ship the last,
 # which for a high-capacity field on the cross-mouse folds is usually the worst).
 # EARLY_STOP_MONITOR=val (default) carves a val set from TRAIN (no leak) but only
@@ -126,6 +134,10 @@ WANDB_ARGS=""
 #   adjacent across animals (denser sampling + cross-mouse fill; needs mice to
 #   register well to the common CCF frame).
 : "${DS_PAIRING:=cross-mouse}"
+# Full-volume reconstruction scope: follow (default; cross-mouse iff DS_PAIRING is
+# cross-mouse, else per-mouse) | per-mouse | cross-mouse. cross-mouse pools all
+# test sections into one AP-ordered canonical brain instead of one volume per mouse.
+: "${DS_RECON_SCOPE:=follow}"
 # Resume: if a checkpoint exists in the exp dir it is loaded and training is
 # skipped. Set DS_FORCE_RETRAIN=1 to retrain from scratch instead.
 : "${DS_FORCE_RETRAIN:=0}"
@@ -139,6 +151,10 @@ DS_FORCE_ARG=""
 : "${INVERSE_TEMPERATURE:=0.1}"
 : "${GPLFR_KERNEL:=matern}"
 : "${GPLFR_NU:=2.5}"
+# Per-axis ARD for the euclidean base GP (1 = on). Ignored by riemann/spectral.
+: "${GPLFR_ARD:=0}"
+GPLFR_ARD_ARG=""
+[ "$GPLFR_ARD" != "0" ] && GPLFR_ARD_ARG="--ard"
 # Manifold-base (riemann|spectral) knobs; ignored when BASE_GP=euclidean. The
 # manifold bases need the eigenpair pipeline (EIGENVECTOR_DIR + graph/spectrum).
 : "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
@@ -233,6 +249,7 @@ if [ "$MODEL" = "deepspatial" ]; then
         --ds-recon-batch $DS_RECON_BATCH \
         --ds-n-samples $DS_N_SAMPLES \
         --ds-pairing $DS_PAIRING \
+        --ds-recon-scope $DS_RECON_SCOPE \
         $DS_FORCE_ARG \
         --reconstruct "$RECONSTRUCT" \
         $WANDB_ARGS \
@@ -268,6 +285,7 @@ elif [ "$MODEL" = "gplfr" ]; then
         --num-inducing $NUM_INDUCING \
         --kernel "$GPLFR_KERNEL" \
         --nu $GPLFR_NU \
+        $GPLFR_ARD_ARG \
         --inverse-temperature $INVERSE_TEMPERATURE \
         --base-gp "$BASE_GP" \
         $MANIFOLD_ARGS \
@@ -324,6 +342,7 @@ else
         --spa3d-hidden $SPA3D_HIDDEN \
         --spa3d-dropout $SPA3D_DROPOUT \
         --reconstruct "$RECONSTRUCT" \
+        $RENDER_ARGS \
         --val-frac $VAL_FRAC \
         --early-stop-patience $EARLY_STOP_PATIENCE \
         --early-stop-monitor $EARLY_STOP_MONITOR \

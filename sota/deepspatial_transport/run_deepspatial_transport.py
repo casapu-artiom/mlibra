@@ -126,6 +126,17 @@ def parse_args():
                         "Lower only if the ODE step itself OOMs.")
     p.add_argument("--ds-n-samples", dest="ds_n_samples", type=int, default=50000,
                    help="Trajectory pairs sampled per mouse (n_samples_base).")
+    p.add_argument("--ds-recon-scope", dest="ds_recon_scope", default="follow",
+                   choices=["follow", "per-mouse", "cross-mouse"],
+                   help="Scope of the full-volume reconstruction. 'per-mouse': "
+                        "transport only within each test mouse's own adjacent "
+                        "sections -> one (sparse, partial-AP) volume per mouse. "
+                        "'cross-mouse': pool ALL test sections, sort by CCF AP and "
+                        "transport across adjacent sections regardless of animal -> "
+                        "one canonical whole-brain volume (mirrors cross-mouse "
+                        "training pairing; sound only when mice register well). "
+                        "'follow' (default): cross-mouse iff --ds-pairing=cross-mouse, "
+                        "else per-mouse -- so training and reconstruction agree.")
     p.add_argument("--ds-pairing", dest="ds_pairing", default="within-mouse",
                    choices=["within-mouse", "cross-mouse"],
                    help="How training UOT section pairs are formed. 'within-mouse' "
@@ -553,31 +564,60 @@ def main():
                 logging.warning(f"diagnostics plotting failed: {e}")
         K = len(col_indices)
         rng = np.random.default_rng(args["seed"])
-        for mouse, secs in test_by_mouse.items():
-            if len(secs) < 2:
-                continue
-            logging.info(f"Reconstructing full volume: {mouse} ({len(secs)} sections)")
+
+        # Resolve reconstruction scope. 'follow' ties it to the training pairing so
+        # a cross-mouse run reconstructs the canonical cross-mouse brain (the two
+        # were previously mismatched: pairing could be cross-mouse while the
+        # reconstruction always ran per-mouse).
+        scope = args.get("ds_recon_scope", "follow")
+        if scope == "follow":
+            scope = ("cross-mouse" if args["ds_pairing"] == "cross-mouse"
+                     else "per-mouse")
+
+        # Normalize every test section into the training frame BEFORE grouping, so
+        # z_norm (CCF AP) is comparable across mice for the cross-mouse sort.
+        for secs in test_by_mouse.values():
             _apply_norm(secs, ds.spatial_stats)
+
+        if scope == "cross-mouse":
+            # Pool ALL test sections into one AP-ordered stack; reconstruct_mouse
+            # then transports across adjacent sections regardless of animal, and
+            # _accumulate averages overlapping-AP voxels from different mice into
+            # the shared CCF grid -> one canonical whole-brain volume.
+            pooled = sorted(
+                (a for secs in test_by_mouse.values() for a in secs),
+                key=lambda a: float(a.obs["z_norm"].iloc[0]))
+            groups = [("crossmouse", pooled)]
+        else:
+            groups = [(str(m), secs) for m, secs in test_by_mouse.items()]
+
+        for tag, secs in groups:
+            if len(secs) < 2:
+                logging.warning(f"Skipping reconstruction '{tag}': "
+                                f"only {len(secs)} section(s).")
+                continue
+            logging.info(f"Reconstructing full volume [{scope}]: {tag} "
+                         f"({len(secs)} sections)")
             preds, indices = reconstruct_mouse(
                 ds, secs, args, ccf2idx, template, col_indices, K, rng)
             _write_per_lipid_volumes(volume_path, preds, indices,
                                      template.shape, lipid_names, col_indices,
-                                     suffix=f"_{mouse}")
-            logging.info(f"  wrote {K} lipid volumes for {mouse} "
+                                     suffix=f"_{tag}")
+            logging.info(f"  wrote {K} lipid volumes for {tag} "
                          f"({len(indices):,} voxels)")
-            # Render per mouse into its own subdir (PNG names carry no suffix, so
-            # separate dirs prevent collisions across test mice).
+            # Render into a per-tag subdir (PNG names carry no suffix, so separate
+            # dirs prevent collisions across reconstructions).
             if render_selected_lipids is not None:
                 try:
                     render_selected_lipids(
                         template_volume=template, volume_dir=volume_path,
-                        output_dir=exp_path / "renders" / str(mouse),
+                        output_dir=exp_path / "renders" / tag,
                         selected_lipids_names=lipid_names,
                         lipid_indices=(list(lipid_filter) if lipid_filter is not None else None),
-                        suffix=f"_{mouse}", n_rotation_frames=10)
-                    logging.info(f"  renders -> {exp_path / 'renders' / str(mouse)}")
+                        suffix=f"_{tag}", n_rotation_frames=10)
+                    logging.info(f"  renders -> {exp_path / 'renders' / tag}")
                 except Exception as e:  # noqa: BLE001
-                    logging.error(f"Rendering failed for {mouse} (volumes saved): {e}")
+                    logging.error(f"Rendering failed for {tag} (volumes saved): {e}")
 
     if run is not None:
         run.finish()

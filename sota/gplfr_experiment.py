@@ -79,6 +79,11 @@ def parse_args():
     parser.add_argument("--kernel", type=str, default="matern", help="Kernel type for the latent GP.")
     parser.add_argument("--log-transform", dest="log_transform", action='store_true', help="Apply log transformation to the data.")
     parser.add_argument("--nu", type=float, default=1.5, help="Matern smoothness parameter.")
+    parser.add_argument("--ard", dest="ard", action="store_true",
+                        help="Euclidean base GP only: use per-axis ARD (one "
+                             "lengthscale per x/y/z) instead of a single isotropic "
+                             "lengthscale. Ignored by the riemann/spectral bases "
+                             "(their manifold kernels have no per-axis lengthscale).")
     parser.add_argument("--n-pixels", dest="n_pixels", type=int, default=10, help="Pixels used for the minimal length scale.")
     parser.add_argument("--learning-rate", dest="learning_rate", type=float, default=0.001, help="Learning rate.")
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=2000, help="Loader batch size (training is full-batch).")
@@ -118,6 +123,10 @@ def _build_euclidean_gp(args, config):
     voxel_size = 0.025
     minimal_length_scale = args["n_pixels"] * voxel_size / (coord_std.sum() / 3)
     logging.info(f"minimal length scale in um: {args['n_pixels'] * voxel_size}")
+    # ard_num_dims=3 => one lengthscale per spatial axis; None => isotropic.
+    ard_num_dims = 3 if args.get("ard") else None
+    logging.info(f"Euclidean base GP: ard_num_dims={ard_num_dims} "
+                 f"({'per-axis ARD' if ard_num_dims else 'isotropic'})")
     gp_model = IndependentMultitaskGPModel(
         inducing_points=inducing_points,
         num_tasks=config.latent_dim,
@@ -125,6 +134,7 @@ def _build_euclidean_gp(args, config):
         nu=config.nu,
         minimal_length_scale=minimal_length_scale,
         input_dim=3,
+        ard_num_dims=ard_num_dims,
     )
     return gp_model, coord_mean, coord_std
 

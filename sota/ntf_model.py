@@ -246,12 +246,13 @@ class NTFModel:
             features_per_level=args.get("ntf_features", 2),
             log2_hashmap=args.get("ntf_log2_hashmap", 19),
             base_res=args.get("ntf_base_res", 16),
-            max_res=args.get("ntf_max_res", 1024),
+            max_res=args.get("ntf_max_res", 256),
             hidden=args.get("ntf_hidden", [128, 128]),
             tv_weight=args.get("ntf_tv_weight", 0.01),
             tv_eps=args.get("ntf_tv_eps", 0.01),
             zero_inflation=args.get("ntf_zero_inflation", False),
             weight_decay=args.get("ntf_weight_decay", 0.0),
+            grid_lr=args.get("ntf_grid_lr", 1e-2),
             # ---- ported from the official NTF models.py ----
             n_features_z=args.get("ntf_features_z", 16),      # latent for sigma_net
             n_features_slice=args.get("ntf_features_slice", 8),
@@ -318,11 +319,24 @@ class NTFModel:
                      f"hash levels={self.cfg['n_levels']}")
 
         self.net = NTFNet(self.p, self.n_slices, self.cfg).to(self.device)
-        # Weight decay (esp. on the hash-grid embeddings) is a strong INR
-        # regulariser: it pulls table entries toward 0 (the mean field), curbing
-        # the per-voxel memorization that drives the cross-mouse val/test gap.
-        opt = torch.optim.Adam(self.net.parameters(), lr=args["learning_rate"],
-                               weight_decay=float(self.cfg["weight_decay"]))
+        # Two param groups (InstantNGP recipe). The hash-grid embeddings train at a
+        # higher LR with a tiny Adam eps and NO weight decay: their per-entry
+        # gradients are sparse and small, so a shared 1e-3 LR barely moves them, and
+        # any weight decay drags the near-zero-init table back to a constant field
+        # -- collapsing NTF to the per-lipid mean (the dead runs). Generalization is
+        # instead regularised by the grid resolution (``max_res``) and the TV term;
+        # weight decay applies only to the MLP heads, which can safely be shrunk.
+        enc_params = list(self.net.encoder.parameters())
+        enc_ids = {id(p) for p in enc_params}
+        other_params = [p for p in self.net.parameters() if id(p) not in enc_ids]
+        opt = torch.optim.Adam(
+            [
+                {"params": enc_params, "lr": float(self.cfg["grid_lr"]),
+                 "weight_decay": 0.0, "eps": 1e-15},
+                {"params": other_params, "lr": args["learning_rate"],
+                 "weight_decay": float(self.cfg["weight_decay"])},
+            ]
+        )
 
         self.psf_samples = int(self.cfg["psf_samples"])
         self.psf_sigma = float(self.cfg["psf_sigma"])

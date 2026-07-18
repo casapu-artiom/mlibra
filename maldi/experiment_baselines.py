@@ -1351,9 +1351,12 @@ def main():
             col_means=col_means, col_stds=col_stds,
             mode=rec_mode, region_bbox=region_bbox,
             threshold=args["reconstruct_threshold"],
-            batch_size=args["inference_batch_size"] or args["batch_size"],
+            # .get(): external callers rebind parse_args (e.g. sota/run_sota.py) and
+            # a mirror missing these keys must fall back to defaults, not KeyError
+            # AFTER training has already run.
+            batch_size=args.get("inference_batch_size") or args["batch_size"],
             lipid_filter=lipid_filter,
-            render_voxels_only=args["render_voxels_only"],
+            render_voxels_only=args.get("render_voxels_only", False),
         )
 
         # ---- Render per-lipid composites + diagnostics ----
