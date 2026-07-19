@@ -52,9 +52,14 @@ RUN set -eux; \
     echo "${APP_USER} ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
 # ---- 3. SSH Configuration ----
+# Allow both APP_USER and root to ssh in. PermitRootLogin prohibit-password is
+# set via sed (not append) because sshd honours the FIRST matching directive, so
+# a base-image `PermitRootLogin no` earlier in the file would otherwise win --
+# and prohibit-password permits key auth for root while still refusing passwords.
 RUN mkdir -p /run/sshd \
     && sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config \
-    && echo "AllowUsers ${APP_USER}" >> /etc/ssh/sshd_config
+    && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && echo "AllowUsers ${APP_USER} root" >> /etc/ssh/sshd_config
 
 # ---- 4. Install Dependencies Directly ----
 # Using --break-system-packages because modern Ubuntu/Debian requires it 
