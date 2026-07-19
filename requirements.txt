@@ -9,13 +9,13 @@ cupy-cuda12x
 numba
 protobuf
 pandas
-scipy
+scipy==1.17.1
 torch
 # --- Your other project dependencies ---
 gpytorch
 tqdm
 ipython
-scikit-learn
+scikit-learn==1.8.0
 scikit-image
 imageio
 tables
@@ -28,3 +28,5 @@ torchvision
 jaxtyping
 IPython
 bg-atlasapi
+xgboost
+deepspatial
