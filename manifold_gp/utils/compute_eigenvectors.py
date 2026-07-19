@@ -318,10 +318,14 @@ class LaplacianEigensolver:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # CuPy -> torch (zero-copy via dlpack when possible).
-        if hasattr(evecs_cp, "toDlpack"):
-            evals = torch.from_dlpack(evals_cp.toDlpack()).float()
-            evecs = torch.from_dlpack(evecs_cp.toDlpack()).float()
+        # CuPy -> torch (zero-copy via dlpack when possible). Pass the cupy array
+        # itself, NOT array.toDlpack(): torch>=2.x consumes the object's __dlpack__
+        # protocol and negotiates the DLPack version. The legacy raw-capsule path
+        # (toDlpack()) fails on newer torch/cupy with "from_dlpack received an
+        # invalid capsule ... consumed only once".
+        if hasattr(evecs_cp, "__dlpack__"):
+            evals = torch.from_dlpack(evals_cp).float()
+            evecs = torch.from_dlpack(evecs_cp).float()
         else:
             evals = torch.from_numpy(cp.asnumpy(evals_cp)).float().cuda()
             evecs = torch.from_numpy(cp.asnumpy(evecs_cp)).float().cuda()
