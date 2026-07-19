@@ -16,18 +16,24 @@ if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
 fi
 
 # ---- Set up authorized_keys from persistent storage ----
-ssh_dir="/home/${APP_USER}/.ssh"
-mkdir -p "$ssh_dir"
-if [ -f "/myhome/.ssh/authorized_keys" ]; then
-    cp /myhome/.ssh/authorized_keys "$ssh_dir/authorized_keys"
-elif [ -f "/myhome/.ssh/id_ed25519.pub" ]; then
-    cp /myhome/.ssh/id_ed25519.pub "$ssh_dir/authorized_keys"
-elif [ -f "/myhome/.ssh/id_rsa.pub" ]; then
-    cp /myhome/.ssh/id_rsa.pub "$ssh_dir/authorized_keys"
-fi
-chmod 700 "$ssh_dir"
-[ -f "$ssh_dir/authorized_keys" ] && chmod 600 "$ssh_dir/authorized_keys"
-chown -R "${APP_USER}:${APP_GID}" "$ssh_dir"
+# Install the same key for both APP_USER and root (root ssh is allowed by the
+# image's sshd_config), so `ssh appuser@` and `ssh root@` both work by key.
+install_authorized_keys() {
+    ssh_dir="$1"; owner="$2"
+    mkdir -p "$ssh_dir"
+    if [ -f "/myhome/.ssh/authorized_keys" ]; then
+        cp /myhome/.ssh/authorized_keys "$ssh_dir/authorized_keys"
+    elif [ -f "/myhome/.ssh/id_ed25519.pub" ]; then
+        cp /myhome/.ssh/id_ed25519.pub "$ssh_dir/authorized_keys"
+    elif [ -f "/myhome/.ssh/id_rsa.pub" ]; then
+        cp /myhome/.ssh/id_rsa.pub "$ssh_dir/authorized_keys"
+    fi
+    chmod 700 "$ssh_dir"
+    [ -f "$ssh_dir/authorized_keys" ] && chmod 600 "$ssh_dir/authorized_keys"
+    chown -R "$owner" "$ssh_dir"
+}
+install_authorized_keys "/home/${APP_USER}/.ssh" "${APP_USER}:${APP_GID}"
+install_authorized_keys "/root/.ssh" "root:root"
 
 # ---- Faiss ----
 # faiss is now compiled and installed at image build time (see Dockerfile);
