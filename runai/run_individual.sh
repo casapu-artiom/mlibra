@@ -17,7 +17,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 : "${SRC_PATH:=$(dirname "$SCRIPT_DIR")}"
 
 # ---- RunPod data / output locations ----------------------------------------
-: "${DATA_PATH:=/workspace/maldi_data}"
+: "${DATA_PATH:=/workspace/mlibra_data}"
 : "${OUTPUT_DIR:=/workspace/output}"
 : "${EIGENVECTOR_DIR:=/workspace/output/eigenvectors}"
 : "${MALDI_FILE:=${DATA_PATH}/maindata_minimal.parquet}"
