@@ -176,10 +176,25 @@ def resolve_graph_keys(args):
         base = dict(parts)
         base["method"] = "faiss"            # graph is the plain-faiss cache
         graph_cache_key = make_graph_key(base)
-        parts["weighting"] = (
+        # weighting = base inflation tag, plus a _root<mode> suffix for the
+        # non-legacy root handling (legacy 'cross' stays un-suffixed so old
+        # caches still load). Mirrors lgp_experiment_per_lipid.
+        _base_wt = (
             f"atlas_x{args.cross_region_inflation:g}" if _legacy_atlas
             else f"{atlas_stem}_x{args.cross_region_inflation:g}"
         )
+        root_mode = str(getattr(args, "root_handling", "cross"))
+        parts["weighting"] = (_base_wt if root_mode == "cross"
+                              else f"{_base_wt}_root{root_mode}")
+        # Hard prune changes edges -> keyed; the denoise that shaped the prune is
+        # keyed alongside it. Denoise WITHOUT prune leaves edges intact -> not
+        # keyed. Exactly the training rule.
+        prune = float(getattr(args, "prune_cross_region", 0.0) or 0.0)
+        n_denoise = int(getattr(args, "denoise_labels", 0) or 0)
+        if prune > 0.0:
+            parts["prune"] = f"{prune:g}"
+            if n_denoise > 0:
+                parts["denoise"] = n_denoise
         eig_graph_key = make_graph_key(parts)
         return "faiss", graph_cache_key, eig_graph_key
 
@@ -189,33 +204,74 @@ def resolve_graph_keys(args):
 
 
 def apply_atlas_weighting(edge_index, edge_value, args):
-    """faiss_atlas_weighted: reweight (not retopologize) the loaded faiss graph
-    by inflating cross-region edges, exactly as the lgp experiments do, so the
-    resulting Laplacian -- and its eigvec fingerprint -- match. Deterministic:
-    node labels come from crop_or_stride_volume(stride) + threshold, recomputed
-    identically on every rank."""
+    """faiss_atlas_weighted: reweight (and optionally hard-prune) the loaded faiss
+    graph, exactly as the lgp experiments do, so the resulting Laplacian -- and
+    its eigvec fingerprint -- match. Deterministic: node labels come from
+    crop_or_stride_volume(stride) + threshold, recomputed identically on every
+    rank, and the prune uses the same fixed seed (0) as training.
+
+    Order mirrors lgp_experiment_per_lipid: root handling -> inflate cross-region
+    edges -> majority-vote label denoise -> hard cross-region prune.
+    """
     if not args.annotations_file:
         raise SystemExit("[slepc] faiss_atlas_weighted needs --annotations-file "
                          "(atlas labels drive cross-region detection).")
     if not args.reference_file:
         raise SystemExit("[slepc] faiss_atlas_weighted needs --reference-file "
                          "(defines the tissue mask / node order).")
-    from utils import crop_or_stride_volume
+    from utils import (
+        crop_or_stride_volume, reference_ccf_from_subvolume,
+        coord_norm_from_reference,
+    )
     from manifold_gp.utils.anatomical_knn import (
         labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
+        dissolve_root_labels, denoise_labels_majority_vote,
+        prune_cross_region_edges,
     )
     reference_image = np.load(args.reference_file)
     annotation_volume = np.load(args.annotations_file)
-    sub_volume, sub_atlas, _off, _scale = crop_or_stride_volume(
+    sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
         reference_image, annotation_volume, args.stride)
     node_labels = labels_for_nodes_from_sub_atlas(
         sub_volume, sub_atlas, args.threshold)
+
+    # ---- root handling (before inflation) --------------------------------
+    root_mode = str(getattr(args, "root_handling", "cross"))
+    if root_mode == "dissolve":
+        # Dissolve on the SAME standardized coords the training pipeline uses
+        # for its reference_nodes -- coord_norm_from_reference is the documented
+        # single source of truth (per-axis mean + isotropic scalar std over all
+        # tissue voxels). Nearest-region assignment is what the eigvecs depend
+        # on, so matching this frame bit-for-bit is required (a per-axis /
+        # anisotropic z-score would warp the metric and silently change labels).
+        coord_mean, coord_std = coord_norm_from_reference(reference_image)
+        mm = np.asarray(reference_ccf_from_subvolume(
+            sub_volume, voxel_offset, voxel_scale_mm, args.threshold),
+            dtype=np.float32)
+        coords_norm = (mm - coord_mean.numpy()) / float(coord_std)
+        node_labels = dissolve_root_labels(node_labels, coords_norm)
+
     ei, ev, info = inflate_cross_region_edges(
         edge_index, edge_value, node_labels,
-        inflation=args.cross_region_inflation, treat_zero_as_cross=True)
-    log(f"faiss_atlas_weighted: inflated cross-region edges "
+        inflation=args.cross_region_inflation,
+        treat_zero_as_cross=(root_mode == "cross"))
+    log(f"faiss_atlas_weighted (root={root_mode}): inflated cross-region edges "
         f"x{args.cross_region_inflation:g} "
         f"({info.get('n_cross', '?')}/{ei.shape[1]} edges reweighted)")
+
+    # ---- label denoise + hard prune (after inflation) --------------------
+    n_denoise = int(getattr(args, "denoise_labels", 0) or 0)
+    prune = float(getattr(args, "prune_cross_region", 0.0) or 0.0)
+    if n_denoise > 0:
+        node_labels = denoise_labels_majority_vote(node_labels, ei, n_denoise)
+    if prune > 0.0:
+        n_before = ei.shape[1]
+        # zero_is_region=False: for the atlas, label 0 is background/gap, never a
+        # within/cross endpoint (matches training's atlas prune).
+        ei, ev = prune_cross_region_edges(
+            ei, ev, node_labels, prune, zero_is_region=False)
+        log(f"faiss_atlas_weighted: hard-pruned cross-region edges "
+            f"(frac={prune:g}) {n_before:,} -> {ei.shape[1]:,}")
     return ei, ev
 
 
@@ -508,6 +564,35 @@ def main():
                         "weights (squared distances) by this factor. Encoded in "
                         "the eigvec key as weighting=atlas_x<infl> so the cache "
                         "matches the lgp experiments. Ignored by other methods.")
+    # ---- root handling + label denoise + hard prune (faiss_atlas_weighted) --
+    # These mirror the per-lipid training pipeline (lgp_experiment_per_lipid.py)
+    # so a pre-baked cache is a drop-in hit. root-handling shapes the weighting
+    # key; prune changes edges -> keyed (prune=<frac>, +denoise=<n> when both on);
+    # denoise alone leaves edges (and the key) intact.
+    p.add_argument("--root-handling", dest="root_handling",
+                   choices=["dissolve", "ignore", "cross"], default="cross",
+                   help="faiss_atlas_weighted only: treat the atlas label-0 'root' "
+                        "catch-all tissue. 'cross' (DEFAULT — legacy slepc "
+                        "behaviour, un-suffixed weighting key): inflate every "
+                        "root-touching edge (treat_zero_as_cross=True). 'dissolve': "
+                        "reassign each root node to its nearest real region before "
+                        "inflating (weighting=..._rootdissolve) — this is the "
+                        "per-lipid TRAINING default, so pass it to pre-bake a cache "
+                        "for a default training run. 'ignore': keep root but don't "
+                        "treat root-touching edges as cross (..._rootignore).")
+    p.add_argument("--denoise-labels", dest="denoise_labels", type=int, default=0,
+                   help="faiss_atlas_weighted only: majority-vote label-smoothing "
+                        "passes over the graph before the prune (absorbs speck "
+                        "nodes). 0 = off. Only enters the eigvec cache key when "
+                        "paired with --prune-cross-region>0 (denoise alone leaves "
+                        "the edges — and the key — unchanged).")
+    p.add_argument("--prune-cross-region", dest="prune_cross_region", type=float,
+                   default=0.0,
+                   help="faiss_atlas_weighted only: HARD-remove this FRACTION of "
+                        "cross-region edges (0 = off, 0.95 = keep 5%%), "
+                        "connectivity-preserving. Changes the graph -> distinct "
+                        "eigvec cache key (prune=<frac>, +denoise=<n> when "
+                        "denoising too). Matches the per-lipid training prune.")
     p.add_argument("--nlist", default="1",
                    help="FAISS IVF nlist: an int, or 'sqrt' for round(sqrt(N)). "
                         "Resolved with the same N as the experiments and keyed "
@@ -543,6 +628,17 @@ def main():
     p.add_argument("--force-recompute", action="store_true",
                    help="Recompute even if the eigvec cache already exists.")
     args = p.parse_args()
+
+    # Root/denoise/prune are only wired for faiss_atlas_weighted here (the method
+    # the training pipeline pairs them with). Fail fast rather than silently cache
+    # eigvecs under a key that ignores them.
+    if args.knn_method != "faiss_atlas_weighted":
+        if (args.root_handling != "cross" or int(args.denoise_labels or 0) > 0
+                or float(args.prune_cross_region or 0.0) > 0.0):
+            raise SystemExit(
+                f"[slepc] --root-handling/--denoise-labels/--prune-cross-region "
+                f"are only supported with --knn-method=faiss_atlas_weighted (got "
+                f"{args.knn_method!r}).")
 
     eig_dir = Path(args.eigenvector_dir)
     knn_dir = eig_dir / "knn"
@@ -639,6 +735,15 @@ def main():
                            "method": "slepc", "knn_method": args.knn_method,
                            "cross_region_inflation": (
                                args.cross_region_inflation
+                               if args.knn_method == "faiss_atlas_weighted" else None),
+                           "root_handling": (
+                               args.root_handling
+                               if args.knn_method == "faiss_atlas_weighted" else None),
+                           "denoise_labels": (
+                               int(args.denoise_labels)
+                               if args.knn_method == "faiss_atlas_weighted" else None),
+                           "prune_cross_region": (
+                               float(args.prune_cross_region)
                                if args.knn_method == "faiss_atlas_weighted" else None),
                            "spectral_transform":
                                "shift-invert" if args.shift_invert else "krylov-schur",
