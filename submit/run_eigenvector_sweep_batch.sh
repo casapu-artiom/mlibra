@@ -63,7 +63,8 @@ BANDWIDTHS=${BANDWIDTHS:-"0.1"}
 # Inflation only applies to faiss_atlas_weighted; iterated only for it below.
 INFLATIONS=${INFLATIONS:-"10 50 100"}
 # Non-swept defaults (set in env to override globally for this batch)
-NUM_MODES=${NUM_MODES:-6000}
+NUM_MODES=${NUM_MODES:-1300}
+NCV_MIN=${NCV_MIN:--1}
 NU=${NU:-2}
 LENGTHSCALE=${LENGTHSCALE:-1.0}
 BUMP_SCALE=${BUMP_SCALE:-1.0}
@@ -71,6 +72,7 @@ BUMP_DECAY=${BUMP_DECAY:-0.01}
 N_TEST_ON=${N_TEST_ON:-500}
 N_TEST_OFF=${N_TEST_OFF:-500}
 TEST_SEED=${TEST_SEED:-42}
+STRIDE=${STRIDE:-4}
 
 EXP_SUFFIX="${EXP_SUFFIX:-$(date +'%y%m%d-%H%M')}"
 
@@ -129,7 +131,9 @@ submit_one() {
         -e GRAPHBANDWIDTH="$bw" \
         -e CROSS_REGION_INFLATION="$infl" \
         -e NUM_MODES="$NUM_MODES" \
+        -e NCV_MIN="$NCV_MIN" \
         -e NU="$NU" \
+        -e STRIDE="$STRIDE" \
         -e LENGTHSCALE="$LENGTHSCALE" \
         -e BUMP_SCALE="$BUMP_SCALE" \
         -e BUMP_DECAY="$BUMP_DECAY" \
@@ -172,7 +176,7 @@ for method in $KNN_METHODS; do
                         # output dir is self-documenting. The job name doesn't
                         # — it's just `lap-<batch suffix>-<counter>`, which is
                         # short and guaranteed unique within the batch.
-                        full_slug="${graph_slug}-bs$(slug "$BUMP_SCALE")-bd$(slug "$BUMP_DECAY")-nu${NU}-ls$(slug "$LENGTHSCALE")-nm${NUM_MODES}"
+                        full_slug="${graph_slug}-bs$(slug "$BUMP_SCALE")-bd$(slug "$BUMP_DECAY")-nu${NU}-ls$(slug "$LENGTHSCALE")-str${STRIDE}-nm${NUM_MODES}"
 
                         n_submitted=$((n_submitted + 1))
                         job_name="lap-${EXP_SUFFIX}-$(printf '%04d' "$n_submitted")"

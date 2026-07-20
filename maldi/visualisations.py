@@ -5,6 +5,7 @@ import napari
 import matplotlib.pyplot as plt
 from pathlib import Path
 import os
+import torch
 from tqdm import tqdm
 from vispy.color import Colormap, Color
 from qtpy.QtWidgets import QApplication # Import QApplication to process events
@@ -16,10 +17,15 @@ import time
 # In your actual use, these would point to your data.
 
 # --- Main Processing Loop ---
-image_output_dir = Path("output_images")
+model_dir = "/home/casap/mlibra/output/DIFFICULT-MANIFOLD-RSAMPLE-5-4-reference-500-1000-anatomical_atlas-1-20.0-0.01-1.010"
+image_output_dir = Path(model_dir) / "output_images"
 video_dir = image_output_dir
 image_output_dir.mkdir(exist_ok=True, parents=True)
-files = ["/Users/Daniel/Downloads/HexCer 42_2;O2_volume255.npy"]
+#lipids = ['HexCer 42:2;O2', 'PC 38:6', 'SM 36:1;O2', 'PE 40:6', 'PC 36:1', 'PC 32:0', 'PC 34:1 PC 36:4 PE 37:1 PE 39:4', 'PC 34:1', 'PA 34:1', 'PA 36:2']
+lipids = ['Hex2Cer 40:1;O2', 'PA 36:1 PA 38:4', 'PC 35:1 PE 38:1']
+files = [model_dir + "/{0}_volume.npy".format(s) for s in lipids]
+selected_lipid_names = list(np.load("/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy").astype(list))
+BATCH_SIZE = 1000
 
 def create_intensity_colormap():
     """
@@ -40,9 +46,8 @@ def create_intensity_colormap():
     ]
     return Colormap(colors)
 
-for cur_file in tqdm(files, desc="Processing volumes"):
-    volume = np.load(cur_file)
-    cur_volume_name = Path(cur_file).stem
+for lipid, file in tqdm(zip(lipids, files), desc="Processing lipids"):
+    volume = np.load(file)
 
     # Normalize volume data to 0-1 for consistent colormap application
     volume_min = np.nanmin(volume)
@@ -58,7 +63,7 @@ for cur_file in tqdm(files, desc="Processing volumes"):
     # Add the main volume layer with volume rendering and custom transparency
     main_volume_layer = viewer.add_image(
         volume,
-        name=f'{cur_volume_name}_intensity',
+        name=f'{lipid}_intensity',
         colormap='inferno',
         rendering='mip', # Crucial for true volume rendering with transparency
         blending='translucent', # 'additive' or 'translucent' often work well with transparency
@@ -85,7 +90,7 @@ for cur_file in tqdm(files, desc="Processing volumes"):
     # Create a larger figure with 4 rows (3 for cuts, 1 for rotation) and 10 columns
     # Reduced the overall height to compress the figure vertically
     fig, axs = plt.subplots(nrows=4, ncols=10, figsize=(30, 11))
-    fig.suptitle(f"Mice Brain Visualization: {cur_volume_name}", fontsize=16)
+    fig.suptitle(f"Mice Brain Visualization: {lipid}", fontsize=16)
     
     # Switch to 2D display for slice views
     viewer.dims.ndisplay = 2
@@ -205,12 +210,12 @@ for cur_file in tqdm(files, desc="Processing volumes"):
     # Instead, directly set the figure margins
     plt.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.01)
     
-    plt.savefig(image_output_dir / f"{cur_volume_name}_multi_panel.png", dpi=300, bbox_inches='tight')
+    plt.savefig(image_output_dir / f"{lipid}_multi_panel.png", dpi=300, bbox_inches='tight')
     plt.close(fig) # Close the matplotlib figure to free memory
     viewer.close() # Close the napari viewer after taking all screenshots for this volume
 def void():
 
-    print(f"Generated multi-panel image for {cur_volume_name}")
+    print(f"Generated multi-panel image for {lipid}")
     # end script for the moment we do not need to save the images
 
     # --- Original Animation Code (kept separate as requested) ---
@@ -219,7 +224,7 @@ def void():
     viewer_animation = napari.Viewer()
     layer_animation = viewer_animation.add_image(
         volume,
-        name=f'{cur_volume_name}_animation',
+        name=f'{lipid}_animation',
         colormap='inferno', # Use the same custom colormap
         rendering='mip',
         blending='translucent',
@@ -240,8 +245,8 @@ def void():
             viewer_animation.camera.angles = (30, angle, 30)
             animation.capture_keyframe()
 
-        animation.animate(video_dir / f"{str(cur_volume_name)}_brain_rotation.mp4", canvas_only=True, fps=30)
-        print(f"Generated rotation video for {cur_volume_name}")
+        animation.animate(video_dir / f"{str(lipid)}_brain_rotation.mp4", canvas_only=True, fps=30)
+        print(f"Generated rotation video for {lipid}")
     except ImportError:
         print("napari-animation not found. Skipping video generation.")
         print("Install with: pip install napari-animation")

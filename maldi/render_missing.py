@@ -206,17 +206,21 @@ def find_models(batch_dir: Path) -> list[tuple[Path, str]]:
 
 # --- Layout A: per-lipid GP ---------------------------------------------------
 def process_perlipid(model: Path, only: str, force: bool, max_lipids: int,
-                     dry_run: bool, wanted: set[str] | None) -> dict:
+                     dry_run: bool, wanted: set[str] | None,
+                     reference_override: str | None = None) -> dict:
     stats = {"model": model.name, "kind": "perlipid", "volumes": 0,
              "scatters": 0, "errors": 0, "skipped": 0, "no_pred": 0}
 
     args = json.loads((model / "config.json").read_text())
-    ref_file = args.get("reference_file")
+    # config.json stores the reference path from the training host (often an
+    # /s3/... cluster path that doesn't exist locally); --reference-file lets you
+    # point at a local copy without editing every config.json.
+    ref_file = reference_override or args.get("reference_file")
     template_full = (np.load(ref_file)
                      if ref_file and Path(ref_file).exists() else None)
     if template_full is None:
         log.warning(f"{model.name}: reference_file '{ref_file}' missing; "
-                    f"volumes will be skipped.")
+                    f"volumes will be skipped (pass --reference-file to override).")
     stride = int(args.get("stride", 4))
     log_transform = bool(args.get("log_transform", False))
 
@@ -491,14 +495,17 @@ def main() -> int:
     p.add_argument("--only", choices=["both", "volume", "scatter"],
                    default="both",
                    help="Render only volumes, only scatter diagnostics, or both.")
-    p.add_argument("--force", action="store_true",
-                   help="Re-render even lipids that already have a PNG.")
+    p.add_argument("--force", "--overwrite", dest="force", action="store_true",
+                   help="Overwrite: re-render even lipids that already have a PNG "
+                        "(stale multi-panel PNGs are deleted first so they redraw).")
     p.add_argument("--max-lipids", type=int, default=0,
                    help="Cap on lipids rendered PER MODEL (0 = all missing).")
     p.add_argument("--reference-file", default=None,
-                   help="Anatomy template (reference_image.npy). Layout-B "
-                        "volumes use it as the background; optional (Layout-A "
-                        "reads it from each model's config.json).")
+                   help="Anatomy template (reference_image.npy). Layout-B volumes "
+                        "use it as the background. For Layout-A (per-lipid) it "
+                        "OVERRIDES the reference_file baked into each model's "
+                        "config.json — use it when that path is a cluster path "
+                        "(e.g. /s3/...) that doesn't exist on this machine.")
     p.add_argument("--available-lipids-file", default=None,
                    help="Ordered lipid-name .npy (the *_available_lipids.npy the "
                         "joint LGP was trained with). Required for Layout-B "
@@ -544,7 +551,8 @@ def main() -> int:
     for m, kind in models:
         if kind == "perlipid":
             s = process_perlipid(m, args.only, args.force, args.max_lipids,
-                                 args.dry_run, wanted)
+                                 args.dry_run, wanted,
+                                 reference_override=args.reference_file)
         else:
             s = process_joint(m, args.only, args.force, args.max_lipids,
                               args.dry_run, template_full, names_list, wanted)

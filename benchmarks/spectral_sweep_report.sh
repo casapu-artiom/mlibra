@@ -17,7 +17,7 @@ set -eu
 
 cd "$SRC_PATH"
 
-python "$SRC_PATH/maldi/spectral_sweep_report.py" \
+python "$SRC_PATH/benchmarks/spectral_sweep_report.py" \
     --out-dir "$OUT_DIR" \
     --objective "$OBJECTIVE" \
     --rank-stat "$RANK_STAT" \

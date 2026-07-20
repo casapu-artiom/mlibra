@@ -30,7 +30,7 @@ python maldi/maldi_kernel_explorer.py \
     --knn-k 15 \
     --n-list sqrt --n-probe 8 \
     --laplacian-norm randomwalk \
-    --graphbandwidth 0.1 \
+    --graphbandwidth 0.02 \
     --num-modes 1000 \
     --ncv-min ${NCV_MIN:--1} \
     --nu 2.0 --lengthscale 0.1 \

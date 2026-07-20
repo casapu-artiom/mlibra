@@ -149,6 +149,11 @@ from scipy.stats import spearmanr, pearsonr
 import scipy.sparse as _sp
 import scipy.sparse.csgraph as _csg
 
+# Moved from maldi/ to benchmarks/; the maldi siblings (laplacian_test, utils)
+# live in ../maldi, so put that on sys.path.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "maldi"))
+
 # Reuse the exact graph/eigs + lipid-name machinery from the single-config diagnostic.
 from laplacian_test import (
     build_graph_and_laplacian,

@@ -52,8 +52,11 @@ from manifold_gp.utils.nearest_neighbors import (
 from manifold_gp.utils.anatomical_knn import (
     labels_for_nodes_from_sub_atlas, inflate_cross_region_edges,
     labels_for_nodes_from_template_clustering, dissolve_root_labels,
+    prune_cross_region_edges,
 )
-from utils import crop_or_stride_volume, reference_ccf_from_subvolume
+from utils import (
+    crop_or_stride_volume, reference_ccf_from_subvolume, coord_norm_from_reference,
+)
 
 
 log = logging.getLogger("maldi_kernel_explorer")
@@ -294,52 +297,6 @@ def denoise_labels_majority_vote(labels: np.ndarray, ei_np: np.ndarray,
     return lab
 
 
-def prune_cross_region_edges(edge_index: torch.Tensor, edge_value: torch.Tensor,
-                             node_labels: np.ndarray, prune: float,
-                             zero_is_region: bool):
-    """Hard-remove a fraction of cross-region edges, connectivity-preserving.
-
-    Any node the prune would ISOLATE keeps its strongest incident edge (a bridge),
-    so the bulk stays connected instead of shattering into specks. On a clean
-    partition this makes the boundary a real bottleneck and the heat walk pools
-    in-region. In-memory only; returns (edge_index, edge_value)."""
-    ei_np = edge_index.cpu().numpy()
-    ev_np = edge_value.detach().cpu().numpy()
-    Nn = int(node_labels.shape[0])
-    if zero_is_region:
-        cross = node_labels[ei_np[0]] != node_labels[ei_np[1]]
-    else:  # label 0 is background/gap, not a region → never a within/cross pair
-        cross = ((node_labels[ei_np[0]] != node_labels[ei_np[1]])
-                 & (node_labels[ei_np[0]] > 0) & (node_labels[ei_np[1]] > 0))
-    drop = np.zeros(cross.shape, bool)
-    cidx = np.where(cross)[0]
-    n_req = int(round(prune * cidx.size))
-    if n_req:
-        drop[np.random.default_rng(0).choice(cidx, n_req, replace=False)] = True
-    # connectivity-preserving: restore one (strongest) bridge per would-be-isolated node
-    deg = np.zeros(Nn)
-    np.add.at(deg, ei_np[0][~drop], 1); np.add.at(deg, ei_np[1][~drop], 1)
-    iso = deg == 0
-    n_iso0 = int(iso.sum())
-    if n_iso0:
-        ic = np.where((iso[ei_np[0]] | iso[ei_np[1]]) & drop)[0]
-        owner = np.where(iso[ei_np[0][ic]], ei_np[0][ic], ei_np[1][ic])
-        order = np.lexsort((ev_np[ic], owner))                # per owner, smallest ev first
-        firstm = np.ones(order.size, bool)
-        firstm[1:] = owner[order][1:] != owner[order][:-1]
-        drop[ic[order][firstm]] = False
-    keep_mask = torch.as_tensor(~drop, device=edge_index.device)
-    n_before = edge_index.shape[1]
-    edge_index = edge_index[:, keep_mask]
-    edge_value = edge_value[keep_mask]
-    deg2 = np.zeros(Nn)
-    np.add.at(deg2, ei_np[0][~drop], 1); np.add.at(deg2, ei_np[1][~drop], 1)
-    log.info(f"pruned {int(drop.sum()):,}/{int(cross.sum()):,} cross-region edges "
-             f"(frac={prune:g}) — {n_before:,} -> {edge_index.shape[1]:,} edges; "
-             f"isolated nodes {n_iso0:,} -> {int((deg2 == 0).sum()):,} after bridges")
-    return edge_index, edge_value
-
-
 # =============================================================================
 # Graph + eigendecomposition on the template voxels (all knn methods)
 # =============================================================================
@@ -357,8 +314,13 @@ def setup_graph(args: dict) -> dict:
     )  # (N, 3) mm in (z, y, x)/template-axis order
     node_ccf = np.asarray(reference_ccf, dtype=np.float32)
     reference_nodes_mm = torch.tensor(node_ccf, dtype=torch.float32)
-    coord_mean = reference_nodes_mm.mean(dim=0)
-    coord_std = reference_nodes_mm.std(dim=0).clamp(min=1e-6)
+    # Isotropic whole-brain normalization -- the single source of truth that
+    # training and SLEPc use for BOTH the graph metric AND dissolve_root_labels.
+    # A per-axis std warps the metric and silently reassigns ~1000 root nodes to
+    # different regions -> a different cross-region edge set -> a different prune
+    # -> the eigvec-cache n_edges mismatch that stopped the SLEPc cache being
+    # reused. coord_mean/coord_std are consumed only here, so this is a drop-in.
+    coord_mean, coord_std = coord_norm_from_reference(template_full)
     reference_nodes = ((reference_nodes_mm - coord_mean) / coord_std).to(device)
 
     N = reference_nodes.shape[0]

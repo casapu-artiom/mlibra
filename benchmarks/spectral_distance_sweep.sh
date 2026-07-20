@@ -80,7 +80,7 @@ set -eu
 
 cd "$SRC_PATH"
 
-python "$SRC_PATH/maldi/spectral_distance_sweep.py" \
+python "$SRC_PATH/benchmarks/spectral_distance_sweep.py" \
     --template-name "$TEMPLATE_NAME" \
     --reference-file "$REFERENCE_FILE" \
     --annotations-file "$ANNOTATION_FILE" \

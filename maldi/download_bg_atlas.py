@@ -41,14 +41,14 @@ def coarsen_annotation(annotation, atlas, max_depth=4):
             lut[src] = dst
     return lut[annotation]
 
-def _load_or_download_template(reference_file: Path, anotations_file: Path):
+def _load_or_download_template(reference_file: Path, anotations_file: Path, max_depth: int = 4):
     from bg_atlasapi.bg_atlas import BrainGlobeAtlas
     atlas = BrainGlobeAtlas("allen_mouse_25um")
 
     if not reference_file.exists() or not anotations_file.exists():
         logging.info("Downloading template volume via BrainGlobe Atlas API...")
         template_volume = atlas.reference
-        annotation_volume = coarsen_annotation(atlas.annotation, atlas, max_depth=4)
+        annotation_volume = coarsen_annotation(atlas.annotation, atlas, max_depth=max_depth)
         logging.info(f"Template volume shape: {template_volume.shape}")
         reference_file.parent.mkdir(parents=True, exist_ok=True)
         anotations_file.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +59,12 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Download BrainGlobe atlas.")
     parser.add_argument("--reference-file", dest="reference_file", type=Path, required=True, help="Path to the reference file.")
     parser.add_argument("--annotations-file", dest="annotations_file", type=Path, required=True, help="Path to the annotations file.")
+    # The Allen tree bottoms out at path length 10, so max_depth >= 9 is the
+    # raw leaf annotation (672 labels) and anything larger is identical.
+    parser.add_argument("--max-depth", dest="max_depth", type=int, default=4,
+                        help="Structure-tree depth to collapse leaves to: "
+                             "1 -> 5 labels, 2 -> 17, 3 -> 41, 4 -> 86, 5 -> 176, "
+                             "6 -> 347, 7 -> 477, 8 -> 629, 9+ -> 672 (leaves).")
     args = parser.parse_args()
 
-    _load_or_download_template(args.reference_file, args.annotations_file)
+    _load_or_download_template(args.reference_file, args.annotations_file, args.max_depth)

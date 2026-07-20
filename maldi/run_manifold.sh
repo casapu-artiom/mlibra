@@ -8,12 +8,12 @@
 # Density/MALDI inducing blend over the UNALTERED strided graph. When enabled it
 # OVERRIDES INDUCING_SOURCE: ~INDUCING_DENSITY_FRAC of the points come from the
 # densest graph nodes, the rest from cheapest-to-snap measured MALDI voxels.
-: "${INDUCING_FROM_MALDI_NODES:=0}"
+: "${INDUCING_FROM_MALDI_NODES:=1}"
 : "${INDUCING_DENSITY_FRAC:=0.8}"
 : "${LATENT_DIM:=5}"
 : "${STRIDE:=4}"
 : "${BATCH_SIZE:=1000}"
-: "${N_EPOCHS:=2}"
+: "${N_EPOCHS:=30}"
 : "${LEARNING_RATE:=0.001}"
 : "${GRAPHBANDWIDTH:=0.1}"
 # Diffusion scale (manifold kernel): multiplicative scale on the frozen Laplacian
@@ -43,10 +43,17 @@
 : "${OUTPUT_DIR:=/home/casap/mlibra/output}"
 : "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
 : "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
-# Atlas level convenience: ATLAS_LEVEL=5 or 15 selects level_${ATLAS_LEVEL}annot.npy
-# under DATA_PATH. Override ANNOTATION_FILE directly to use any other volume.
-: "${ATLAS_LEVEL:=15}"
-: "${ANNOTATION_FILE:=${DATA_PATH}/level_${ATLAS_LEVEL}annot.npy}"
+# Atlas level convenience:
+#   ATLAS_LEVEL=5 or 15  -> level_${ATLAS_LEVEL}annot.npy  (LBAE-shipped partial
+#       cuts; root-997 catch-all covers 72%/57% of the brain)
+#   ATLAS_LEVEL=d5 or d7 -> ccf_depth${N}annot.npy         (true CCF depth-cuts
+#       from download_bg_atlas.py --max-depth; 175/476 regions, root down to 0.7%)
+# Override ANNOTATION_FILE directly to use any other volume.
+: "${ATLAS_LEVEL:=d7}"
+case "$ATLAS_LEVEL" in
+    d[0-9]*) : "${ANNOTATION_FILE:=${DATA_PATH}/ccf_depth${ATLAS_LEVEL#d}annot.npy}" ;;
+    *)       : "${ANNOTATION_FILE:=${DATA_PATH}/level_${ATLAS_LEVEL}annot.npy}" ;;
+esac
 : "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
 : "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
 : "${KNN_METHOD:=faiss_atlas_weighted}"
@@ -67,7 +74,7 @@
 # Non-cross ROOT_HANDLING and any PRUNE change the eigvec cache key (fresh solve).
 : "${ROOT_HANDLING:=dissolve}"
 : "${DENOISE_LABELS:=3}"
-: "${PRUNE_CROSS_REGION:=0.95}"
+: "${PRUNE_CROSS_REGION:=0.97}"
 : "${SRC_PATH:=/home/casap/mlibra_git}"
 : "${EXP_PREFIX:=FOLD-2-STATIC-INDP}"
 : "${LAPLACIAN_NORM:=randomwalk}"

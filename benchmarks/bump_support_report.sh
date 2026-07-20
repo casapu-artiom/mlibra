@@ -1,18 +1,15 @@
-python maldi/visualize_laplacian.py \
+python benchmarks/bump_support_report.py \
     --template-name reference \
     --reference-file /home/casap/mlibra/mlibra_data/reference_image.npy \
     --annotations-file /home/casap/mlibra/mlibra_data/level_15annot.npy \
     --eigenvector-dir /home/casap/mlibra/output/eigenvectors \
     --knn-method faiss_atlas_weighted \
-    --knn-k 15 \
-    --n-probe 8 \
-    --cross-region-inflation 50.0 \
-    --num-modes 300 \
-    --ncv-min ${NCV_MIN:--1} \
+    --knn-k 120 \
+    --cross-region-inflation 10.0 \
+    --num-modes 6000 \
     --laplacian-norm randomwalk \
     --graphbandwidth 0.1 \
-    --n-sources 100 --n-targets 60 --k-show 30 \
-    --source-marker-size 6 \
-    --fabric-edge-sample 200000 --laplacian-edge-sample 80000 \
     --threshold 5 \
-    --stride 4
+    --stride 8 \
+    --bump-scale 0.25 --bump-decay 0.01 \
+    --maldi /home/casap/mlibra/mlibra_data/maindata_minimal.parquet

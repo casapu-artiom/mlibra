@@ -18,9 +18,9 @@ set -euo pipefail
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # --- graph + solver properties ---
-MODES="${MODES:-200}"
+MODES="${MODES:-1300}"
 STRIDE="${STRIDE:-4}"
-THRESHOLD="${THRESHOLD:-40}"
+THRESHOLD="${THRESHOLD:-5}"
 KNN_K="${KNN_K:-15}"
 KNN_METHOD="${KNN_METHOD:-faiss}"
 BANDWIDTH="${BANDWIDTH:-1.0}"
@@ -28,10 +28,10 @@ NORMALIZATION="${NORMALIZATION:-randomwalk}"
 TEMPLATE="${TEMPLATE:-reference}"
 NCV_MIN="${NCV_MIN:--1}"
 TOL="${TOL:-1e-6}"
-APPROACHES="${APPROACHES:-cupy_sa,cupy_si_cg,scipy_si,lobpcg}"
+APPROACHES="${APPROACHES:-cupy_sa,cupy_si_cg,slepc_ks}"
 SI_SIGMA="${SI_SIGMA:--1e-3}"
 SI_CG_INNER_RTOL="${SI_CG_INNER_RTOL:-1e-6}"
-REFERENCE="${REFERENCE:-auto}"
+REFERENCE="${REFERENCE:-slepc_si}"
 MAX_DIRECT_NODES="${MAX_DIRECT_NODES:-2000000}"
 
 # --- paths (override KNN_DIR / OUT_DIR to S3 mounts on the cluster) ---
@@ -63,7 +63,7 @@ echo "[eigensolver_compare] -> $RUN_DIR  (device=$DEVICE, approaches=$APPROACHES
 # Unbuffer Python: piping through tee makes stdout/stderr block-buffered, which
 # otherwise hides all prints + tqdm bars until a stage finishes (looks "stuck").
 export PYTHONUNBUFFERED=1
-python -u "${REPO}/maldi/eigensolver_compare.py" \
+python -u "${REPO}/benchmarks/eigensolver_compare.py" \
     --knn-dir "$KNN_DIR" \
     --template "$TEMPLATE" \
     --stride "$STRIDE" \

@@ -511,6 +511,13 @@ def prune_cross_region_edges(edge_index, edge_value,
                  & (node_labels[ei_np[0]] > 0) & (node_labels[ei_np[1]] > 0))
     drop = np.zeros(cross.shape, bool)
     cidx = np.where(cross)[0]
+    # Canonicalize the candidate order by edge identity (src, dst) so the seeded
+    # draw picks the SAME edges regardless of how the caller ordered the edge
+    # array. Without this, two build paths that present the same edge SET in a
+    # different order (e.g. SLEPc vs the explorer) drop different edges, restore
+    # different bridges, and the resulting graph -- hence the eigvec-cache
+    # n_edges fingerprint -- silently drifts, so the cache is never reused.
+    cidx = cidx[np.lexsort((ei_np[1][cidx], ei_np[0][cidx]))]
     n_req = int(round(float(prune) * cidx.size))
     if n_req:
         drop[np.random.default_rng(seed).choice(cidx, n_req, replace=False)] = True

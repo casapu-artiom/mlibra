@@ -32,7 +32,7 @@ else
     exit 1
 fi
 
-# --- Cluster resources ------------------------------------------------------
+# --- Cluster resources 
 IMAGE=${IMAGE:-artiomartiom/sdsc:maldi_manifold_all_latest}
 # CPU is both the cgroup quota AND what OMP/BLAS are pinned to in submit_baseline.
 # torch/OpenMP otherwise size their thread pools from the NODE's core count, which
@@ -40,22 +40,22 @@ IMAGE=${IMAGE:-artiomartiom/sdsc:maldi_manifold_all_latest}
 # ~5x slower at 32 threads on 2 cores). OMP_WAIT_POLICY=passive stops the spinning.
 # Mirrors run_submit_per_lipid.sh, which already does this.
 CPU=${CPU:-2}
-# Plain baselines (mean/linear/mlp) are light; the manifold-aware ones
+# Plain baselines (mean/linear/mlp------------------------------------------------------) are light; the manifold-aware ones
 # (mlp_eigen/gcn_faiss) also run a GPU eigensolve / full-graph GCN, so give them
 # more RAM + a whole GPU.
-MEM=${MEM:-48G}
+MEM=${MEM:-32G}
 GPU=${GPU:-0.2}
 MEM_MANIFOLD=${MEM_MANIFOLD:-48G}
 GPU_MANIFOLD=${GPU_MANIFOLD:-0.5}
 
 # --- Sweep values -----------------------------------------------------------
 # Space-separated; override from the environment, e.g. MODES_LIST="100 300".
-MODES_LIST=(${MODES_LIST:-100 300 1300})                  # mlp_eigen: eigenbasis size
+MODES_LIST=(${MODES_LIST:-1300})                  # mlp_eigen: eigenbasis size
 CROSS_REGION_INFLATION_LIST=(${CROSS_REGION_INFLATION_LIST:-50.0})  # gcn_faiss atlas graph
 # Baselines with no manifold params: one job each. Not swept, but xgboost's
 # hyperparams are passed explicitly below (see XGB knobs).
-#PLAIN_MODELS=(${PLAIN_MODELS:-mean linear mlp xgboost})
-PLAIN_MODELS=(${PLAIN_MODELS:-mlp})
+PLAIN_MODELS=(${PLAIN_MODELS:-mean linear mlp xgboost})
+#PLAIN_MODELS=(${PLAIN_MODELS:-mlp})
 
 # --- Run config -------------------------------------------------------------
 N_EPOCHS=${N_EPOCHS:-100}
@@ -135,17 +135,17 @@ for FOLD in "${FOLDS_LIST[@]}"; do
     echo "=== Fold: $FOLD  (split: $SLICES_DATASET_FILE)"
 
     # --- Param-free baselines: one job each ---------------------------------
-    for model in "${PLAIN_MODELS[@]}"; do
-        model_env=()
-        if [ "$model" = "xgboost" ]; then
-            model_env=(-e XGB_LR="$XGB_LR"
-                       -e XGB_N_ESTIMATORS="$XGB_N_ESTIMATORS"
-                       -e XGB_MAX_DEPTH="$XGB_MAX_DEPTH")
-        fi
-        submit_baseline "base-${model}-${fold_slug}-${EXP_SUFFIX}" "$model" "$MEM" "$GPU" \
-            -e EXP_PREFIX="$FOLD_UPPER" \
-            ${model_env[@]+"${model_env[@]}"}
-    done
+    # for model in "${PLAIN_MODELS[@]}"; do
+    #     model_env=()
+    #     if [ "$model" = "xgboost" ]; then
+    #         model_env=(-e XGB_LR="$XGB_LR"
+    #                    -e XGB_N_ESTIMATORS="$XGB_N_ESTIMATORS"
+    #                    -e XGB_MAX_DEPTH="$XGB_MAX_DEPTH")
+    #     fi
+    #     submit_baseline "base-${model}-${fold_slug}-${EXP_SUFFIX}" "$model" "$MEM" "$GPU" \
+    #         -e EXP_PREFIX="$FOLD_UPPER" \
+    #         ${model_env[@]+"${model_env[@]}"}
+    # done
 
     # --- mlp_eigen: sweep NUM_MODES (fold modes into EXP_PREFIX so dirs are distinct)
     for modes in "${MODES_LIST[@]}"; do
@@ -155,15 +155,15 @@ for FOLD in "${FOLDS_LIST[@]}"; do
             -e FEAT_SCRATCH_DIR="$FEAT_SCRATCH_DIR"
     done
 
-    # # --- gcn_faiss: atlas-weighted graph, sweeping cross-region inflations ---
-    # for infl in "${CROSS_REGION_INFLATION_LIST[@]}"; do
-    #     infl_slug=$(slug "$infl")
-    #     submit_baseline "base-gcnfaiss-atlasx${infl_slug}-${fold_slug}-${EXP_SUFFIX}" "gcn_faiss" "$MEM_MANIFOLD" "$GPU_MANIFOLD" \
-    #         -e EXP_PREFIX="${FOLD_UPPER}-ATLASx${infl_slug}" \
-    #         -e KNN_METHOD="faiss_atlas_weighted" \
-    #         -e CROSS_REGION_INFLATION="$infl" \
-    #         -e GCN_FAISS_ITERS="$GCN_FAISS_ITERS"
-    # done
+    # --- gcn_faiss: atlas-weighted graph, sweeping cross-region inflations ---
+    for infl in "${CROSS_REGION_INFLATION_LIST[@]}"; do
+        infl_slug=$(slug "$infl")
+        submit_baseline "base-gcnfaiss-atlasx${infl_slug}-${fold_slug}-${EXP_SUFFIX}" "gcn_faiss" "$MEM_MANIFOLD" "$GPU_MANIFOLD" \
+            -e EXP_PREFIX="${FOLD_UPPER}-ATLASx${infl_slug}" \
+            -e KNN_METHOD="faiss_atlas_weighted" \
+            -e CROSS_REGION_INFLATION="$infl" \
+            -e GCN_FAISS_ITERS="$GCN_FAISS_ITERS"
+    done
 done
 
 echo "Submitted $n_submitted jobs. Folds: ${FOLDS_LIST[*]}  Suffix: $EXP_SUFFIX  Output: $S3_OUTPUT_DIR"

@@ -51,6 +51,11 @@ from manifold_gp.utils.nearest_neighbors import KnnGraphCache, make_key as make_
 from manifold_gp.utils.compute_eigenvectors import LaplacianEigensolver, resolve_ncv_min
 from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
 
+# Moved from maldi/ to benchmarks/; the maldi sibling `utils` (imported inside a
+# function below) lives in ../maldi, so put that on sys.path at module load.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "maldi"))
+
 try:
     import psutil
 except Exception:
@@ -477,15 +482,146 @@ def run_cupy_si_cg(L_csr, num_modes, tol, sigma, inner_rtol=1e-6,
     return _to_sorted_numpy(evals, evecs)
 
 
-def run_reference(L_csr, op, num_modes, max_dense, tol
+def run_slepc(L_csr, num_modes, tol, *, shift_invert, target=0.0,
+              factor_solver="mumps", ncv=None) -> Tuple[np.ndarray, np.ndarray]:
+    """Bottom `num_modes` modes via SLEPc, in-process and serial (COMM_SELF).
+
+    shift_invert=True factorizes (L - target*I) with a 64-bit parallel direct
+    solver (MUMPS / SuperLU_DIST). That is the path that survives the 3D fill-in
+    where scipy's 32-bit SuperLU raises "Can't expand MemType" -- so it is the
+    feasible gold standard at large N. shift_invert=False is matrix-free
+    Krylov-Schur on smallest-real (no factorization; cheap memory, slower to
+    converge on the clustered low spectrum).
+
+    Runs serially: PETSc COMM_SELF with one rank. The MUMPS advantage is the
+    64-bit indexing + better ordering, not the parallelism, so a single process
+    already fixes the overflow. For multi-rank speedups use slepc_eigensolve.py
+    under mpirun.
+    """
+    import sys
+    import petsc4py
+    petsc4py.init(sys.argv)
+    from petsc4py import PETSc          # noqa: E402
+    from slepc4py import SLEPc          # noqa: E402
+
+    comm = PETSc.COMM_SELF
+    A = L_csr.tocsr()
+    Amat = PETSc.Mat().createAIJWithArrays(
+        size=(A.shape[0], A.shape[1]),
+        csr=(A.indptr.astype(PETSc.IntType),
+             A.indices.astype(PETSc.IntType),
+             A.data.astype(PETSc.ScalarType)),
+        comm=comm)
+    Amat.assemble()
+
+    E = SLEPc.EPS().create(comm=comm)
+    E.setOperators(Amat)
+    E.setProblemType(SLEPc.EPS.ProblemType.HEP)
+    E.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+    if ncv is not None and ncv > 0:
+        E.setDimensions(nev=num_modes, ncv=ncv)
+    else:
+        E.setDimensions(nev=num_modes)
+    E.setTolerances(tol=tol)
+
+    if shift_invert:
+        E.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
+        E.setTarget(target)
+        st = E.getST()
+        st.setType(SLEPc.ST.Type.SINVERT)
+        ksp = st.getKSP()
+        ksp.setType("preonly")
+        pc = ksp.getPC()
+        pc.setType("lu")
+        try:
+            pc.setFactorSolverType(factor_solver)
+        except Exception:
+            print(f"[slepc] factor solver {factor_solver!r} unavailable -- using "
+                  "PETSc built-in LU (serial, may overflow on large fill).")
+    else:
+        E.setWhichEigenpairs(SLEPc.EPS.Which.SMALLEST_REAL)
+
+    # Live progress: SLEPc's per-iteration monitor reports how many of the wanted
+    # modes have converged. The low Laplacian spectrum is clustered, so nconv
+    # sits flat then jumps in bursts -- the frontier residual (error of the next
+    # mode about to converge, shrinking toward tol) gives motion during the flat
+    # stretches. Defensive: a monitor error must never abort the solve.
+    kind = "shift-invert" if shift_invert else "krylov-schur"
+    bar = None
+    try:
+        from tqdm import tqdm
+        bar = tqdm(total=num_modes, desc=f"[slepc] {kind} modes converged",
+                   leave=False)
+    except Exception:
+        bar = None
+    seen = {"n": 0}
+
+    def _monitor(eps, its, nconv, eig, err):
+        if bar is None:
+            return
+        try:
+            if nconv > seen["n"]:
+                bar.update(nconv - seen["n"])
+                seen["n"] = nconv
+            frontier = ""
+            if err is not None and nconv < len(err):
+                frontier = f" res={float(err[nconv]):.1e}"
+            bar.set_postfix_str(f"iter={its}{frontier}")
+        except Exception:
+            pass
+
+    try:
+        E.setMonitor(_monitor)
+    except Exception:
+        pass
+
+    E.setFromOptions()
+    E.solve()
+    if bar is not None:
+        bar.close()
+    nconv = E.getConverged()
+    if nconv == 0:
+        raise RuntimeError("slepc converged 0 eigenpairs -- raise --slepc-ncv-min "
+                           "or loosen --tol")
+    k = min(nconv, num_modes)
+    if k < num_modes:
+        print(f"[slepc] WARNING: only {k}/{num_modes} modes converged")
+    evals = np.empty(k)
+    evecs = np.empty((A.shape[0], k))
+    xr = Amat.createVecRight()
+    gather = range(k)
+    try:
+        from tqdm import tqdm
+        gather = tqdm(gather, desc="[slepc] gathering eigenvectors", leave=False)
+    except Exception:
+        pass
+    for i in gather:
+        evals[i] = E.getEigenpair(i, xr).real
+        evecs[:, i] = xr.getArray().real
+    return _to_sorted_numpy(evals, evecs)
+
+
+def run_reference(L_csr, op, num_modes, max_dense, tol, mode="auto", *,
+                  slepc_target=0.0, slepc_factor_solver="mumps", slepc_ncv=None
                   ) -> Tuple[np.ndarray, np.ndarray, str]:
-    """Gold-standard eigenpairs. Dense eigh when N <= max_dense (exact),
-    otherwise scipy shift-invert (accurate but iterative)."""
+    """Gold-standard eigenpairs. 'auto' = dense eigh when N <= max_dense (exact),
+    else scipy shift-invert. Explicit modes: 'dense', 'scipy_si', 'slepc_si'
+    (MUMPS shift-invert -- the feasible truth at large N), 'slepc_ks'."""
     N = L_csr.shape[0]
-    if N <= max_dense:
+    if mode == "dense" or (mode == "auto" and N <= max_dense):
         import scipy.linalg as la
         w, v = la.eigh(L_csr.toarray())
         return w[:num_modes], v[:, :num_modes], f"dense eigh (N={N})"
+    if mode == "slepc_si":
+        ev, evec = run_slepc(L_csr, num_modes, tol, shift_invert=True,
+                             target=slepc_target,
+                             factor_solver=slepc_factor_solver, ncv=slepc_ncv)
+        return ev, evec, f"slepc shift-invert ({slepc_factor_solver})"
+    if mode == "slepc_ks":
+        ev, evec = run_slepc(L_csr, num_modes, tol, shift_invert=False,
+                             ncv=slepc_ncv)
+        return ev, evec, "slepc krylov-schur"
+    # mode in ("auto" with large N, "scipy_si")
     evals, evecs = run_scipy_si(op, num_modes, tol)
     return evals, evecs, "scipy shift-invert"
 
@@ -589,11 +725,25 @@ def main():
                    help="Disable the Jacobi preconditioner on the inner CG.")
     p.add_argument("--max-dense", type=int, default=6000,
                    help="Use exact dense reference when N <= this.")
-    p.add_argument("--reference", choices=["auto", "none"], default="auto",
-                   help="'auto' = dense (small N) or scipy shift-invert; 'none' "
-                        "= skip the reference and report only the self-contained "
-                        "residual / orthonormality / perf columns (use at very "
-                        "large N where no gold standard is feasible).")
+    p.add_argument("--reference",
+                   choices=["auto", "none", "dense", "scipy_si",
+                            "slepc_si", "slepc_ks"],
+                   default="auto",
+                   help="'auto' = dense (small N) or scipy shift-invert; "
+                        "'slepc_si' = MUMPS 64-bit shift-invert (the feasible "
+                        "gold standard at large N where scipy's SuperLU "
+                        "overflows); 'slepc_ks' = Krylov-Schur; 'none' = skip "
+                        "the reference and report only the self-contained "
+                        "residual / orthonormality / perf columns.")
+    p.add_argument("--slepc-factor-solver", default="mumps",
+                   choices=["mumps", "superlu_dist", "petsc"],
+                   help="Direct solver for slepc_si shift-invert factorization. "
+                        "mumps/superlu_dist are 64-bit (needed for large fill).")
+    p.add_argument("--slepc-target", type=float, default=0.0,
+                   help="slepc_si shift-invert target, near the spectrum bottom.")
+    p.add_argument("--slepc-ncv-min", type=int, default=-1,
+                   help="Krylov basis floor for slepc_si / slepc_ks; <=0 lets "
+                        "SLEPc choose.")
     p.add_argument("--max-direct-nodes", type=int, default=2_000_000,
                    help="Above this N, skip the direct-factorization methods "
                         "(scipy_si, cupy_si) and any scipy reference -- their LU "
@@ -606,7 +756,7 @@ def main():
                         "independent second solve (e.g. as a noise check).")
     p.add_argument("--approaches", default="cupy_sa,scipy_si,lobpcg",
                    help="Comma list subset of cupy_sa,cupy_si,cupy_si_cg,"
-                        "scipy_si,lobpcg.")
+                        "scipy_si,lobpcg,slepc_si,slepc_ks.")
     p.add_argument("--monitor-interval", type=float, default=0.1,
                    help="Resource sampling interval (seconds).")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -675,20 +825,36 @@ def main():
     # is too big, scipy's LU overflows), so --reference none drops the
     # reference-dependent columns and reports only the self-contained metrics.
     want_reference = (args.reference != "none")
-    if want_reference and N > args.max_direct_nodes and N > args.max_dense:
+    # The direct-node ceiling only forces reference-free for the scipy/dense
+    # gold standards (their LU overflows). slepc_si uses 64-bit MUMPS and stays
+    # feasible at large N, so it is exempt from the ceiling.
+    ref_is_overflow_prone = args.reference in ("auto", "scipy_si", "dense")
+    if (want_reference and ref_is_overflow_prone
+            and N > args.max_direct_nodes and N > args.max_dense):
         print(f"[compare] N={N:,} exceeds --max-direct-nodes "
               f"({args.max_direct_nodes:,}) and --max-dense ({args.max_dense:,}) "
-              f"-- no feasible reference (dense too big, scipy LU would "
-              f"overflow). Proceeding reference-free.")
+              f"-- no feasible scipy/dense reference (LU would overflow). Pass "
+              f"--reference slepc_si for a MUMPS gold standard, or proceed "
+              f"reference-free.")
         want_reference = False
 
     if want_reference:
         print("[compare] computing reference eigenpairs ...")
         t0 = time.perf_counter()
+        slepc_ncv = None if args.slepc_ncv_min <= 0 else args.slepc_ncv_min
         ref_evals, ref_evecs, ref_name = run_reference(
-            L_csr, op, args.modes, args.max_dense, args.tol)
+            L_csr, op, args.modes, args.max_dense, args.tol, mode=args.reference,
+            slepc_target=args.slepc_target,
+            slepc_factor_solver=args.slepc_factor_solver, slepc_ncv=slepc_ncv)
         ref_wall = time.perf_counter() - t0
-        ref_method = "scipy_si" if ref_name.startswith("scipy") else "dense"
+        if ref_name.startswith("scipy"):
+            ref_method = "scipy_si"
+        elif ref_name.startswith("slepc shift"):
+            ref_method = "slepc_si"
+        elif ref_name.startswith("slepc krylov"):
+            ref_method = "slepc_ks"
+        else:
+            ref_method = "dense"
         print(f"[compare] reference = {ref_name}  ({ref_wall:.1f}s)")
         lam_max = float(ref_evals[-1]) if ref_evals[-1] > 0 else lam_max_est
     else:
@@ -714,12 +880,29 @@ def main():
         "scipy_si": lambda: run_scipy_si(op, args.modes, args.tol),
         "lobpcg": lambda: run_lobpcg(L_csr, args.modes, args.tol,
                                      args.lobpcg_maxiter, lobpcg_backend),
+        "slepc_si": lambda: run_slepc(
+            L_csr, args.modes, args.tol, shift_invert=True,
+            target=args.slepc_target, factor_solver=args.slepc_factor_solver,
+            ncv=(None if args.slepc_ncv_min <= 0 else args.slepc_ncv_min)),
+        "slepc_ks": lambda: run_slepc(
+            L_csr, args.modes, args.tol, shift_invert=False,
+            ncv=(None if args.slepc_ncv_min <= 0 else args.slepc_ncv_min)),
     }
     wanted = [a.strip() for a in args.approaches.split(",") if a.strip()]
     for gpu_only in ("cupy_sa", "cupy_si", "cupy_si_cg"):
         if gpu_only in wanted and not cupy_available:
             print(f"[compare] cupy not available -- skipping {gpu_only}")
             wanted.remove(gpu_only)
+    if any(s in wanted for s in ("slepc_si", "slepc_ks")):
+        try:
+            import slepc4py  # noqa: F401
+            import petsc4py  # noqa: F401
+        except Exception:
+            for s in ("slepc_si", "slepc_ks"):
+                if s in wanted:
+                    print(f"[compare] slepc4py/petsc4py not available -- "
+                          f"skipping {s}")
+                    wanted.remove(s)
     # Direct-factorization methods (scipy_si, cupy_si) build an LU whose 3D
     # fill-in blows past memory / SuperLU's 32-bit indexing at large N. Skip
     # them above the node ceiling rather than crash or hang.

@@ -37,7 +37,7 @@ from manifold_gp.utils.compute_eigenvectors import (
     LaplacianEigensolver, resolve_ncv_min, make_key as make_eig_key,
 )
 from manifold_gp.utils.nearest_neighbors import (
-    KnnGraphCache, make_key as make_graph_key,
+    KnnGraphCache, make_key as make_graph_key, resolve_nlist, resolve_nprobe,
 )
 from utils import crop_or_stride_volume, reference_ccf_from_subvolume, coord_norm_from_reference
 
@@ -84,6 +84,10 @@ def parse_args() -> dict:
     p.add_argument("--cross-region-inflation", type=float, default=100.0)
     p.add_argument("--knn-k", type=int, default=15)
     p.add_argument("--n-list", type=int, default=1)
+    p.add_argument("--n-probe", dest="n_probe", default="8",
+                   help="FAISS IVF nprobe (int or 'sqrt', default 8). MUST be > 1 "
+                        "when nlist > 1 -- nprobe=1 with an IVF index builds a "
+                        "FRAGMENTED graph (~nlist components).")
     p.add_argument("--laplacian-norm", choices=["symmetric", "randomwalk"],
                    default="symmetric")
     p.add_argument("--graphbandwidth", type=float, required=True)
@@ -187,6 +191,13 @@ def setup(args: dict, log: logging.Logger):
     node_voxel_idx = np.argwhere(sub_volume > args["threshold"]).astype(np.int32)
     assert node_voxel_idx.shape[0] == reference_nodes.shape[0]
 
+    # Resolve the FAISS IVF nlist ('sqrt' -> round(sqrt(N)), or an int) BEFORE it
+    # enters the cache key or a train call -- matches every other caller
+    # (maldi_kernel_explorer, lgp_manifold_experiment, ...) so 'sqrt' hits the
+    # same cached graph the training pipeline wrote, and never reaches FAISS raw.
+    nlist = resolve_nlist(args["n_list"], reference_nodes.shape[0])
+    nprobe = resolve_nprobe(args["n_probe"], nlist)
+
     sv_scale = np.array([args["stride"], args["stride"], args["stride"]], dtype=np.float32)
     sv_translate = np.asarray(voxel_offset, dtype=np.float32)
 
@@ -198,7 +209,7 @@ def setup(args: dict, log: logging.Logger):
         "thresh": args["threshold"],
         "method": args["knn_method"],
         "k": args["knn_k"],
-        "nlist": args["n_list"],
+        "nlist": nlist,
         "bbox": None,
     }
     if args["knn_method"] == "anatomical_atlas":
@@ -209,14 +220,14 @@ def setup(args: dict, log: logging.Logger):
     if args["knn_method"] == "faiss":
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key, method="faiss", coords=reference_nodes,
-            k=args["knn_k"], nlist=args["n_list"], extra=graph_key_parts,
+            k=args["knn_k"], nlist=nlist, nprobe=nprobe, extra=graph_key_parts,
             device=args["device"], force_recompute=args["force_recompute_graph"],
         )
     elif args["knn_method"] == "anatomical_atlas":
         knn, edge_index, edge_value = graphs.train_or_load(
             key=graph_key, method="anatomical_atlas", volume=sub_volume,
             threshold=args["threshold"], atlas_volume=sub_atlas, connectivity=3,
-            coords=reference_nodes, k=args["knn_k"], nlist=args["n_list"],
+            coords=reference_nodes, k=args["knn_k"], nlist=nlist, nprobe=nprobe,
             extra=graph_key_parts, device=args["device"], force_recompute=args["force_recompute_graph"],
         )
     elif args["knn_method"] == "faiss_atlas_weighted":
@@ -225,7 +236,7 @@ def setup(args: dict, log: logging.Logger):
         base_key = make_graph_key(base_key_parts)
         knn, edge_index, edge_value = graphs.train_or_load(
             key=base_key, method="faiss", coords=reference_nodes,
-            k=args["knn_k"], nlist=args["n_list"], extra=base_key_parts,
+            k=args["knn_k"], nlist=nlist, nprobe=nprobe, extra=base_key_parts,
             device=args["device"], force_recompute=args["force_recompute_graph"],
         )
         node_labels = labels_for_nodes_from_sub_atlas(sub_volume, sub_atlas, args["threshold"])

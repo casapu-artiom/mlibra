@@ -47,9 +47,11 @@ else
     exit 1
 fi
 
-MEM=48G
-CPU=4
-GPU=0.5
+# ---- resource tiers (per model) --------------------------------------------
+# spa3d gets the HIGH tier (heavier 3D graph); every other model uses LOW.
+# All env-overridable.
+LOW_GPU=${LOW_GPU:-0.2};  LOW_CPU=${LOW_CPU:-2};  LOW_MEM=${LOW_MEM:-32G}
+HIGH_GPU=${HIGH_GPU:-0.5}; HIGH_CPU=${HIGH_CPU:-2}; HIGH_MEM=${HIGH_MEM:-48G}
 
 # W&B on by default for cluster runs (WANDB_API_KEY comes from .env). WANDB=0 disables.
 WANDB=${WANDB:-1}
@@ -57,7 +59,7 @@ WANDB_PROJECT=${WANDB_PROJECT:-sota_maldi}
 
 # ---- S3-mounted I/O overrides (the runner defaults are LOCAL) --------------
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_OUTPUT_DIR=${S3_OUTPUT_DIR:-"/s3/mlibra/mlibra-data/artiom/sota_batch"}
+S3_OUTPUT_DIR=${S3_OUTPUT_DIR:-"/s3/mlibra/mlibra-data/artiom/sota_batch_cv"}
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
 S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_15annot.npy"
@@ -65,7 +67,8 @@ S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_availabl
 # Precomputed eigenvectors -- only GPLFR's riemann/spectral bases need these.
 S3_EIGENVECTOR_DIR=${S3_EIGENVECTOR_DIR:-"/s3/mlibra/mlibra-data/artiom/eigenvectors"}
 SRC_PATH="/myhome/mlibra"
-EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
+# job-name-only suffix -- kept short because runai caps workload names at 50 chars.
+EXP_SUFFIX="$(date +'%m%d-%H%M')"
 
 # ---------------------------------------------------------------------------
 # Per-model sweep grids. One config per "echo" line: "TAG:ENV1=v1 ENV2=v2 ...".
@@ -81,17 +84,19 @@ EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 sweep_for_model() {
     case "$1" in
         ntf)
-            echo "wd1e4-tv05:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.05"
-            echo "wd1e3-tv05:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.001 NTF_TV_WEIGHT=0.05"
-            echo "wd1e2-tv05:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.01 NTF_TV_WEIGHT=0.05"
-            echo "wd1e3-tv20:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.001 NTF_TV_WEIGHT=0.2"
-            echo "wd1e3-tv00:N_EPOCHS=30 BATCH_SIZE=16384 NTF_WEIGHT_DECAY=0.001 NTF_TV_WEIGHT=0.0"
+            echo "res128-tv05:N_EPOCHS=50 BATCH_SIZE=16384 NTF_MAX_RES=128 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.05"
+            echo "res256-tv05:N_EPOCHS=50 BATCH_SIZE=16384 NTF_MAX_RES=256 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.05"
+            echo "res512-tv05:N_EPOCHS=50 BATCH_SIZE=16384 NTF_MAX_RES=512 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.05"
+            echo "res256-tv20:N_EPOCHS=50 BATCH_SIZE=16384 NTF_MAX_RES=256 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.2"
+            echo "res256-tv00:N_EPOCHS=50 BATCH_SIZE=16384 NTF_MAX_RES=256 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.0"
             ;;
         spa3d)
-            echo "zw03-alft:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=alft"
-            echo "zw06-alft:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.6 SPA3D_SPE=alft"
-            echo "zw10-alft:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=1.0 SPA3D_SPE=alft"
-            echo "zw03-none:N_EPOCHS=30 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=none"
+            echo "zw03-none:N_EPOCHS=50 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=none"
+            echo "zw01-none:N_EPOCHS=50 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.1 SPA3D_SPE=none"
+            echo "zw05-none:N_EPOCHS=50 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.5 SPA3D_SPE=none"
+            echo "zw03-none-nodes150k:N_EPOCHS=50 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=none SPA3D_GRAPH_NODES=150000"
+            echo "zw03-alft:N_EPOCHS=50 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=alft"
+            echo "zw03-hilbert:N_EPOCHS=50 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=hilbert"
             ;;
         deepspatial)
             echo "cross-reg03:N_EPOCHS=100 BATCH_SIZE=256 DS_PAIRING=cross-mouse DS_UOT_REG=0.3 DS_MAX_CELLS=8000"
@@ -99,9 +104,9 @@ sweep_for_model() {
             echo "within-reg03:N_EPOCHS=100 BATCH_SIZE=256 DS_PAIRING=within-mouse DS_UOT_REG=0.3 DS_MAX_CELLS=8000"
             ;;
         gplfr)
-            echo "euclidean:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=euclidean"
-            echo "riemann:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=riemann"
-            echo "spectral:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=spectral"
+            echo "euclidean:N_EPOCHS=30 BATCH_SIZE=2000 BASE_GP=euclidean"
+            echo "riemann:N_EPOCHS=30 BATCH_SIZE=2000 BASE_GP=riemann"
+            echo "spectral:N_EPOCHS=30 BATCH_SIZE=2000 BASE_GP=spectral"
             ;;
         *)
             echo "ERROR: no sweep grid defined for model '$1'" >&2
@@ -109,6 +114,30 @@ sweep_for_model() {
             ;;
     esac
 }
+
+# sweep_for_model() {
+#     case "$1" in
+#         ntf)
+#             echo "res128-tv05:N_EPOCHS=3 BATCH_SIZE=16384 NTF_MAX_RES=128 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.05"
+#             ;;
+#         spa3d)
+#             echo "zw03-none:N_EPOCHS=3 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=none"
+#             ;;
+#         deepspatial)
+#             echo "cross-reg03:N_EPOCHS=10 BATCH_SIZE=256 DS_PAIRING=cross-mouse DS_UOT_REG=0.3 DS_MAX_CELLS=8000"
+#             ;;
+#         gplfr)
+#             echo "euclidean:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=euclidean"
+#             echo "riemann:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=riemann"
+#             echo "spectral:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=spectral"
+#             ;;
+#         *)
+#             echo "ERROR: no sweep grid defined for model '$1'" >&2
+#             return 1
+#             ;;
+#     esac
+# }
+
 
 submit() {
     local job_name=$1 model=$2 slices=$3 prefix=$4 env_str=$5
@@ -118,12 +147,19 @@ submit() {
     # config's own knobs -- all passed straight through as -e vars.
     local sweep_env=()
     for kv in $env_str; do sweep_env+=(-e "$kv"); done
-    echo ">>> Submitting $job_name (model=$model, sweep='$env_str')"
+    # per-model resource tier: spa3d -> high, everything else -> low
+    local gpu cpu mem tier
+    if [ "$model" = "spa3d" ]; then
+        tier=high; gpu=$HIGH_GPU; cpu=$HIGH_CPU; mem=$HIGH_MEM
+    else
+        tier=low;  gpu=$LOW_GPU;  cpu=$LOW_CPU;  mem=$LOW_MEM
+    fi
+    echo ">>> Submitting $job_name (model=$model, tier=$tier: gpu=$gpu cpu=$cpu mem=$mem, sweep='$env_str')"
     runai training submit "$job_name" \
         -i artiomartiom/sdsc:maldi_manifold_all_latest \
-        --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
-        --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
-        --gpu-request-type portion --gpu-portion-request "$GPU" \
+        --cpu-core-limit "$cpu" --cpu-core-request "$cpu" \
+        --cpu-memory-limit "$mem" --cpu-memory-request "$mem" \
+        --gpu-request-type portion --gpu-portion-request "$gpu" \
         -e EXP_PREFIX="$prefix" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e MODEL="$model" \
@@ -143,8 +179,9 @@ submit() {
         -- ./sota/run_sota.sh "${extra_args[@]}"
 }
 
-MODELS=${MODELS:-"ntf spa3d deepspatial"}   # add 'gplfr' to also sweep the latent-GP
-FOLDS=(${FOLDS:-"fold-1 fold-2 fold-3"})    # shared CV list; e.g. FOLDS="fold-1 fold-2 ... fold-8"
+MODELS=${MODELS:-"ntf spa3d deepspatial gplfr"}   # add 'gplfr' to also sweep the latent-GP
+#FOLDS=(${FOLDS:-"fold-1"})    # shared CV list; e.g. FOLDS="fold-1 fold-2 ... fold-8"
+FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")
 
 # Outer loop: folds shared across all models. Inner: per-model sweep grid.
 for fold in "${FOLDS[@]}"; do
@@ -160,7 +197,10 @@ for fold in "${FOLDS[@]}"; do
             env_str=${cfg#*:}              # "N_EPOCHS=.. BATCH_SIZE=.. KEY=VAL .."
             tag_upper=${tag^^}
             prefix="${fold_upper}-${tag_upper}"
-            job="sota-${model}-${tag}-${fold}-${EXP_SUFFIX}"
+            # Job name stays short (runai caps workload names at 50): the sweep
+            # tag lives in EXP_PREFIX / the output dir, so the job name uses a
+            # running counter for uniqueness instead. e.g. sota-deepspatial-fold3-0718-2322-7
+            job="sota-${model}-${fold//-/}-${EXP_SUFFIX}-${N_JOBS}"
             run_or_echo submit "$job" "$model" "$SLICES_DATASET_FILE" \
                 "$prefix" "$env_str" "$@"
             N_JOBS=$((N_JOBS + 1))
