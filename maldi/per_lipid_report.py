@@ -10,8 +10,9 @@ Each run lands in ``<root>/<exp_name>/`` with:
     summary.json   # the run's own aggregate
     FAILED.txt     # present only if the run diverged
 
-This script walks ``<root>``, finds every directory that has a ``metrics.csv``,
-and emits:
+This script walks one or more ``<root>`` dirs, finds every directory that has a
+``metrics.csv`` (runs from all roots are pooled; a ``source`` column tags each
+when >1 root is given), and emits:
 
   1. A PER-RUN table   (one row per run dir).
   2. A PER-FOLD table  (runs grouped by the fold their config points at).
@@ -34,6 +35,7 @@ per-run / per-fold / total tables stay per-lipid-only (unchanged).
 Usage
 -----
     python maldi/per_lipid_report.py /path/to/experiment_batch_14
+    python maldi/per_lipid_report.py out_a out_b out_c          # multiple roots pooled
     python maldi/per_lipid_report.py /path/to/out --csv-dir ./report_out
     python maldi/per_lipid_report.py /path/to/out --sort test_r2 --metric test_r2
     # compare the per-lipid GPs against the whole-brain LGP/manifold models:
@@ -126,7 +128,7 @@ def derive_model(run_dir: Path, config: dict | None) -> str:
     return _FOLD_PREFIX_RE.sub("", name, count=1)
 
 
-def load_run(run_dir: Path) -> dict | None:
+def load_run(run_dir: Path, source: str = "") -> dict | None:
     """Load one run dir into a record, or None if it has no usable metrics."""
     metrics_path = run_dir / "metrics.csv"
     if not metrics_path.exists():
@@ -145,6 +147,7 @@ def load_run(run_dir: Path) -> dict | None:
 
     return {
         "run": run_dir.name,
+        "source": source,
         "fold": derive_fold(run_dir, config),
         "model": derive_model(run_dir, config),
         "kernel_family": (config or {}).get("kernel_family")
@@ -228,9 +231,9 @@ def build_per_lipid_model(long_df: pd.DataFrame, metric: str) -> pd.DataFrame:
     return out
 
 
-def _long_from_runs(runs: list[dict]) -> pd.DataFrame:
+def _long_from_runs(runs: list[dict], multi_source: bool = False) -> pd.DataFrame:
     """Stack every run's per-lipid df into one long table, tagged with the run's
-    identity columns (run / fold / model / kernel_family)."""
+    identity columns (run / fold / model / kernel_family, + source if pooled)."""
     long_parts = []
     for r in runs:
         d = r["df"].copy()
@@ -238,25 +241,33 @@ def _long_from_runs(runs: list[dict]) -> pd.DataFrame:
         d.insert(1, "fold", r["fold"])
         d.insert(2, "model", r["model"])
         d.insert(3, "kernel_family", r["kernel_family"])
+        if multi_source:
+            d.insert(1, "source", r.get("source", ""))
         long_parts.append(d)
     return pd.concat(long_parts, ignore_index=True) if long_parts else pd.DataFrame()
 
 
 def build_tables(runs: list[dict], metric: str):
+    # Only surface the `source` (root) column when runs span >1 root, else it's
+    # constant clutter.
+    multi_source = len({r.get("source", "") for r in runs}) > 1
+
     # ---- long per-lipid table (one row per lipid, tagged with run+fold) ----
-    long_df = _long_from_runs(runs)
+    long_df = _long_from_runs(runs, multi_source)
 
     # ---- per-run table ----
     per_run_rows = []
     for r in runs:
-        row = {
-            "run": r["run"],
+        row = {"run": r["run"]}
+        if multi_source:
+            row["source"] = r.get("source", "")
+        row.update({
             "fold": r["fold"],
             "kernel_family": r["kernel_family"],
             "failed": r["failed"],
             "n_lipids": r["n_lipids"],
             "wall_time_sec": r["wall_time_sec"],
-        }
+        })
         row.update(summarise(r["df"]))
         per_run_rows.append(row)
     per_run = pd.DataFrame(per_run_rows)
@@ -404,9 +415,10 @@ def build_model_comparison(combined_long: pd.DataFrame, metric: str) -> pd.DataF
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("root", type=Path,
-                    help="Directory containing the per-run output dirs "
-                         "(e.g. .../experiment_batch_14).")
+    ap.add_argument("roots", type=Path, nargs="+",
+                    help="One or more directories containing the per-run output dirs "
+                         "(e.g. .../experiment_batch_14). Runs from all roots are "
+                         "pooled (a 'source' column tags each when >1 root is given).")
     ap.add_argument("--metric", default="test_r2",
                     choices=METRIC_COLS,
                     help="Metric used to sort the per-fold table (default test_r2).")
@@ -442,21 +454,32 @@ def main() -> int:
                     help="Row block size for the streaming whole-brain metric recompute.")
     args = ap.parse_args()
 
-    root: Path = args.root
-    if not root.is_dir():
-        print(f"ERROR: not a directory: {root}", file=sys.stderr)
+    roots: list[Path] = args.roots
+    missing = [r for r in roots if not r.is_dir()]
+    if missing:
+        print("ERROR: not a directory: " + ", ".join(str(m) for m in missing),
+              file=sys.stderr)
         return 1
 
     # Any directory containing a metrics.csv is a run. rglob so nested layouts
-    # (e.g. an extra fold subdir on S3) are handled too.
-    run_dirs = sorted({p.parent for p in root.rglob("metrics.csv")})
+    # (e.g. an extra fold subdir on S3) are handled too. Discover across every
+    # root; a run's `source` is the first root it's found under (dedup by full
+    # path, so the same dir under two roots is still scored once).
+    run_dir_to_source: dict[Path, str] = {}
+    for root in roots:
+        for p in root.rglob("metrics.csv"):
+            run_dir_to_source.setdefault(p.parent, root.name)
+    run_dirs = sorted(run_dir_to_source)
     if not run_dirs:
-        print(f"No metrics.csv found anywhere under {root}", file=sys.stderr)
+        roots_str = ", ".join(str(r) for r in roots)
+        print(f"No metrics.csv found anywhere under {roots_str}", file=sys.stderr)
         return 1
 
-    runs = [r for r in (load_run(d) for d in run_dirs) if r is not None]
+    runs = [r for r in (load_run(d, run_dir_to_source[d]) for d in run_dirs)
+            if r is not None]
     if not runs:
-        print(f"Found metrics.csv files under {root} but none were usable.",
+        roots_str = ", ".join(str(r) for r in roots)
+        print(f"Found metrics.csv files under {roots_str} but none were usable.",
               file=sys.stderr)
         return 1
 
@@ -503,8 +526,9 @@ def main() -> int:
     pd.set_option("display.float_format", lambda v: f"{v:.4f}")
 
     n_failed = int(per_run["failed"].sum())
+    roots_str = ", ".join(str(r) for r in roots)
     print("=" * 90)
-    print(f"PER-LIPID GP REPORT  —  root: {root}")
+    print(f"PER-LIPID GP REPORT  —  roots: {roots_str}")
     print(f"  runs: {len(runs)}   folds: {per_fold.shape[0]}   "
           f"lipid-rows: {len(long_df)}   failed runs: {n_failed}")
     if args.full_lgp_root:
