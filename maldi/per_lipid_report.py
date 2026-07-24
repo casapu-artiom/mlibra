@@ -86,9 +86,9 @@ FULL_LGP_METRIC_MAP = {"r2": "test_r2", "corr": "test_corr"}
 # so for those the kernel_family column instead carries a human-readable
 # description of the model itself, keyed off the lgp_report family label.
 _FULL_LGP_DESC = {
-    "lgp": "whole-brain Euclidean latent GP",
-    "manifold": "whole-brain manifold (Riemann) latent GP",
-    "spectral": "whole-brain spectral latent GP",
+    "lgp": "whole-brain Euclidean (Matern) latent GP",
+    "manifold": "whole-brain Riemann manifold latent GP (inducing-point)",
+    "spectral": "whole-brain Riemann manifold latent GP (spectral / weight-space eigenbasis)",
 }
 _SOTA_DESC = {
     "ntf": "Neural Transcriptomic Field (hash-grid INR)",
@@ -355,7 +355,7 @@ def load_full_lgp_run(run_dir: Path, split: str, chunk_rows: int,
     # whole-brain report unless --full-lgp-root is used.
     from lgp_metrics import load_or_compute as wb_load_or_compute
     from lgp_report import (derive_family as wb_family, derive_fold as wb_fold,
-                            _load_args as wb_load_args)
+                            derive_model as wb_model, _load_args as wb_load_args)
 
     df = wb_load_or_compute(run_dir, split, chunk_rows=chunk_rows,
                             lipid_names=lipid_names, force=force)
@@ -364,6 +364,10 @@ def load_full_lgp_run(run_dir: Path, split: str, chunk_rows: int,
 
     args = wb_load_args(run_dir)
     family = wb_family(run_dir, args)
+    # The full CONFIG label (exp_name minus the fold token), so each distinct
+    # full model gets its OWN line -- two configs of the same family (e.g. two
+    # manifold variants) stay separate instead of collapsing into one row.
+    model_cfg = wb_model(run_dir, args)
     if family_filter and family_filter.lower() not in family.lower():
         return None
 
@@ -396,10 +400,10 @@ def load_full_lgp_run(run_dir: Path, split: str, chunk_rows: int,
     return {
         "run": run_dir.name,
         "fold": wb_fold(run_dir, args),
-        # A distinct, sortable label so full models never collide with a
-        # per-lipid config of the same name in the per-lipid x per-model table.
-        "model": f"[full] {family}",
-        # Not a per-lipid kernel: describe the model itself instead of a kernel.
+        # One line per full-model CONFIG (the '[full] ' prefix also keeps it from
+        # colliding with a per-lipid config of the same name).
+        "model": f"[full] {model_cfg}",
+        # Not a per-lipid kernel: describe the model family instead of a kernel.
         "kernel_family": full_lgp_description(family),
         "failed": (run_dir / "FAILED.txt").exists(),
         "n_lipids": int(len(df)),
