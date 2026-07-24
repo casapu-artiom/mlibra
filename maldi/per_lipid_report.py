@@ -26,11 +26,16 @@ Pass ``--full-lgp-root`` (one or more roots of whole-brain runs, i.e. dirs
 holding ``<split>/predictions.npy`` as scored by ``lgp_report.py``) to fold those
 models in for a head-to-head, RESTRICTED to the lipids the per-lipid runs
 trained (joined on ``lipid_name``). They then appear:
-  * as extra ``[full] <family>`` rows in the PER-LIPID x PER-MODEL table, and
-  * in a dedicated FULL-LGP vs PER-LIPID leaderboard (pooled over trained lipids).
-Only r2 and corr are compared — the per-lipid rmse is z-scored (``test_rmse_z``)
-while the whole-brain rmse is in original units, so it is not carried over. The
-per-run / per-fold / total tables stay per-lipid-only (unchanged).
+  * as extra ``[full] <family>`` rows in the PER-LIPID x PER-MODEL table,
+  * in a FULL-LGP vs PER-LIPID leaderboard (pooled over trained lipids), and
+  * in an UPLIFT table: how much each full model adds ON TOP OF the best single
+    per-lipid GP for the same lipid (mean/median delta + win-rate) — the point of
+    the whole comparison.
+Metrics compared are r2, corr and a standardized rmse: the cached whole-brain
+``rmse`` is in original units, but the per-lipid ``test_rmse_z`` is the RMSE on
+the standardized target, which equals sqrt(1 - r2), so it is derived from r2 for
+the full models (rather than left blank). The per-run / per-fold / total tables
+stay per-lipid-only (unchanged).
 
 Usage
 -----
@@ -75,6 +80,40 @@ def _nan_agg(fn, vals) -> float:
 # while the whole-brain `rmse` is in original units, so it is deliberately NOT
 # carried over (it would compare apples to oranges).
 FULL_LGP_METRIC_MAP = {"r2": "test_r2", "corr": "test_corr"}
+
+# The per-lipid runs' kernel_family is always a real kernel (euclidean / manifold /
+# eigenmap / spectral). The whole-brain ("full") models are NOT per-lipid kernels,
+# so for those the kernel_family column instead carries a human-readable
+# description of the model itself, keyed off the lgp_report family label.
+_FULL_LGP_DESC = {
+    "lgp": "whole-brain Euclidean latent GP",
+    "manifold": "whole-brain manifold (Riemann) latent GP",
+    "spectral": "whole-brain spectral latent GP",
+}
+_SOTA_DESC = {
+    "ntf": "Neural Transcriptomic Field (hash-grid INR)",
+    "spa3d": "spatial-pattern GCN (SPE + z-aware)",
+    "deepspatial": "DeepSpatial optimal-transport",
+}
+
+
+def full_lgp_description(family: str) -> str:
+    """Readable description of a whole-brain model, from its lgp_report family
+    label (lgp / manifold / spectral / gplfr-<base> / sota-<method> /
+    baseline-<model>). Falls back to the family string for anything unrecognised."""
+    if family in _FULL_LGP_DESC:
+        return _FULL_LGP_DESC[family]
+    if family.startswith("gplfr"):
+        base = family.split("-", 1)[1] if "-" in family else None
+        return f"GP latent-factor regression ({base} base)" if base \
+            else "GP latent-factor regression"
+    if family.startswith("sota-"):
+        method = family.split("-", 1)[1]
+        return _SOTA_DESC.get(method, f"SOTA model ({method})")
+    if family.startswith("baseline"):
+        model = family.split("-", 1)[1] if "-" in family else "baseline"
+        return f"{model} baseline"
+    return family
 
 
 def _lipid_col(df: pd.DataFrame) -> str | None:
@@ -344,7 +383,14 @@ def load_full_lgp_run(run_dir: Path, split: str, chunk_rows: int,
 
     # Map the comparable whole-brain metrics onto the per-lipid column names.
     df = df.rename(columns=FULL_LGP_METRIC_MAP)
-    keep = ["lipid_name", *FULL_LGP_METRIC_MAP.values()]
+    # The per-lipid `test_rmse_z` is the RMSE on the STANDARDIZED target. On the
+    # whole-brain side r2 = 1 - SSE/SST (SST about the test mean), so the
+    # standardized RMSE is exactly sqrt(1 - r2) -- derive it so the rmse column
+    # is populated and comparable (rather than left blank because the cached
+    # whole-brain `rmse` is in original units).
+    if "test_r2" in df.columns:
+        df["test_rmse_z"] = np.sqrt(np.clip(1.0 - df["test_r2"], 0.0, None))
+    keep = ["lipid_name", *FULL_LGP_METRIC_MAP.values(), "test_rmse_z"]
     df = df[[c for c in keep if c in df.columns]]
 
     return {
@@ -353,7 +399,8 @@ def load_full_lgp_run(run_dir: Path, split: str, chunk_rows: int,
         # A distinct, sortable label so full models never collide with a
         # per-lipid config of the same name in the per-lipid x per-model table.
         "model": f"[full] {family}",
-        "kernel_family": family,
+        # Not a per-lipid kernel: describe the model itself instead of a kernel.
+        "kernel_family": full_lgp_description(family),
         "failed": (run_dir / "FAILED.txt").exists(),
         "n_lipids": int(len(df)),
         "wall_time_sec": float("nan"),
@@ -376,7 +423,7 @@ def load_full_lgp_runs(roots: list[Path], split: str, chunk_rows: int,
         r = load_full_lgp_run(d, split, chunk_rows, lipid_names, trained_lipids,
                               force, family_filter)
         if r is not None:
-            print(f"  full-lgp scored {r['kernel_family']:16s} {r['run']} "
+            print(f"  full-lgp scored {r['model']:22s} {r['run']} "
                   f"({r['n_lipids']} trained lipids)", file=sys.stderr)
             out.append(r)
     return out
@@ -409,6 +456,60 @@ def build_model_comparison(combined_long: pd.DataFrame, metric: str) -> pd.DataF
     if not out.empty and sort_col in out.columns:
         ascending = metric.endswith("rmse_z") or metric == "fit_sec"
         out = out.sort_values(sort_col, ascending=ascending, kind="stable")
+    return out
+
+
+def build_uplift(per_lipid_model: pd.DataFrame) -> pd.DataFrame:
+    """How much each ``[full] …`` model adds ON TOP OF a single per-lipid GP.
+
+    For every trained lipid the baseline is the BEST single per-lipid GP for that
+    lipid (the max median test_r2 / test_corr over all per-lipid configs) — a
+    conservative bar, so a positive uplift means the full model beats the best
+    single GP, not just an average one. Each full model is then compared to that
+    baseline per lipid and aggregated: median full vs baseline, the mean/median
+    delta, and the win-rate (fraction of lipids where the full model wins).
+    """
+    if per_lipid_model.empty or "test_r2_median" not in per_lipid_model.columns:
+        return pd.DataFrame()
+    df = per_lipid_model.copy()
+    df["_is_full"] = df["model"].astype(str).str.startswith("[full] ")
+    per, full = df[~df["_is_full"]], df[df["_is_full"]]
+    if per.empty or full.empty:
+        return pd.DataFrame()
+
+    # Best single per-lipid GP per lipid (best achievable by ANY one GP config).
+    agg = {"base_r2": ("test_r2_median", "max")}
+    if "test_corr_median" in df.columns:
+        agg["base_corr"] = ("test_corr_median", "max")
+    base = per.groupby("lipid").agg(**agg).reset_index()
+
+    rows = []
+    for model, g in full.groupby("model"):
+        m = g.merge(base, on="lipid", how="inner")
+        if m.empty:
+            continue
+        d_r2 = m["test_r2_median"] - m["base_r2"]
+        row = {
+            "full_model": model,
+            "kernel_family": g["kernel_family"].iloc[0],
+            "n_lipids": int(len(m)),
+            "r2_full_median": float(m["test_r2_median"].median()),
+            "r2_best_single_median": float(m["base_r2"].median()),
+            "d_r2_mean": float(d_r2.mean()),
+            "d_r2_median": float(d_r2.median()),
+            "r2_win_rate": float((d_r2 > 0).mean()),
+        }
+        if "test_corr_median" in m.columns and "base_corr" in m.columns:
+            d_corr = m["test_corr_median"] - m["base_corr"]
+            row.update({
+                "d_corr_mean": float(d_corr.mean()),
+                "d_corr_median": float(d_corr.median()),
+                "corr_win_rate": float((d_corr > 0).mean()),
+            })
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values("d_r2_median", ascending=False, kind="stable")
     return out
 
 
@@ -490,6 +591,7 @@ def main() -> int:
     # These are added to the per-lipid x per-model table and drive a dedicated
     # FULL-vs-PER-LIPID comparison; per-run / per-fold / total stay per-lipid.
     model_comparison = pd.DataFrame()
+    uplift = pd.DataFrame()
     n_full_runs = 0
     if args.full_lgp_root:
         lipid_col = _lipid_col(long_df)
@@ -517,6 +619,7 @@ def main() -> int:
                                           ignore_index=True)
                 per_lipid_model = build_per_lipid_model(combined_long, args.metric)
                 model_comparison = build_model_comparison(combined_long, args.metric)
+                uplift = build_uplift(per_lipid_model)
             else:
                 print("  ! no whole-brain runs overlapped the trained lipids.",
                       file=sys.stderr)
@@ -558,6 +661,13 @@ def main() -> int:
         with pd.option_context("display.max_rows", args.max_rows):
             print(model_comparison.to_string(index=False))
 
+    # ---- uplift: what each full model adds over the best single per-lipid GP ----
+    if args.full_lgp_root and not uplift.empty:
+        print("\n### UPLIFT — full model minus BEST single per-lipid GP, per lipid "
+              "(d_* = full - best-single; win_rate = fraction of lipids the full model wins)")
+        with pd.option_context("display.max_rows", args.max_rows):
+            print(uplift.to_string(index=False))
+
     # ---- per-lipid x per-model (aggregated across folds) ----
     print("\n### PER-LIPID x PER-MODEL SUMMARY (aggregated across folds: "
           "mean / median / min..max)")
@@ -592,6 +702,8 @@ def main() -> int:
         total_df.to_csv(args.csv_dir / "total.csv", index=False)
         if not model_comparison.empty:
             model_comparison.to_csv(args.csv_dir / "full_vs_per_lipid.csv", index=False)
+        if not uplift.empty:
+            uplift.to_csv(args.csv_dir / "full_lgp_uplift.csv", index=False)
         print(f"\nWrote CSVs to {args.csv_dir}/")
 
     return 0
