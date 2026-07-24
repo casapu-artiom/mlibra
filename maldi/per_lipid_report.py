@@ -19,11 +19,27 @@ and emits:
 
 Optionally dumps the long per-lipid table and the per-run/per-fold tables to CSV.
 
+Comparison with the whole-brain ("full") LGP models
+---------------------------------------------------
+Pass ``--full-lgp-root`` (one or more roots of whole-brain runs, i.e. dirs
+holding ``<split>/predictions.npy`` as scored by ``lgp_report.py``) to fold those
+models in for a head-to-head, RESTRICTED to the lipids the per-lipid runs
+trained (joined on ``lipid_name``). They then appear:
+  * as extra ``[full] <family>`` rows in the PER-LIPID x PER-MODEL table, and
+  * in a dedicated FULL-LGP vs PER-LIPID leaderboard (pooled over trained lipids).
+Only r2 and corr are compared — the per-lipid rmse is z-scored (``test_rmse_z``)
+while the whole-brain rmse is in original units, so it is not carried over. The
+per-run / per-fold / total tables stay per-lipid-only (unchanged).
+
 Usage
 -----
     python maldi/per_lipid_report.py /path/to/experiment_batch_14
     python maldi/per_lipid_report.py /path/to/out --csv-dir ./report_out
     python maldi/per_lipid_report.py /path/to/out --sort test_r2 --metric test_r2
+    # compare the per-lipid GPs against the whole-brain LGP/manifold models:
+    python maldi/per_lipid_report.py /path/to/per_lipid_out \
+        --full-lgp-root /path/to/whole_brain_out \
+        --full-lgp-lipid-names-file .../available_lipids.npy
 """
 from __future__ import annotations
 
@@ -42,6 +58,21 @@ METRIC_COLS = ["test_rmse_z", "test_corr", "test_r2", "mean_pred_std_z", "fit_se
 
 # Candidate columns that identify a lipid within a metrics.csv, in priority order.
 LIPID_ID_COLS = ["lipid_name", "slug", "lipid_global_idx"]
+
+def _nan_agg(fn, vals) -> float:
+    """Apply a nan-reduction (nanmean/median/min/max) without the RuntimeWarning
+    an all-NaN or empty slice raises — full-LGP rows have no ``test_rmse_z``, so
+    that column is legitimately all-NaN for them."""
+    arr = pd.to_numeric(pd.Series(vals), errors="coerce").to_numpy(dtype=float)
+    return float(fn(arr)) if arr.size and np.isfinite(arr).any() else float("nan")
+
+
+# Whole-brain ("full") LGP metric columns (from lgp_metrics) mapped onto the
+# per-lipid schema, so the two families land in the SAME columns. Only r2 and
+# corr are directly comparable: the per-lipid rmse is z-scored (`test_rmse_z`)
+# while the whole-brain `rmse` is in original units, so it is deliberately NOT
+# carried over (it would compare apples to oranges).
+FULL_LGP_METRIC_MAP = {"r2": "test_r2", "corr": "test_corr"}
 
 
 def _lipid_col(df: pd.DataFrame) -> str | None:
@@ -155,11 +186,10 @@ def summarise_across_folds(g: pd.DataFrame) -> dict:
     out: dict[str, float] = {}
     for col in METRIC_COLS:
         if col in g.columns:
-            vals = pd.to_numeric(g[col], errors="coerce")
-            out[f"{col}_mean"] = float(np.nanmean(vals)) if len(vals) else float("nan")
-            out[f"{col}_median"] = float(np.nanmedian(vals)) if len(vals) else float("nan")
-            out[f"{col}_min"] = float(np.nanmin(vals)) if len(vals) else float("nan")
-            out[f"{col}_max"] = float(np.nanmax(vals)) if len(vals) else float("nan")
+            out[f"{col}_mean"] = _nan_agg(np.nanmean, g[col])
+            out[f"{col}_median"] = _nan_agg(np.nanmedian, g[col])
+            out[f"{col}_min"] = _nan_agg(np.nanmin, g[col])
+            out[f"{col}_max"] = _nan_agg(np.nanmax, g[col])
     return out
 
 
@@ -198,8 +228,9 @@ def build_per_lipid_model(long_df: pd.DataFrame, metric: str) -> pd.DataFrame:
     return out
 
 
-def build_tables(runs: list[dict], metric: str):
-    # ---- long per-lipid table (one row per lipid, tagged with run+fold) ----
+def _long_from_runs(runs: list[dict]) -> pd.DataFrame:
+    """Stack every run's per-lipid df into one long table, tagged with the run's
+    identity columns (run / fold / model / kernel_family)."""
     long_parts = []
     for r in runs:
         d = r["df"].copy()
@@ -208,7 +239,12 @@ def build_tables(runs: list[dict], metric: str):
         d.insert(2, "model", r["model"])
         d.insert(3, "kernel_family", r["kernel_family"])
         long_parts.append(d)
-    long_df = pd.concat(long_parts, ignore_index=True) if long_parts else pd.DataFrame()
+    return pd.concat(long_parts, ignore_index=True) if long_parts else pd.DataFrame()
+
+
+def build_tables(runs: list[dict], metric: str):
+    # ---- long per-lipid table (one row per lipid, tagged with run+fold) ----
+    long_df = _long_from_runs(runs)
 
     # ---- per-run table ----
     per_run_rows = []
@@ -250,6 +286,121 @@ def build_tables(runs: list[dict], metric: str):
     return long_df, per_run, per_fold, per_lipid_model
 
 
+# ---------------------------------------------------------------------------
+# Optional: whole-brain ("full") LGP models, restricted to the trained lipids
+# ---------------------------------------------------------------------------
+def load_full_lgp_run(run_dir: Path, split: str, chunk_rows: int,
+                      lipid_names: np.ndarray | None, trained_lipids: set[str],
+                      force: bool, family_filter: str | None) -> dict | None:
+    """Load one whole-brain LGP run and shape it like a per-lipid run record,
+    but restricted to the lipids that the per-lipid runs actually trained.
+
+    Reuses ``lgp_metrics.load_or_compute`` (the same per-lipid r2/corr/rmse/mae
+    the whole-brain report scores) and ``lgp_report``'s fold/family derivation,
+    then renames the comparable columns onto the per-lipid schema. Returns None
+    if the run has no usable metrics, no lipid names to join on, or none of its
+    lipids overlap the trained set.
+    """
+    # Imported lazily so per_lipid_report has no hard dependency on the
+    # whole-brain report unless --full-lgp-root is used.
+    from lgp_metrics import load_or_compute as wb_load_or_compute
+    from lgp_report import (derive_family as wb_family, derive_fold as wb_fold,
+                            _load_args as wb_load_args)
+
+    df = wb_load_or_compute(run_dir, split, chunk_rows=chunk_rows,
+                            lipid_names=lipid_names, force=force)
+    if df is None or df.empty:
+        return None
+
+    args = wb_load_args(run_dir)
+    family = wb_family(run_dir, args)
+    if family_filter and family_filter.lower() not in family.lower():
+        return None
+
+    # Need lipid names to join against the trained set. Prefer the cached
+    # column; else label from --full-lgp-lipid-names-file if it lines up.
+    if "lipid_name" not in df.columns and lipid_names is not None and len(lipid_names) == len(df):
+        df = df.copy()
+        df.insert(1, "lipid_name", [str(x) for x in lipid_names])
+    if "lipid_name" not in df.columns:
+        print(f"  ! {run_dir.name}: no lipid_name (pass --full-lgp-lipid-names-file); skipping",
+              file=sys.stderr)
+        return None
+
+    df = df[df["lipid_name"].astype(str).isin(trained_lipids)].copy()
+    if df.empty:
+        return None
+
+    # Map the comparable whole-brain metrics onto the per-lipid column names.
+    df = df.rename(columns=FULL_LGP_METRIC_MAP)
+    keep = ["lipid_name", *FULL_LGP_METRIC_MAP.values()]
+    df = df[[c for c in keep if c in df.columns]]
+
+    return {
+        "run": run_dir.name,
+        "fold": wb_fold(run_dir, args),
+        # A distinct, sortable label so full models never collide with a
+        # per-lipid config of the same name in the per-lipid x per-model table.
+        "model": f"[full] {family}",
+        "kernel_family": family,
+        "failed": (run_dir / "FAILED.txt").exists(),
+        "n_lipids": int(len(df)),
+        "wall_time_sec": float("nan"),
+        "df": df,
+        "is_full": True,
+    }
+
+
+def load_full_lgp_runs(roots: list[Path], split: str, chunk_rows: int,
+                       lipid_names: np.ndarray | None, trained_lipids: set[str],
+                       force: bool, family_filter: str | None) -> list[dict]:
+    """Discover + load every whole-brain run under `roots` (a run dir is any dir
+    holding ``<split>/predictions.npy``), restricted to the trained lipids."""
+    run_dirs: set[Path] = set()
+    for root in roots:
+        for p in root.rglob(f"{split}/predictions.npy"):
+            run_dirs.add(p.parent.parent)
+    out = []
+    for d in sorted(run_dirs):
+        r = load_full_lgp_run(d, split, chunk_rows, lipid_names, trained_lipids,
+                              force, family_filter)
+        if r is not None:
+            print(f"  full-lgp scored {r['kernel_family']:16s} {r['run']} "
+                  f"({r['n_lipids']} trained lipids)", file=sys.stderr)
+            out.append(r)
+    return out
+
+
+def build_model_comparison(combined_long: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Leaderboard over the trained lipids: one row per model (per-lipid configs
+    AND ``[full] …`` whole-brain families), pooled over lipids/folds, on the
+    comparable metrics (test_r2 / test_corr). Marks which rows are full models."""
+    if combined_long.empty:
+        return pd.DataFrame()
+    lipid_col = _lipid_col(combined_long)
+    rows = []
+    for model, g in combined_long.groupby("model", dropna=False):
+        row = {
+            "model": model,
+            "kernel_family": g["kernel_family"].iloc[0],
+            "is_full": str(model).startswith("[full] "),
+            "n_lipids": g[lipid_col].nunique() if lipid_col else int(len(g)),
+            "n_folds": g["fold"].nunique(),
+            "n_runs": g["run"].nunique(),
+        }
+        for col in ("test_r2", "test_corr", "test_rmse_z"):
+            if col in g.columns:
+                row[f"{col}_mean"] = _nan_agg(np.nanmean, g[col])
+                row[f"{col}_median"] = _nan_agg(np.nanmedian, g[col])
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    sort_col = f"{metric}_median"
+    if not out.empty and sort_col in out.columns:
+        ascending = metric.endswith("rmse_z") or metric == "fit_sec"
+        out = out.sort_values(sort_col, ascending=ascending, kind="stable")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -266,6 +417,29 @@ def main() -> int:
                          "per_fold.csv here.")
     ap.add_argument("--max-rows", type=int, default=200,
                     help="Cap rows printed in the per-run table (default 200).")
+    # ---- optional: compare against the whole-brain ("full") LGP models -----
+    ap.add_argument("--full-lgp-root", type=Path, nargs="+", default=None,
+                    metavar="ROOT",
+                    help="One or more roots of whole-brain LGP runs "
+                         "(dirs holding <split>/predictions.npy, as scored by "
+                         "lgp_report.py). They are added to the per-lipid x per-model "
+                         "table and a FULL-vs-PER-LIPID comparison, restricted to the "
+                         "lipids the per-lipid runs trained. Only r2/corr are compared "
+                         "(the whole-brain rmse is original-unit, not z-scored).")
+    ap.add_argument("--full-lgp-lipid-names-file", type=Path, default=None,
+                    help="Optional .npy of lipid names to label the whole-brain output "
+                         "columns (needed to join by lipid_name unless the run's cached "
+                         "metrics.csv already carries lipid_name).")
+    ap.add_argument("--full-lgp-split", default="test", choices=["test", "train"],
+                    help="Which whole-brain split to score (default test).")
+    ap.add_argument("--full-lgp-family", default=None,
+                    help="Only include whole-brain runs whose family contains this "
+                         "substring (e.g. lgp, manifold, gplfr).")
+    ap.add_argument("--full-lgp-force", action="store_true",
+                    help="Recompute whole-brain metrics from the npy arrays even if a "
+                         "cached metrics.csv exists.")
+    ap.add_argument("--full-lgp-chunk-rows", type=int, default=200_000,
+                    help="Row block size for the streaming whole-brain metric recompute.")
     args = ap.parse_args()
 
     root: Path = args.root
@@ -288,6 +462,42 @@ def main() -> int:
 
     long_df, per_run, per_fold, per_lipid_model = build_tables(runs, args.metric)
 
+    # ---- optional: fold in the whole-brain ("full") LGP models --------------
+    # Restricted to the lipids the per-lipid runs trained (join on lipid_name).
+    # These are added to the per-lipid x per-model table and drive a dedicated
+    # FULL-vs-PER-LIPID comparison; per-run / per-fold / total stay per-lipid.
+    model_comparison = pd.DataFrame()
+    n_full_runs = 0
+    if args.full_lgp_root:
+        lipid_col = _lipid_col(long_df)
+        if lipid_col != "lipid_name":
+            print("  ! --full-lgp-root needs a 'lipid_name' column on the per-lipid "
+                  f"runs to join on (found '{lipid_col}'); skipping full-LGP comparison.",
+                  file=sys.stderr)
+        else:
+            trained_lipids = {str(x) for x in long_df["lipid_name"].dropna().unique()}
+            full_lipid_names = None
+            if args.full_lgp_lipid_names_file and args.full_lgp_lipid_names_file.exists():
+                try:
+                    full_lipid_names = np.load(args.full_lgp_lipid_names_file,
+                                               allow_pickle=True).ravel()
+                except Exception as ex:  # noqa: BLE001
+                    print(f"  ! could not read --full-lgp-lipid-names-file ({ex})",
+                          file=sys.stderr)
+            full_runs = load_full_lgp_runs(
+                args.full_lgp_root, args.full_lgp_split, args.full_lgp_chunk_rows,
+                full_lipid_names, trained_lipids, args.full_lgp_force,
+                args.full_lgp_family)
+            n_full_runs = len(full_runs)
+            if full_runs:
+                combined_long = pd.concat([long_df, _long_from_runs(full_runs)],
+                                          ignore_index=True)
+                per_lipid_model = build_per_lipid_model(combined_long, args.metric)
+                model_comparison = build_model_comparison(combined_long, args.metric)
+            else:
+                print("  ! no whole-brain runs overlapped the trained lipids.",
+                      file=sys.stderr)
+
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 200)
     pd.set_option("display.float_format", lambda v: f"{v:.4f}")
@@ -297,6 +507,9 @@ def main() -> int:
     print(f"PER-LIPID GP REPORT  —  root: {root}")
     print(f"  runs: {len(runs)}   folds: {per_fold.shape[0]}   "
           f"lipid-rows: {len(long_df)}   failed runs: {n_failed}")
+    if args.full_lgp_root:
+        print(f"  full-lgp: {n_full_runs} whole-brain run(s) folded in "
+              f"(trained lipids only; r2/corr comparison)")
     print("=" * 90)
 
     # ---- per-fold ----
@@ -313,6 +526,13 @@ def main() -> int:
     total.update(summarise(long_df))
     total_df = pd.DataFrame([total])
     print(total_df.to_string(index=False))
+
+    # ---- full-LGP vs per-lipid comparison (trained lipids only) ----
+    if args.full_lgp_root and not model_comparison.empty:
+        print("\n### FULL-LGP vs PER-LIPID (pooled over the trained lipids only; "
+              "'[full] …' = whole-brain models)")
+        with pd.option_context("display.max_rows", args.max_rows):
+            print(model_comparison.to_string(index=False))
 
     # ---- per-lipid x per-model (aggregated across folds) ----
     print("\n### PER-LIPID x PER-MODEL SUMMARY (aggregated across folds: "
@@ -346,6 +566,8 @@ def main() -> int:
         per_fold.to_csv(args.csv_dir / "per_fold.csv", index=False)
         per_lipid_model.to_csv(args.csv_dir / "per_lipid_model.csv", index=False)
         total_df.to_csv(args.csv_dir / "total.csv", index=False)
+        if not model_comparison.empty:
+            model_comparison.to_csv(args.csv_dir / "full_vs_per_lipid.csv", index=False)
         print(f"\nWrote CSVs to {args.csv_dir}/")
 
     return 0

@@ -10,6 +10,10 @@ them. Recognised families:
     * spectral        — ``spectral_lgp_manifold_experiment.py`` (weight-space spectral GP)
     * gplfr-<base>    — ``run_sota.sh MODEL=gplfr`` -> ``sota/gplfr_experiment.py``, split by the
                         latent-GP kernel: gplfr-euclidean / gplfr-riemann / gplfr-spectral
+    * sota-<method>   — the SOTA 3D-reconstruction papers from ``run_sota.sh``:
+                        sota-ntf (Neural Transcriptomic Field), sota-spa3d (SPE + z-aware
+                        GCN), sota-deepspatial (faithful transport driver). The shared
+                        ``sota-`` prefix lets ``--family sota`` select them together.
     * baseline-<model>— ``experiment_baselines.py``: baseline-mean / -linear /
                         -xgboost / -mlp / -mlp_eigen / -gcn / -gcn_faiss
                         (bottleneck runs -> baseline-bottleneck-<model>)
@@ -113,6 +117,13 @@ def derive_family(run_dir: Path, args: dict | None) -> str:
         # Split by the latent-GP kernel (euclidean / riemann / spectral) so the
         # kernels are comparable side by side rather than pooled into one "gplfr".
         return f"gplfr-{base_gp}" if base_gp else "gplfr"
+    # SOTA 3D-reconstruction papers (run_sota.sh). All share a `sota-` prefix so
+    # `--family sota` selects them together, but stay split by method.
+    if "DEEPSPATIAL" in name:
+        return "sota-deepspatial"
+    if "SOTA" in name or model in {"ntf", "spa3d"}:
+        # ntf / spa3d go through run_sota.py; the `model` field IS the method.
+        return f"sota-{model}" if model else "sota"
     if "MANIFOLD" in name:
         return "manifold"
     if "SPECTRAL" in name:
