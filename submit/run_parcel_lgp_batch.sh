@@ -38,9 +38,9 @@ else
 fi
 
 # ---- resource limits ------------------------------------------------------
-MEM=${MEM:-48G}
-CPU=${CPU:-4}
-GPU=${GPU:-0.5}
+MEM=${MEM:-24G}
+CPU=${CPU:-2}
+GPU=${GPU:-0.2}
 
 # ---- S3-mounted paths inside the container --------------------------------
 # Same roots as run_lgp_batch.sh / run_submit_per_lipid.sh; only the output dir
@@ -144,13 +144,13 @@ submit() {
 #                     interpretable setting (the parcels plot in 2-D).
 #   PARCEL_NB_LIST    0/1 = weight each feature vs each descriptor block equally.
 # =============================================================================
-FOLDS=("fold-2")
+FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
 PARCEL_FEAT_LIST=("full" "spatial")
-PARCEL_K_LIST=(128)
+PARCEL_K_LIST=(128 192)
 PARCEL_SW_LIST=(1.0 3.0)
-PARCEL_STRIDE_LIST=(4)
+PARCEL_STRIDE_LIST=(2)
 PARCEL_RANK_LIST=(8)
-PARCEL_NB_LIST=(0)
+PARCEL_NB_LIST=(0 1)
 LATENT_DIMS=(5)
 NO_RSAMPLES=("true")
 IND_SOURCES=("reference")
