@@ -35,9 +35,9 @@ else
 fi
 
 # ---- resource limits ------------------------------------------------------
-MEM=48G
-CPU=4
-GPU=0.5
+MEM=24G
+CPU=2
+GPU=0.2
 
 # ---- FAISS CPU-only toggle ------------------------------------------------
 # FAISS_CPU=1 forces all FAISS KNN work (graph build, searches, reconstruction)
@@ -111,6 +111,13 @@ ATLAS_LEVEL=${ATLAS_LEVEL:-15}
 S3_ANNOTATION_FILE="/s3/mlibra/mlibra-data/level_${ATLAS_LEVEL}annot.npy"
 S3_SLICES_DATASET_FILE="/myhome/mlibra/maldi/data/splits/fold_3.json"
 S3_AVAILABLE_LIPIDS_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy"
+# Parcel fields live on S3 so a sweep builds each one ONCE and every later job
+# reuses it. parcelgp.build verifies the cached field's recorded parameters
+# before reuse and writes atomically (temp + rename), so concurrent jobs racing
+# to build the same field cannot corrupt it -- the losers just rewrite identical
+# bytes. At stride 4 a build is ~15s; at stride 1 it is far longer, so prebuild
+# those (see PARCEL_PREBUILD_CMD printed at the end).
+S3_PARCEL_DIR="${S3_PARCEL_DIR:-/s3/mlibra/mlibra-data/artiom/parcels}"
 SRC_PATH="/myhome/mlibra"
 
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
@@ -206,6 +213,74 @@ submit() {
         -e MKL_NUM_THREADS="$CPU" \
         -e OMP_WAIT_POLICY=passive \
         -- ./maldi/run_lgp_per_lipid.sh "${extra_args[@]}"
+}
+
+# ---- one PARCEL submission ------------------------------------------------
+# Runs ./parcelgp/run_parcel.sh (per-lipid GP + reference-only parcel factor)
+# rather than ./maldi/run_lgp_per_lipid.sh. The parcel factor multiplies the
+# spatial kernel by exp(-||z(x)-z(x')||^2/2) with z(x)=m(x)^T B; the partition
+# comes from the reference image alone and only B is learned.
+#
+# MODE=parcel is hardcoded: run_parcel.sh defaults to MODE=both, which would run
+# an identical baseline inside EVERY job of the sweep -- N times the compute, all
+# writing the same baseline directory. The baseline is an ordinary no-parcel run;
+# take it from the euclidean sweep above or from an existing per_lipid_cv run with
+# matching hyperparameters (parcelgp.compare pairs them per lipid).
+submit_parcel() {
+    local job_name=$1 prefix=$2 slice=$3
+    local features=$4 n_parcels=$5 spatial_weight=$6 stride=$7
+    local rank=$8 normalize_blocks=$9 init_scale=${10} shared_b=${11}
+    shift 11
+    local extra_args=("$@")
+
+    echo ">>> Submitting $job_name"
+    run_or_echo runai training submit "$job_name" \
+        -i artiomartiom/sdsc:withfaiss \
+        --image-pull-policy Always \
+        --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
+        --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
+        --gpu-request-type portion --gpu-portion-request "$GPU" \
+        -e EXP_PREFIX="$prefix" \
+        -e WANDB_API_KEY="$WANDB_API_KEY" \
+        -e SRC_PATH="$SRC_PATH" \
+        -e DATA_PATH="$S3_DATA_PATH" \
+        -e OUTPUT_DIR="$S3_PARCEL_OUTPUT_DIR" \
+        -e MALDI_FILE="$S3_MALDI_FILE" \
+        -e SLICES_DATASET_FILE="$slice" \
+        -e AVAILABLE_LIPIDS_FILE="$S3_AVAILABLE_LIPIDS_FILE" \
+        -e TEMPLATE_NAME="$S3_TEMPLATE_NAME" \
+        -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
+        -e LIPIDS_FILE="$LIPIDS_FILE" \
+        -e MODE="parcel" \
+        -e PARCEL_DIR="$S3_PARCEL_DIR" \
+        -e PARCEL_FEATURES="$features" \
+        -e N_PARCELS="$n_parcels" \
+        -e SPATIAL_WEIGHT="$spatial_weight" \
+        -e STRIDE="$stride" \
+        -e THRESHOLD="${PARCEL_THRESHOLD:-5}" \
+        -e NORMALIZE_BLOCKS="$normalize_blocks" \
+        -e PARCEL_RANK="$rank" \
+        -e PARCEL_INIT_SCALE="$init_scale" \
+        -e PARCEL_SHARED_B="$shared_b" \
+        -e KERNEL_FAMILY="${PARCEL_KERNEL_FAMILY:-euclidean}" \
+        -e KERNEL="matern" \
+        -e NU="${PARCEL_NU:-2.5}" \
+        -e NO_ARD="${PARCEL_NO_ARD:-0}" \
+        -e NUM_INDUCING="$NUM_INDUCING" \
+        -e INDUCING_SOURCE="${PARCEL_INDUCING_SOURCE:-data}" \
+        -e LIPID_BATCH_SIZE="$LIPID_BATCH_SIZE" \
+        -e EPOCHS="$EPOCHS" \
+        -e LEARNING_RATE="$LEARNING_RATE" \
+        -e BATCH_SIZE="$BATCH_SIZE" \
+        -e SEED="${PARCEL_SEED:-42}" \
+        -e DEVICE="cuda" \
+        -e WANDB="${WANDB:-0}" \
+        -e WANDB_PROJECT="${WANDB_PROJECT:-l3di_maldi_per_lipid}" \
+        -e OMP_NUM_THREADS="$CPU" \
+        -e OPENBLAS_NUM_THREADS="$CPU" \
+        -e MKL_NUM_THREADS="$CPU" \
+        -e OMP_WAIT_POLICY=passive \
+        -- ./parcelgp/run_parcel.sh "${extra_args[@]}"
 }
 
 # =============================================================================
@@ -327,6 +402,34 @@ RUN_EIGENMAP=0
 SPECTRAL_NU=(2)
 RUN_SPECTRAL=1
 
+
+# ---- PARCEL sweep (reference-only parcellation, per-lipid) ----------------
+# The cross-product below is the ablation grid. Every axis is a bash array, so
+# edit in place to sweep; a single-element array pins that axis.
+#
+# What each axis buys, and what it costs in jobs:
+#   PARCEL_SW_LIST   the highest-leverage build knob. 3 features vs 16 means
+#                    sw=1 gives geometry only 16% of the k-means distance and
+#                    sw=3 gives it 63%; sw~2.3 is the 50/50 point.
+#   PARCEL_FEAT_LIST 'full' vs 'spatial' is THE control arm — if 'spatial'
+#                    (no appearance features at all) wins equally, the gain is
+#                    soft spatial partitioning and not the reference image.
+#   PARCEL_NB_LIST   0/1 = weight each feature vs each descriptor block equally.
+#   PARCEL_RANK_LIST width of the learned parcel embedding. r=2 is the
+#                    interpretable one (the 128 parcels plot in 2-D).
+#
+# Job count = folds x features x K x sw x stride x rank x nb, PLUS one baseline
+# per fold. Keep it honest: the default grid below is already 2x2x2 = 8 per fold.
+PARCEL_FEAT_LIST=("full" "spatial")
+PARCEL_K_LIST=(64 128 192)
+PARCEL_SW_LIST=(1.0 3.0)
+PARCEL_STRIDE_LIST=(4)
+PARCEL_RANK_LIST=(8)
+PARCEL_NB_LIST=(0)
+PARCEL_INIT_SCALE=${PARCEL_INIT_SCALE:-0.05}
+PARCEL_SHARED_B=${PARCEL_SHARED_B:-0}
+RUN_PARCEL=${RUN_PARCEL:-0}
+S3_PARCEL_OUTPUT_DIR="${S3_PARCEL_OUTPUT_DIR:-/s3/mlibra/mlibra-data/artiom/parcel_per_lipid_cv}"
 
 exp_num=1
 for fold in "${FOLDS[@]}"; do
@@ -542,6 +645,29 @@ for fold in "${FOLDS[@]}"; do
                 "$sp_infl" "${MAN_THRESHOLDS[0]}" \
                 "$fold_upper" "$SLICES_DATASET_FILE" "$sp_stride" "$sp_modes" "0" "1"
             exp_num=$((exp_num + 1))
+        done
+    fi
+
+    # ---- PARCEL loop ------------------------------------------------------
+    if [ "$RUN_PARCEL" = "1" ]; then
+        for feat in "${PARCEL_FEAT_LIST[@]}"; do
+          for k in "${PARCEL_K_LIST[@]}"; do
+            for sw in "${PARCEL_SW_LIST[@]}"; do
+              for stride in "${PARCEL_STRIDE_LIST[@]}"; do
+                for rank in "${PARCEL_RANK_LIST[@]}"; do
+                  for nb in "${PARCEL_NB_LIST[@]}"; do
+                    job_name="gp-parcel-${EXP_SUFFIX}-${exp_num}"
+                    printf "  exp %2d: %-22s feat=%-7s K=%-4s sw=%-4s stride=%s r=%-2s nb=%s fold=%s\n" \
+                        "$exp_num" "parcel" "$feat" "$k" "$sw" "$stride" "$rank" "$nb" "$fold"
+                    submit_parcel "$job_name" "$fold_upper" "$SLICES_DATASET_FILE" \
+                        "$feat" "$k" "$sw" "$stride" "$rank" "$nb" \
+                        "$PARCEL_INIT_SCALE" "$PARCEL_SHARED_B"
+                    exp_num=$((exp_num + 1))
+                  done
+                done
+              done
+            done
+          done
         done
     fi
 done

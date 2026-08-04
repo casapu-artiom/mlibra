@@ -91,6 +91,17 @@ from manifold_gp.utils.anatomical_knn import (
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from manifold_gp.kernels.surface_kernels import SurfaceRiemannMaternKernel
 
+# Reference-only parcel geometry (--parcel-field). Self-contained package at the
+# repo root; the path shim covers environments whose editable install predates it
+# (a fresh `pip install -e .` picks it up automatically via `packages = find:`).
+try:
+    from parcelgp.field import ParcelField
+    from parcelgp.kernels import wrap_scale_kernel
+except ModuleNotFoundError:                                          # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from parcelgp.field import ParcelField
+    from parcelgp.kernels import wrap_scale_kernel
+
 
 # =============================================================================
 # CLI parsing — strict superset of lgp_*_experiment.py flags
@@ -211,6 +222,27 @@ def parse_args() -> dict:
                    default=None,
                    help="Initial kernel lengthscale (z-units). Default: gpytorch "
                         "default (~0.69). Smaller favours more local covariance.")
+
+    # ---- reference-only parcel factor (parcelgp) ----
+    p.add_argument("--parcel-field", dest="parcel_field", default=None,
+                   help="Path to a parcelgp .npz parcel field. When set, the "
+                        "spatial kernel is multiplied by a learned parcel-similarity "
+                        "factor exp(-||z(x)-z(x')||^2/2), z(x)=m(x)^T B — letting "
+                        "covariance break across a template-derived boundary and "
+                        "reach across a gap within a region, which no stationary "
+                        "kernel can express. The partition is reference-only; only "
+                        "B is learned. Build one with `python -m parcelgp.build`.")
+    p.add_argument("--parcel-rank", dest="parcel_rank", type=int, default=8,
+                   help="(--parcel-field) width r of the learned parcel embedding.")
+    p.add_argument("--parcel-init-scale", dest="parcel_init_scale", type=float,
+                   default=0.05,
+                   help="(--parcel-field) std of the B init. Small keeps training "
+                        "starting at the unmodified base kernel; 0.0 makes the "
+                        "factor an exact no-op at init.")
+    p.add_argument("--parcel-shared-B", dest="parcel_per_task",
+                   action="store_false", default=True,
+                   help="(--parcel-field) share one B across the lipid batch "
+                        "instead of one per lipid.")
     p.add_argument("--lengthscale-no-decay", dest="lengthscale_no_decay",
                    action="store_true",
                    help="Exclude raw_lengthscale / raw_graphbandwidth from AdamW "
@@ -1261,6 +1293,13 @@ def _kernel_hypers_for_log(model):
             out["kernel/lengthscale_mean"] = float(np.mean(ls))
         if gb:
             out["kernel/graphbandwidth_mean"] = float(np.mean(gb))
+        # Parcel factor: offdiag_mean is the mean covariance multiplier between
+        # DIFFERENT parcels. It starts at ~1 (no-op) and falls as the model learns
+        # to stop smoothing across borders — the single number that says whether
+        # the factor is doing anything at all.
+        for m in model.modules():
+            if hasattr(m, "factor_stats"):
+                out.update(m.factor_stats())
     except Exception:
         pass
     return out
@@ -1274,6 +1313,7 @@ def train_lipid_batch(
     config: MaldiConfig,
     args: dict,
     manifold_kernel=None,         # if None → Euclidean path
+    parcel_field=None,            # optional parcelgp.ParcelField
     device: str,
     log: logging.Logger,
     pbar_desc: str,
@@ -1392,6 +1432,25 @@ def train_lipid_batch(
             if isinstance(m, RiemannMaternKernel):
                 m.lengthscale = torch.tensor(float(ls_init))
         log.info(f"  lengthscale init = {ls_init}")
+
+    # Parcel factor. Wrapped INSIDE the ScaleKernel (see wrap_scale_kernel) so
+    # covar_module stays a ScaleKernel and _register_hyperpriors below still
+    # finds outputscale/lengthscale where it expects them. Applied before the
+    # optimizer is built so B is picked up as a trainable parameter.
+    if parcel_field is not None:
+        covar = getattr(model, "covar_module", None)
+        if not isinstance(covar, gpytorch.kernels.ScaleKernel):
+            raise ValueError(
+                f"--parcel-field needs a ScaleKernel covar_module to wrap, got "
+                f"{type(covar).__name__}. The euclidean and manifold families "
+                f"both provide one; check --kernel-family.")
+        wrap_scale_kernel(
+            covar, parcel_field, num_tasks=n_tasks,
+            rank=int(args.get("parcel_rank", 8)),
+            init_scale=float(args.get("parcel_init_scale", 0.05)),
+            per_task=bool(args.get("parcel_per_task", True)),
+        )
+        model.to(device)
 
     # Per-task observation noise model — the GaussianLikelihood analogue of
     # LGP's log_var_n (task_noises = noise variance per task, init 1.0).
@@ -2660,6 +2719,22 @@ def main():
     # + eigenpairs: 'manifold' uses the Riemann kernel directly, 'eigenmap'
     # uses the eigenfunctions as input features, 'spectral' uses them as the
     # weight-space basis) ----
+    # ---- reference-only parcel field (--parcel-field) ----
+    # Loaded once here and shared by every lipid batch: the KD-tree build and the
+    # membership arrays are per-field, not per-batch. Its node coordinates are in
+    # the same standardized frame as coords_train (parcelgp.volume mirrors
+    # utils.coord_norm_from_reference), so no re-scaling is needed.
+    parcel_field = None
+    if args.get("parcel_field"):
+        parcel_field = ParcelField.load(args["parcel_field"])
+        log.info(
+            "parcel field: %s — %d nodes, %d parcels, built from %s (stride %s, "
+            "features %s)", args["parcel_field"],
+            parcel_field.node_coords.shape[0], parcel_field.n_parcels,
+            parcel_field.meta.get("reference_file", "?"),
+            parcel_field.meta.get("stride", "?"),
+            parcel_field.meta.get("features", "?"))
+
     needs_graph = args["kernel_family"] in ("manifold", "eigenmap", "spectral")
     manifold_ctx = None
     if needs_graph:
@@ -3178,6 +3253,7 @@ def main():
                     config=config,
                     args=args_for_batch,
                     manifold_kernel=mk,
+                    parcel_field=parcel_field,
                     device=args["device"],
                     log=log,
                     pbar_desc=f"batch {batch_i+1}/{n_batches}",
