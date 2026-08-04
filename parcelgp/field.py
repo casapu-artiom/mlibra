@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +33,45 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 log = logging.getLogger(__name__)
+
+
+def publish_file(src, dest) -> Path:
+    """Copy a locally-written file to ``dest``, atomically where the filesystem allows.
+
+    Two constraints have to be satisfied at once:
+
+    * **S3-fuse mounts cannot seek.** ``np.savez_compressed`` writes a ZIP, and
+      closing a ZIP seeks back to write the central directory, so writing the
+      archive *directly* to /s3/... dies with ``OSError: [Errno 95] Operation not
+      supported``. The archive must therefore be built on local disk and then
+      copied over sequentially, which S3 does support.
+    * **Concurrent writers.** A batch sweep starts many jobs at once, none sees a
+      cached field, and all build and write the same path. Staging under a
+      per-process name and renaming means the losers just rewrite identical bytes
+      and no reader ever sees a partial file.
+
+    Rename is not universally supported on fuse mounts either, so the atomic path
+    is attempted and a plain copy is the fallback. The fallback keeps a small
+    window where a reader could see a partially written file -- unavoidable on a
+    filesystem without rename, and harmless in practice because a torn read fails
+    loudly at ``np.load`` rather than returning wrong data.
+    """
+    src, dest = Path(src), Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staged = dest.with_name(f"{dest.name}.tmp.{os.getpid()}")
+    try:
+        shutil.copyfile(src, staged)
+        os.replace(staged, dest)
+        return dest
+    except OSError as e:
+        log.debug("atomic publish unavailable on %s (%s); falling back to copy",
+                  dest.parent, e)
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+    shutil.copyfile(src, dest)
+    return dest
 
 
 @dataclass
@@ -127,25 +168,26 @@ class ParcelField:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-        np.savez_compressed(
-            tmp,
-            node_coords=self.node_coords, labels=self.labels,
-            mem_idx=self.mem_idx, mem_val=self.mem_val,
-            d_border_z=self.d_border_z, d_border_rel=self.d_border_rel,
-            nearest_other=self.nearest_other,
-            n_parcels=np.array(self.n_parcels),
-            node_vox=(self.node_vox if self.node_vox is not None
-                      else np.zeros((0, 3), np.int32)),
-            volume_shape=np.array(self.volume_shape or (0, 0, 0)),
-            meta=np.array(json.dumps(self.meta)),
-        )
-        # np.savez_compressed appends .npz when the target has no suffix; our
-        # temp name ends in .tmp.<pid>, so it does. Resolve either spelling.
-        written = tmp if tmp.exists() else tmp.with_name(tmp.name + ".npz")
-        os.replace(written, path)
-        log.info("wrote parcel field -> %s (%d nodes, %d parcels)",
-                 path, self.node_coords.shape[0], self.n_parcels)
+        # Build the archive on LOCAL disk: np.savez_compressed seeks, and S3-fuse
+        # mounts do not support seeking. Then publish it across.
+        with tempfile.TemporaryDirectory(prefix="parcelgp-") as td:
+            tmp = Path(td) / "field.npz"
+            np.savez_compressed(
+                tmp,
+                node_coords=self.node_coords, labels=self.labels,
+                mem_idx=self.mem_idx, mem_val=self.mem_val,
+                d_border_z=self.d_border_z, d_border_rel=self.d_border_rel,
+                nearest_other=self.nearest_other,
+                n_parcels=np.array(self.n_parcels),
+                node_vox=(self.node_vox if self.node_vox is not None
+                          else np.zeros((0, 3), np.int32)),
+                volume_shape=np.array(self.volume_shape or (0, 0, 0)),
+                meta=np.array(json.dumps(self.meta)),
+            )
+            mb = tmp.stat().st_size / 1e6
+            publish_file(tmp, path)
+        log.info("wrote parcel field -> %s (%d nodes, %d parcels, %.0f MB)",
+                 path, self.node_coords.shape[0], self.n_parcels, mb)
         return path
 
     @classmethod

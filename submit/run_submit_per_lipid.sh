@@ -378,7 +378,7 @@ INDUCING_DENSITY_FRAC=0.8       # frac from densest graph nodes (rest = cheapest
 MAN_LEARN_INDUCING=(0)
 WANDB=1                        # log loss/KL/hypers/noise/grad-norms (incl. inducing) to W&B
 WANDB_PROJECT=l3di_maldi_per_lipid
-RUN_MANIFOLD=1
+RUN_MANIFOLD=0
 
 # ---- Eigenmap sweep -------------------------------------------------------
 # 'eigenmap' projects coordinates into the leading EIGENMAP_EMBED_DIMS Laplacian
@@ -400,7 +400,7 @@ RUN_EIGENMAP=0
 # nu and the diffusion scale (DIFFUSION_SCALE_INIT / LEARN_DIFFUSION_SCALE,
 # shared with the manifold config above) are the meaningful axes.
 SPECTRAL_NU=(2)
-RUN_SPECTRAL=1
+RUN_SPECTRAL=0
 
 
 # ---- PARCEL sweep (reference-only parcellation, per-lipid) ----------------
@@ -421,14 +421,14 @@ RUN_SPECTRAL=1
 # Job count = folds x features x K x sw x stride x rank x nb, PLUS one baseline
 # per fold. Keep it honest: the default grid below is already 2x2x2 = 8 per fold.
 PARCEL_FEAT_LIST=("full" "spatial")
-PARCEL_K_LIST=(64 128 192)
-PARCEL_SW_LIST=(1.0 3.0)
-PARCEL_STRIDE_LIST=(4)
+PARCEL_K_LIST=(128 192)
+PARCEL_SW_LIST=(3.0)
+PARCEL_STRIDE_LIST=(2 4)
 PARCEL_RANK_LIST=(8)
-PARCEL_NB_LIST=(0)
+PARCEL_NB_LIST=(0 1)
 PARCEL_INIT_SCALE=${PARCEL_INIT_SCALE:-0.05}
 PARCEL_SHARED_B=${PARCEL_SHARED_B:-0}
-RUN_PARCEL=${RUN_PARCEL:-0}
+RUN_PARCEL=${RUN_PARCEL:-1}
 S3_PARCEL_OUTPUT_DIR="${S3_PARCEL_OUTPUT_DIR:-/s3/mlibra/mlibra-data/artiom/parcel_per_lipid_cv}"
 
 exp_num=1

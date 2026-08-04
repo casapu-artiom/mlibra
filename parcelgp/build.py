@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,7 +27,7 @@ import numpy as np
 
 from .border import border_distance
 from .features import FEATURE_VERSION, FeatureSpec, template_features
-from .field import ParcelField
+from .field import ParcelField, publish_file
 from .parcellate import parcellate
 from .volume import (LR_AXIS, coord_norm_from_reference, load_reference,
                      midline_mm, node_coords_mm, node_voxels, standardize,
@@ -234,9 +235,10 @@ def main(argv=None):
     # Same atomic dance for the sidecar: check_cached reads it, and a torn
     # write there would make a good field look unverifiable.
     meta_path = Path(str(out) + ".meta.json")
-    meta_tmp = meta_path.with_name(f"{meta_path.name}.tmp.{os.getpid()}")
-    meta_tmp.write_text(json.dumps(field.meta, indent=2))
-    os.replace(meta_tmp, meta_path)
+    with tempfile.TemporaryDirectory(prefix="parcelgp-meta-") as td:
+        local = Path(td) / "meta.json"
+        local.write_text(json.dumps(field.meta, indent=2))
+        publish_file(local, meta_path)
     print(json.dumps(field.meta, indent=2))
 
 
