@@ -81,6 +81,13 @@ NB_ARG=""; NB_TAG=""
 # (they get it automatically — the selection is in common_args).
 : "${LIPIDS_FILE:=$SRC_PATH/maldi/data/lipid_subset.txt}"                # text file, one lipid name per line
 : "${LIMIT:=}"                      # fit only the first N lipids (smoke tests)
+# ---- rendering ----
+# lgp_experiment_per_lipid.py renders by DEFAULT; stated explicitly here so both
+# parcelgp runners declare the same behaviour instead of one inheriting it
+# silently. RENDER_MAX_LIPIDS caps how many trained lipids get a PNG.
+: "${RENDER:=1}"
+: "${RENDER_MAX_LIPIDS:=8}"
+
 : "${WANDB:=0}"
 : "${WANDB_PROJECT:=l3di_parcel}"
 
@@ -125,6 +132,11 @@ common_args=(
 [ "$NO_ARD" = "1" ] && common_args+=(--no-ard)
 [ -n "$LIPIDS_FILE" ] && common_args+=(--lipids-file "$LIPIDS_FILE")
 [ -n "$LIMIT" ] && common_args+=(--limit "$LIMIT")
+if [ "$RENDER" = "1" ]; then
+    common_args+=(--render --render-max-lipids "$RENDER_MAX_LIPIDS")
+else
+    common_args+=(--no-render)
+fi
 [ "$WANDB" = "1" ] && common_args+=(--wandb --wandb-project "$WANDB_PROJECT")
 
 # Both arms encode the shared hyperparameters in their name, so a sweep over

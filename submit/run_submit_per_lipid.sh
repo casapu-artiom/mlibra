@@ -274,6 +274,8 @@ submit_parcel() {
         -e BATCH_SIZE="$BATCH_SIZE" \
         -e SEED="${PARCEL_SEED:-42}" \
         -e DEVICE="cuda" \
+        -e RENDER="${RENDER:-1}" \
+        -e RENDER_MAX_LIPIDS="${RENDER_MAX_LIPIDS:-8}" \
         -e WANDB="${WANDB:-0}" \
         -e WANDB_PROJECT="${WANDB_PROJECT:-l3di_maldi_per_lipid}" \
         -e OMP_NUM_THREADS="$CPU" \

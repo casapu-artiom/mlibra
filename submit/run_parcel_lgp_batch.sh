@@ -118,7 +118,7 @@ submit() {
         -e LEARN_INDUCING="${LEARN_INDUCING:-true}" \
         -e ARD="${ARD:-true}" \
         -e LOG_TRANSFORM="${LOG_TRANSFORM:-true}" \
-        -e DO_BRAIN_RECONSTRUCTION="${DO_BRAIN_RECONSTRUCTION:-0}" \
+        -e DO_BRAIN_RECONSTRUCTION="${DO_BRAIN_RECONSTRUCTION:-1}" \
         -e RENDER_VOXELS_ONLY="${RENDER_VOXELS_ONLY:-1}" \
         -e OMP_NUM_THREADS="$CPU" \
         -e OPENBLAS_NUM_THREADS="$CPU" \

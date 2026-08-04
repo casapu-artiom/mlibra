@@ -42,7 +42,7 @@ set -euo pipefail
 : "${PARCEL_DIR:=$DATA_PATH/parcels}"
 : "${N_PARCELS:=128}"
 : "${PARCEL_FEATURES:=full}"        # full | simple | spatial
-: "${SPATIAL_WEIGHT:=1.0}"          # 2.3 balances geometry vs appearance 50/50
+: "${SPATIAL_WEIGHT:=3.0}"          # 2.3 balances geometry vs appearance 50/50
 : "${STRIDE:=4}"
 : "${THRESHOLD:=5}"
 # 1 = weight each descriptor BLOCK equally in the k-means distance instead of
@@ -69,7 +69,7 @@ NB_ARG=""; NB_TAG=""
 : "${NU:=1.5}"                      # Euclidean Matern accepts 0.5 | 1.5 | 2.5
 : "${N_PIXELS:=10}"                 # sets the lengthscale floor
 : "${BATCH_SIZE:=1000}"
-: "${N_EPOCHS:=10}"
+: "${N_EPOCHS:=2}"
 : "${LEARNING_RATE:=0.001}"
 : "${SEED:=416465}"
 : "${MODE_ARG:=lgp}"                # MaldiConfig 'mode'
@@ -77,10 +77,16 @@ NB_ARG=""; NB_TAG=""
 : "${LEARN_INDUCING:=true}"
 : "${ARD:=true}"
 : "${LOG_TRANSFORM:=true}"
-: "${DO_BRAIN_RECONSTRUCTION:=0}"
-: "${RENDER_VOXELS_ONLY:=1}"
+: "${DO_BRAIN_RECONSTRUCTION:=1}"   # 1 = whole-brain volumes + rendered figures
+                                    # (restricted to RECONSTRUCTION_LIPIDS_FILE below;
+                                    #  set 0 for a metrics-only sweep)
+: "${RENDER_VOXELS_ONLY:=1}"        # (reconstruction) only the voxels the figure reads
+# Which lipids get reconstructed/rendered. Reconstruction is O(voxels x lipids)
+# over the whole brain -- 34M voxels at stride 1 -- so it MUST be restricted to a
+# subset or it dominates the run. One lipid name per line; '#' comments ignored.
+: "${RECONSTRUCTION_LIPIDS_FILE:=$SRC_PATH/maldi/data/lipid_subset.txt}"
 
-: "${MODE:=both}"                   # both | parcel | baseline
+: "${MODE:=parcel}"                   # both | parcel | baseline
 
 # =============================================================================
 mkdir -p "$PARCEL_DIR"
@@ -112,8 +118,35 @@ fi
 # NOTE: MaldiConfig itself appends N_PIXELS and '_log' to exp_name, so those two
 # are already in the directory name and are deliberately not repeated here.
 [ "$LOG_TRANSFORM" = "true" ] || [ "$LOG_TRANSFORM" = "1" ] && flags+=(--log-transform)
-[ "$DO_BRAIN_RECONSTRUCTION" = "1" ] && flags+=(--do-brain-reconstruction)
-[ "$RENDER_VOXELS_ONLY" = "1" ] && flags+=(--render-voxels-only)
+if [ "$DO_BRAIN_RECONSTRUCTION" = "1" ]; then
+    flags+=(--do-brain-reconstruction)
+    [ "$RENDER_VOXELS_ONLY" = "1" ] && flags+=(--render-voxels-only)
+    # --reconstruction-lipids is nargs='+', and lipid names contain spaces
+    # ("PC 35:1 PE 38:1"), so each line must become ONE argv entry. Reading into
+    # a bash array does that correctly; run_final.sh achieves the same with an
+    # IFS=newline trick, which is easier to break.
+    if [ -f "$RECONSTRUCTION_LIPIDS_FILE" ]; then
+        recon=()
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            # Trim CR (Windows line endings) and surrounding whitespace, matching
+            # run_final.sh's python line.strip(). lipid_subset.txt contains a
+            # whitespace-ONLY line, which would otherwise be passed through as a
+            # lipid named " " and silently match nothing.
+            _line="${_line%$'\r'}"
+            _line="${_line#"${_line%%[![:space:]]*}"}"
+            _line="${_line%"${_line##*[![:space:]]}"}"
+            case "$_line" in ''|\#*) continue ;; esac
+            recon+=("$_line")
+        done < "$RECONSTRUCTION_LIPIDS_FILE"
+        if [ ${#recon[@]} -gt 0 ]; then
+            flags+=(--reconstruction-lipids "${recon[@]}")
+            echo "== reconstructing ${#recon[@]} lipid(s) from $(basename "$RECONSTRUCTION_LIPIDS_FILE")"
+        fi
+    else
+        echo "WARNING: RECONSTRUCTION_LIPIDS_FILE=$RECONSTRUCTION_LIPIDS_FILE not found;" >&2
+        echo "         reconstruction will run over ALL lipids, which is very slow." >&2
+    fi
+fi
 
 # Every knob above that changes the fitted model appears here. The fold comes
 # from the splits file's basename so runs on different folds never collide.
