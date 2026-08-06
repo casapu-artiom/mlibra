@@ -77,6 +77,13 @@ from lgp_metrics import METRIC_COLS, LOWER_IS_BETTER, load_or_compute  # shared 
 
 # Leading fold token, e.g. 'FOLD-3-', 'fold_3-', 'difficult-'.
 _FOLD_PREFIX_RE = re.compile(r"^(fold[-_]?\d+|difficult)[-_]", re.IGNORECASE)
+# The same token ANYWHERE in the name, with the separator on either side. The
+# LGP-family runners (maldi/run_final.sh, parcelgp/run_latent.sh) build
+# '<EXP_PREFIX>-LGP-<splits-file-stem>-d5-...', so the fold appears a second time
+# in the MIDDLE of exp_name — stripping only the leading token leaves every fold
+# of one configuration as a model of its own, which is not what the per-model
+# tables are for.
+_FOLD_TOKEN_RE = re.compile(r"[-_]?\b(fold[-_]?\d+|difficult)\b[-_]?", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +112,7 @@ def derive_fold(run_dir: Path, args: dict | None) -> str:
             m = _FOLD_PREFIX_RE.match(str(exp))
             if m:
                 return m.group(1)
-    m = _FOLD_PREFIX_RE.match(run_dir.name)
+    m = _FOLD_PREFIX_RE.match(run_dir.name) or _FOLD_TOKEN_RE.search(run_dir.name)
     return m.group(1) if m else "?"
 
 
@@ -171,10 +178,11 @@ def derive_family(run_dir: Path, args: dict | None) -> str:
 
 
 def derive_model(run_dir: Path, args: dict | None) -> str:
-    """Full configuration label (exp_name minus the leading fold token), so the
-    same config under different folds collapses to one model."""
+    """Full configuration label (exp_name minus EVERY fold token, wherever it
+    sits), so the same config scored under different folds collapses to one
+    model instead of one model per fold."""
     name = str((args or {}).get("exp_name") or run_dir.name)
-    return _FOLD_PREFIX_RE.sub("", name, count=1)
+    return _FOLD_TOKEN_RE.sub("-", name).strip("-_")
 
 
 # ---------------------------------------------------------------------------

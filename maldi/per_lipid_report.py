@@ -193,17 +193,22 @@ def _prefix_from_exp(name: str) -> str:
 
 # Leading fold token in a run/exp name, e.g. 'FOLD-3-', 'fold_3-', 'difficult-'.
 _FOLD_PREFIX_RE = re.compile(r"^(fold[-_]?\d+|difficult)[-_]", re.IGNORECASE)
+# The same token ANYWHERE in the name, with the separator on either side. Some
+# runners (maldi/run_final.sh, parcelgp/run_latent.sh) put the splits-file stem
+# in the MIDDLE of exp_name as well, so stripping only the leading token leaves
+# every fold of one configuration as a model of its own.
+_FOLD_TOKEN_RE = re.compile(r"[-_]?\b(fold[-_]?\d+|difficult)\b[-_]?", re.IGNORECASE)
 
 
 def derive_model(run_dir: Path, config: dict | None) -> str:
     """Full model-configuration label, stable across folds.
 
-    This is the run/exp name with any leading fold token stripped, so the same
-    configuration scored under different folds collapses to one model. Prefers
-    config['exp_name'] (the canonical config string) over the dir name.
+    This is the run/exp name with EVERY fold token stripped, wherever it sits, so
+    the same configuration scored under different folds collapses to one model.
+    Prefers config['exp_name'] (the canonical config string) over the dir name.
     """
     name = str((config or {}).get("exp_name") or run_dir.name)
-    return _FOLD_PREFIX_RE.sub("", name, count=1)
+    return _FOLD_TOKEN_RE.sub("-", name).strip("-_")
 
 
 def load_run(run_dir: Path, source: str = "") -> dict | None:
