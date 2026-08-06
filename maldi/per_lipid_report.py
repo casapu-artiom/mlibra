@@ -20,6 +20,15 @@ when >1 root is given), and emits:
 
 Optionally dumps the long per-lipid table and the per-run/per-fold tables to CSV.
 
+parcelgp runs
+-------------
+Runs from ``parcelgp/run_parcel.sh`` are ordinary per-lipid runs with an extra
+``--parcel-field``, and the parcel factor wraps the SAME kernel — so they report
+``kernel_family='euclidean'`` and used to be indistinguishable from the baseline
+they ablate. Their kernel_family is now suffixed ``+parcel`` (so the arms group
+separately everywhere), and a ``parcel`` column showing the field/rank they used
+appears in the per-run table whenever such a run is loaded.
+
 Comparison with the whole-brain ("full") LGP models
 ---------------------------------------------------
 Pass ``--full-lgp-root`` (one or more roots of whole-brain runs, i.e. dirs
@@ -100,7 +109,11 @@ _SOTA_DESC = {
 def full_lgp_description(family: str) -> str:
     """Readable description of a whole-brain model, from its lgp_report family
     label (lgp / manifold / spectral / gplfr-<base> / sota-<method> /
-    baseline-<model>). Falls back to the family string for anything unrecognised."""
+    baseline-<model>, optionally with a '+parcel' suffix). Falls back to the
+    family string for anything unrecognised."""
+    if family.endswith("+parcel"):
+        return (full_lgp_description(family[: -len("+parcel")])
+                + " + reference-only parcel factor")
     if family in _FULL_LGP_DESC:
         return _FULL_LGP_DESC[family]
     if family.startswith("gplfr"):
@@ -122,6 +135,32 @@ def _lipid_col(df: pd.DataFrame) -> str | None:
         if col in df.columns:
             return col
     return None
+
+
+def derive_parcel(run_dir: Path, config: dict | None) -> str:
+    """The parcelgp factor the run carried, ``''`` if it carried none.
+
+    A parcelgp run (``parcelgp/run_parcel.sh`` -> ``--parcel-field``) wraps the
+    parcel factor around the SAME kernel, so it still records
+    ``kernel_family='euclidean'``: nothing tells it apart from the baseline it
+    ablates unless the parcel field is read out explicitly. The label is the
+    field file's stem (which carries its build parameters) plus the embedding
+    rank.
+    """
+    field = (config or {}).get("parcel_field")
+    if not field:
+        # Runs synced without config.json: the runner puts the same settings in
+        # exp_name, so the directory name still shows it is a parcel run. Only
+        # the field is read back — config.py appends n_pixels to the directory
+        # name, so '-r8' + '10' is indistinguishable from a rank of 810.
+        m = re.search(r"-parcel([^-]+)", run_dir.name, re.IGNORECASE)
+        return m.group(1) if m else ""
+    bits = [Path(str(field)).stem]
+    if (config or {}).get("parcel_rank") is not None:
+        bits.append(f"r{config['parcel_rank']}")
+    if not (config or {}).get("parcel_per_task", True):  # --parcel-shared-B
+        bits.append("sharedB")
+    return "/".join(bits)
 
 
 def derive_fold(run_dir: Path, config: dict | None) -> str:
@@ -184,13 +223,19 @@ def load_run(run_dir: Path, source: str = "") -> dict | None:
     config = _load_json(run_dir / "config.json")
     summary = _load_json(run_dir / "summary.json")
 
+    # A parcelgp run reports the base kernel_family and would pool with the very
+    # run it ablates; the '+parcel' suffix keeps the two arms apart.
+    parcel = derive_parcel(run_dir, config)
+    kernel_family = (config or {}).get("kernel_family") \
+        or (summary or {}).get("kernel_family", "?")
+
     return {
         "run": run_dir.name,
         "source": source,
         "fold": derive_fold(run_dir, config),
         "model": derive_model(run_dir, config),
-        "kernel_family": (config or {}).get("kernel_family")
-        or (summary or {}).get("kernel_family", "?"),
+        "kernel_family": f"{kernel_family}+parcel" if parcel else kernel_family,
+        "parcel": parcel,
         "failed": (run_dir / "FAILED.txt").exists(),
         "n_lipids": int(len(df)),
         "wall_time_sec": float((summary or {}).get("wall_time_sec", float("nan"))),
@@ -288,8 +333,9 @@ def _long_from_runs(runs: list[dict], multi_source: bool = False) -> pd.DataFram
 
 def build_tables(runs: list[dict], metric: str):
     # Only surface the `source` (root) column when runs span >1 root, else it's
-    # constant clutter.
+    # constant clutter. Same for the parcel column: only when a parcelgp run is in.
     multi_source = len({r.get("source", "") for r in runs}) > 1
+    any_parcel = any(r.get("parcel") for r in runs)
 
     # ---- long per-lipid table (one row per lipid, tagged with run+fold) ----
     long_df = _long_from_runs(runs, multi_source)
@@ -304,6 +350,7 @@ def build_tables(runs: list[dict], metric: str):
             "fold": r["fold"],
             "kernel_family": r["kernel_family"],
             "failed": r["failed"],
+            **({"parcel": r.get("parcel") or "-"} if any_parcel else {}),
             "n_lipids": r["n_lipids"],
             "wall_time_sec": r["wall_time_sec"],
         })

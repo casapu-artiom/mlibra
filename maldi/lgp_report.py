@@ -17,6 +17,12 @@ them. Recognised families:
     * baseline-<model>— ``experiment_baselines.py``: baseline-mean / -linear /
                         -xgboost / -mlp / -mlp_eigen / -gcn / -gcn_faiss
                         (bottleneck runs -> baseline-bottleneck-<model>)
+    * <base>+parcel   — ``parcelgp/run_latent.sh`` -> ``parcelgp/lgp_parcel_experiment.py``:
+                        the same model with the reference-only parcel factor in the
+                        kernel (lgp+parcel, manifold+parcel, ...). The suffix keeps
+                        the parcel arm out of its own baseline's row — without it the
+                        run's exp_name still says LGP and the ablation pools with the
+                        thing it ablates. ``--family parcel`` selects them all.
 
 Unlike the per-lipid pipeline, these runs do NOT write a ``metrics.csv``. Each run
 dir instead holds:
@@ -34,6 +40,9 @@ So this script RECOMPUTES per-lipid metrics from those arrays (chunked, so a
   2. A TOTAL summary           (everything pooled).
   3. A PER-LIPID x PER-MODEL    table (aggregated across folds).
   4. A PER-RUN table           (one row per run dir).
+
+A ``parcel`` column (the field / rank the run used, ``-`` for runs without one)
+appears in the per-run table whenever a parcelgp run is loaded.
 
 Per-lipid metrics (computed per output column, then averaged per run):
     r2    1 - SSE/SST              (higher better; can be negative)
@@ -100,10 +109,38 @@ def derive_fold(run_dir: Path, args: dict | None) -> str:
     return m.group(1) if m else "?"
 
 
+def derive_parcel(run_dir: Path, args: dict | None) -> str:
+    """The parcelgp factor the run carried, ``''`` if it carried none.
+
+    A parcelgp run (``parcelgp/run_latent.sh`` -> ``--parcel-field``) wraps the
+    parcel factor around the SAME kernel, so its exp_name still says LGP and its
+    args still say matern: nothing tells it apart from the baseline it ablates
+    unless the parcel field is read out explicitly. The label is the field file's
+    stem (which carries its build parameters) plus the embedding rank.
+    """
+    field = (args or {}).get("parcel_field")
+    if not field:
+        # Runs synced without args.npy: the entrypoint appends the same settings
+        # to exp_name, so the directory name still shows it is a parcel run. Only
+        # the field is read back — config.py appends n_pixels to the directory
+        # name, so '-r8' + '10' is indistinguishable from a rank of 810.
+        m = re.search(r"-parcel([^-]+)", run_dir.name, re.IGNORECASE)
+        return m.group(1) if m else ""
+    bits = [Path(str(field)).stem]
+    if (args or {}).get("parcel_rank") is not None:
+        bits.append(f"r{args['parcel_rank']}")
+    if not (args or {}).get("parcel_per_task", True):  # --parcel-shared-B
+        bits.append("sharedB")
+    return "/".join(bits)
+
+
 def derive_family(run_dir: Path, args: dict | None) -> str:
     """Coarse model family, stable across folds:
-    lgp | manifold | spectral | gplfr-<base> | baseline-<model>."""
+    lgp | manifold | spectral | gplfr-<base> | baseline-<model>, with a
+    ``+parcel`` suffix when the run carried a parcelgp ``--parcel-field`` (else
+    the parcel arm would land in the family row of the run it ablates)."""
     name = str((args or {}).get("exp_name") or run_dir.name).upper()
+    parcel = "+parcel" if derive_parcel(run_dir, args) else ""
     model = (args or {}).get("model")
     base_gp = (args or {}).get("base_gp")
     if "BASELINE" in name:
@@ -112,25 +149,25 @@ def derive_family(run_dir: Path, args: dict | None) -> str:
             tag += "-bottleneck"
         if model:
             tag += f"-{model}"
-        return tag
+        return tag + parcel
     if "GPLFR" in name:
         # Split by the latent-GP kernel (euclidean / riemann / spectral) so the
         # kernels are comparable side by side rather than pooled into one "gplfr".
-        return f"gplfr-{base_gp}" if base_gp else "gplfr"
+        return (f"gplfr-{base_gp}" if base_gp else "gplfr") + parcel
     # SOTA 3D-reconstruction papers (run_sota.sh). All share a `sota-` prefix so
     # `--family sota` selects them together, but stay split by method.
     if "DEEPSPATIAL" in name:
-        return "sota-deepspatial"
+        return "sota-deepspatial" + parcel
     if "SOTA" in name or model in {"ntf", "spa3d"}:
         # ntf / spa3d go through run_sota.py; the `model` field IS the method.
-        return f"sota-{model}" if model else "sota"
+        return (f"sota-{model}" if model else "sota") + parcel
     if "MANIFOLD" in name:
-        return "manifold"
+        return "manifold" + parcel
     if "SPECTRAL" in name:
-        return "spectral"
+        return "spectral" + parcel
     if "LGPALL" in name or "LGP" in name:
-        return "lgp"
-    return str((args or {}).get("kernel", "?"))
+        return "lgp" + parcel
+    return str((args or {}).get("kernel", "?")) + parcel
 
 
 def derive_model(run_dir: Path, args: dict | None) -> str:
@@ -165,6 +202,7 @@ def load_run(run_dir: Path, split: str, chunk_rows: int,
         "fold": derive_fold(run_dir, args),
         "family": derive_family(run_dir, args),
         "model": derive_model(run_dir, args),
+        "parcel": derive_parcel(run_dir, args),
         "failed": (run_dir / "FAILED.txt").exists(),
         "n_lipids": int(len(df)),
         "n_test": int(df[n_col].max()) if n_col else 0,
@@ -223,6 +261,8 @@ def build_tables(runs: list[dict], metric: str):
     # Only surface the `source` (root) column when runs span >1 root, else it's
     # constant clutter.
     multi_source = len({r.get("source", "") for r in runs}) > 1
+    # Same idea for the parcel column: only shown when a parcelgp run is loaded.
+    any_parcel = any(r.get("parcel") for r in runs)
 
     long_parts = []
     for r in runs:
@@ -243,6 +283,8 @@ def build_tables(runs: list[dict], metric: str):
             row["source"] = r.get("source", "")
         row.update({"fold": r["fold"], "family": r["family"],
                     "failed": r["failed"], "n_lipids": r["n_lipids"], "n_test": r["n_test"]})
+        if any_parcel:
+            row["parcel"] = r.get("parcel") or "-"
         row.update(summarise(r["df"]))
         per_run_rows.append(row)
     per_run = pd.DataFrame(per_run_rows)
