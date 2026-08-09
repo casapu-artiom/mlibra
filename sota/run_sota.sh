@@ -128,6 +128,19 @@ WANDB_ARGS=""
 # this is what lets DS_MAX_CELLS_RECON=0 (dense) run without OOM. Lower if you OOM.
 : "${DS_RECON_BATCH:=8000}"
 : "${DS_N_SAMPLES:=100000}"
+# LOSO metric knobs (eval only -- these do NOT affect training, so they take
+# effect on a resumed checkpoint).
+#   DS_LOSO_K        = synthesized cells averaged per held voxel. The flow is
+#                      generative, so k=1 is a single Monte-Carlo draw whose
+#                      variance wrecks R^2; k>1 estimates the conditional mean.
+#   DS_LOSO_MAX_CELLS= source voxels per neighbour section (in-plane density of
+#                      the metric). 0 = ALL, -1 = follow DS_MAX_CELLS_RECON.
+#                      Chunked through DS_RECON_BATCH, so this costs TIME, not
+#                      memory -- with DS_MAX_CELLS_RECON=0 the LOSO pass runs at
+#                      full section density and is the dominant cost of a resumed
+#                      run. Set e.g. 16000 to cut it back.
+: "${DS_LOSO_K:=32}"
+: "${DS_LOSO_MAX_CELLS:=-1}"
 # Section-pairing mode for training UOT trajectories:
 #   within-mouse (default, faithful) = adjacent sections of the SAME mouse.
 #   cross-mouse = pool all mice's sections into one AP-ordered stack and pair
@@ -248,6 +261,8 @@ if [ "$MODEL" = "deepspatial" ]; then
         --ds-max-cells-recon $DS_MAX_CELLS_RECON \
         --ds-recon-batch $DS_RECON_BATCH \
         --ds-n-samples $DS_N_SAMPLES \
+        --ds-loso-k $DS_LOSO_K \
+        --ds-loso-max-cells $DS_LOSO_MAX_CELLS \
         --ds-pairing $DS_PAIRING \
         --ds-recon-scope $DS_RECON_SCOPE \
         $DS_FORCE_ARG \

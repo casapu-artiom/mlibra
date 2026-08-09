@@ -12,8 +12,13 @@ slice interpolation -- adapted to MALDI:
     synthesized cells onto the CCF grid, and render per-lipid volumes with the
     same renderer the manifold / run_sota experiments use.
   * Quantitative eval: leave-one-section-out interpolation on the test mice
-    (drop an interior section, reconstruct its gap, match synthesized cells to
-    the held section by nearest in-plane position, score per-lipid corr / RMSE).
+    (drop an interior section, reconstruct its gap, estimate each held voxel from
+    the mean of its --ds-loso-k nearest synthesized cells, score per-lipid
+    corr / RMSE).
+
+No gene data is involved anywhere: upstream's ``gene_dim`` / ``lambda_g`` / ``g0``
+names are the package's term for the expression channel, which here carries the
+173 lipids.
 
 This is the sole DeepSpatial implementation (the earlier harness-plugged
 regression stand-in was removed). Launch via ``MODEL=deepspatial
@@ -126,6 +131,20 @@ def parse_args():
                         "Lower only if the ODE step itself OOMs.")
     p.add_argument("--ds-n-samples", dest="ds_n_samples", type=int, default=50000,
                    help="Trajectory pairs sampled per mouse (n_samples_base).")
+    p.add_argument("--ds-loso-k", dest="ds_loso_k", type=int, default=32,
+                   help="Neighbours averaged per held voxel in the LOSO metric. "
+                        "The flow is GENERATIVE: one nearest cell (k=1) is a single "
+                        "Monte-Carlo draw, whose variance inflates RMSE and wrecks R^2 "
+                        "even when the marginals are right. Averaging k of them "
+                        "estimates the conditional mean instead. k=1 restores the "
+                        "old single-sample behaviour.")
+    p.add_argument("--ds-loso-max-cells", dest="ds_loso_max_cells", type=int,
+                   default=-1,
+                   help="Source voxels per neighbour section in the LOSO metric; "
+                        "sets its IN-PLANE density exactly as --ds-max-cells-recon "
+                        "does for the full volume. 0 = ALL voxels, -1 = follow "
+                        "--ds-max-cells-recon. Chunked through --ds-recon-batch, so "
+                        "raising it costs time, not memory.")
     p.add_argument("--ds-recon-scope", dest="ds_recon_scope", default="follow",
                    choices=["follow", "per-mouse", "cross-mouse"],
                    help="Scope of the full-volume reconstruction. 'per-mouse': "
@@ -269,53 +288,117 @@ def build_trajectories(train_by_mouse, le, num_classes, args):
 # ---------------------------------------------------------------------------
 # Leave-one-section-out interpolation metric
 # ---------------------------------------------------------------------------
-def _subsample(a, n, rng):
-    """Random-subsample an AnnData section to <=n rows (for cheap LOSO recon)."""
-    if a.n_obs <= n:
-        return a
-    return a[rng.choice(a.n_obs, n, replace=False)].copy()
+def _chunk_pairs(a0, a1, cap, batch, rng):
+    """Yield (idx0, idx1) source-voxel index blocks covering ``cap`` voxels per
+    section (<=0 => ALL), in blocks of ``batch``, cycling the shorter section.
+
+    Chunking decouples IN-PLANE density (total source cells covered, = cap) from
+    per-call memory (= batch): one reconstruct() call allocates
+    batch*(gap/thickness)*n_lipids on the GPU regardless of how dense the
+    reconstruction is overall.
+    """
+    u0 = a0.n_obs if cap <= 0 else min(a0.n_obs, cap)
+    u1 = a1.n_obs if cap <= 0 else min(a1.n_obs, cap)
+    p0 = rng.permutation(a0.n_obs)[:u0]
+    p1 = rng.permutation(a1.n_obs)[:u1]
+    for ci in range(max(1, int(np.ceil(max(u0, u1) / batch)))):
+        off = ci * batch
+        yield (p0[np.arange(off, off + batch) % u0],
+               p1[np.arange(off, off + batch) % u1])
+
+
+def _n_chunks(a0, a1, cap, batch):
+    """Number of blocks ``_chunk_pairs`` will yield (for progress bars)."""
+    u0 = a0.n_obs if cap <= 0 else min(a0.n_obs, cap)
+    u1 = a1.n_obs if cap <= 0 else min(a1.n_obs, cap)
+    return max(1, int(np.ceil(max(u0, u1) / batch)))
+
+
+def _knn_mean(seg, held3, k):
+    """Mean of the ``k`` synthesized cells nearest each held voxel in 3D
+    (yccf, zccf, xccf-depth).
+
+    Depth must be in the match: a 2D (y,z)-only match pulls values from cells at
+    ARBITRARY depths across the gap, while the held section sits at one depth.
+
+    k>1 is what makes this an estimate of the conditional mean rather than a
+    single draw. The flow transports position AND expression jointly and both are
+    generated, so one nearest cell is a Monte-Carlo sample whose variance adds to
+    the error instead of cancelling. Accumulated one neighbour at a time so peak
+    memory is n_held x n_lipids, not n_held x k x n_lipids.
+    """
+    from scipy.spatial import cKDTree
+    if seg.n_obs == 0:
+        return None
+    syn3 = np.column_stack([seg.obsm["spatial"].astype(np.float64),
+                            np.asarray(seg.obs["z_coord"], np.float64)])
+    kk = max(1, min(int(k), len(syn3)))
+    _, nn = cKDTree(syn3).query(held3, k=kk, workers=-1)
+    nn = nn.reshape(len(held3), kk)
+    synX = seg.X.toarray() if hasattr(seg.X, "toarray") else np.asarray(seg.X)
+    acc = np.zeros((len(held3), synX.shape[1]), dtype=np.float32)
+    for j in range(kk):
+        acc += synX[nn[:, j]]
+    return acc / kk
 
 
 def loso_predictions(ds, by_mouse, args, max_secs=6):
     """Leave-one-section-out interpolation over the given mice: drop an interior
-    section, reconstruct its gap from the two neighbours, and predict each held
-    voxel from its nearest synthesized cell. Returns (true, pred, pixel_index,
-    ccf_coords) stacked over all evaluated held voxels -- the harness-layout
-    per-split predictions (regeneratable, so they are stored to disk).
+    section, reconstruct its gap from the two neighbours, and estimate each held
+    voxel from the mean of its ``--ds-loso-k`` nearest synthesized cells. Returns
+    (true, pred, pixel_index, ccf_coords) stacked over all evaluated held voxels
+    -- the harness-layout per-split predictions (regeneratable, so they are stored
+    to disk).
 
     ``max_secs`` caps interior sections evaluated per mouse (bounds cost on the
-    dense atlas mice). LOSO neighbours are capped so a 2-gap reconstruction stays
-    cheap regardless of --ds-max-cells-recon.
+    dense atlas mice). Source density follows --ds-loso-max-cells and is covered
+    in --ds-recon-batch blocks, exactly as ``reconstruct_mouse`` does for the full
+    volume; each block's k-NN estimate is averaged, so the effective neighbourhood
+    is k per block and memory is independent of the density.
     """
-    from scipy.spatial import cKDTree
     rng = np.random.default_rng(args["seed"])
-    cap = min(args["ds_max_cells_recon"] or 4000, 4000)
+    cap = args["ds_loso_max_cells"]
+    if cap < 0:                                    # -1 => follow the volume knob
+        cap = args["ds_max_cells_recon"]
+    batch = max(1, int(args["ds_recon_batch"]))
+    k_nn = int(args["ds_loso_k"])
     T, P, PIX, C = [], [], [], []
     for mouse, secs in by_mouse.items():
         if len(secs) < 3:
             continue
+        # Normalize whole sections once (chunks inherit spatial_norm / z_norm).
+        # Needed here as well as in main() because a resumed run restores
+        # spatial_stats from the checkpoint without re-running _normalize_spatial.
+        _apply_norm(secs, ds.spatial_stats)
         n_done = 0
         for k in range(1, len(secs) - 1):
             if n_done >= max_secs:
                 break
-            a0 = _subsample(secs[k - 1], cap, rng)
-            a2 = _subsample(secs[k + 1], cap, rng)
-            _apply_norm([a0, a2], ds.spatial_stats)
-            seg = ds.reconstruct_between_slices(
-                a0, a2, thickness=args["ds_thickness"], steps=args["ds_steps"],
-                chunk_size=int(args.get("ds_recon_chunk", 32768)), device=args["device"])
-            held = secs[k]
-            # Match each held voxel to its nearest synthesized cell in 3D
-            # (yccf, zccf, xccf-depth). A 2D (y,z)-only match pulls values from
-            # cells at ARBITRARY depths across the gap -- the held section sits at
-            # one depth, so ignoring it mismatches values and tanks correlation.
-            syn3 = np.column_stack([seg.obsm["spatial"].astype(np.float64),
-                                    np.asarray(seg.obs["z_coord"], np.float64)])
+            a0, a2, held = secs[k - 1], secs[k + 1], secs[k]
             held3 = np.column_stack([held.obsm["spatial"].astype(np.float64),
                                      held.obs["xccf"].to_numpy(np.float64)])
-            _, nn = cKDTree(syn3).query(held3, k=1)
-            synX = seg.X.toarray() if hasattr(seg.X, "toarray") else np.asarray(seg.X)
-            P.append(synX[nn].astype(np.float32))
+            acc, n_acc = None, 0
+            nch = _n_chunks(a0, a2, cap, batch)
+            for c0, c2 in _chunk_pairs(a0, a2, cap, batch, rng):
+                seg = ds.reconstruct_between_slices(
+                    a0[c0].copy(), a2[c2].copy(), thickness=args["ds_thickness"],
+                    steps=args["ds_steps"],
+                    chunk_size=int(args.get("ds_recon_chunk", 32768)),
+                    device=args["device"])
+                est = _knn_mean(seg, held3, k_nn)
+                del seg
+                if est is None:
+                    continue
+                acc = est if acc is None else acc + est
+                n_acc += 1
+            if acc is None:
+                logging.warning(f"  LOSO {mouse} section {k}: no synthesized "
+                                f"cells over {nch} chunk(s) -- skipped.")
+                continue
+            # Clip at zero: the ODE is unconstrained and overshoots below the data
+            # support (measured intensities are clipped at 0 on load), so negative
+            # synthesized values are pure error. Eval-only -- no training stats.
+            P.append(np.clip(acc / n_acc, 0.0, None).astype(np.float32))
             T.append(np.asarray(held.X, np.float32))
             PIX.append(held.obs[["x_index", "y_index", "z_index"]].to_numpy(np.int64))
             C.append(held.obs[["xccf", "yccf", "zccf"]].to_numpy(np.float32))
@@ -373,22 +456,13 @@ def reconstruct_mouse(ds, secs, args, ccf2idx, template, col_indices, K, rng):
     ode_chunk = int(args.get("ds_recon_chunk", 32768))
     cap = int(args["ds_max_cells_recon"])          # 0 => all voxels
     # Pre-count chunks for a progress bar (dense =0 runs can be many calls).
-    plan = []
-    for k in range(len(secs) - 1):
-        u0 = secs[k].n_obs if cap <= 0 else min(secs[k].n_obs, cap)
-        u1 = secs[k + 1].n_obs if cap <= 0 else min(secs[k + 1].n_obs, cap)
-        plan.append((k, u0, u1, max(1, int(np.ceil(max(u0, u1) / batch)))))
-    total_calls = sum(p[3] for p in plan)
+    total_calls = sum(_n_chunks(secs[k], secs[k + 1], cap, batch)
+                      for k in range(len(secs) - 1))
     run = (None, None, None)
     pbar = tqdm(total=total_calls, desc="  recon (gap-chunks)", unit="call", leave=False)
-    for k, use0, use1, nch in plan:
+    for k in range(len(secs) - 1):
         a0, a1 = secs[k], secs[k + 1]
-        p0 = rng.permutation(a0.n_obs)[:use0]
-        p1 = rng.permutation(a1.n_obs)[:use1]
-        for ci in range(nch):
-            off = ci * batch
-            c0 = p0[np.arange(off, off + batch) % use0]   # cycle shorter section
-            c1 = p1[np.arange(off, off + batch) % use1]
+        for c0, c1 in _chunk_pairs(a0, a1, cap, batch, rng):
             s0, s1 = a0[c0].copy(), a1[c1].copy()
             seg = ds.reconstruct_between_slices(
                 s0, s1, thickness=args["ds_thickness"], steps=args["ds_steps"],

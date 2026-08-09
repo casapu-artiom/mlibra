@@ -41,8 +41,11 @@ this same assumption in NTF/Spa3D's section logic was done alongside this work.)
   onto the CCF grid, and **render** per-lipid volumes with the same renderer the
   manifold / run_sota runs use (`render_lipid_volumes.render_selected_lipids`).
 - **Metrics**: leave-one-section-out interpolation on the test mice — drop an
-  interior section, reconstruct its gap, match synthesized cells to the held
-  section by nearest in-plane position, score per-lipid corr/RMSE → `metrics.csv`.
+  interior section, reconstruct its gap, estimate each held voxel as the **mean of
+  its `--ds-loso-k` nearest synthesized cells in 3D** (y, z, xccf-depth), score
+  per-lipid corr/RMSE → `metrics.csv`. Density follows `--ds-loso-max-cells`
+  (`-1` = follow `--ds-max-cells-recon`, `0` = all voxels), covered in
+  `--ds-recon-batch` blocks.
 
 ## MALDI-specific adaptations (documented, necessary)
 
@@ -50,6 +53,11 @@ this same assumption in NTF/Spa3D's section logic was done alongside this work.)
   builds a full N₀×N₁ coupling, infeasible at that size (the paper's ST slices
   are far sparser). Sections are randomly subsampled to `--ds-max-cells` (train)
   / `--ds-max-cells-recon` (reconstruction) before the coupling.
+- **k-NN averaging in the metric** (`--ds-loso-k`, default 32). The flow is
+  generative and transports position *and* lipids jointly, so the single nearest
+  synthesized cell is one Monte-Carlo draw whose variance adds to the error
+  instead of cancelling. Averaging k of them estimates the conditional mean.
+  `--ds-loso-k 1` restores the old single-sample behaviour.
 - **`--ds-thickness` is in `xccf` (mm) units** — the inter-plane spacing;
   `target_cells ≈ n_sec · gap / thickness`. MALDI gaps are ~0.15–2 mm, so the
   default `0.02` fills the volume (vs. the paper's µm-scale default).
@@ -98,3 +106,12 @@ Cluster: [`../../submit/run_deepspatial_transport.sh`](../../submit/run_deepspat
   a test mouse with ≥3 sections.
 - Reconstruction density scales with `n_sec / thickness`; tune `--ds-thickness`
   and `--ds-max-cells-recon` for coverage vs. compute.
+- The flow trains on **raw** lipid intensities, whose RMS spans 272× across the
+  173 channels — so the expression loss (and `--ds-lambda-g`, which weights it
+  against the position loss) is dominated by a handful of bright lipids, as is
+  the UOT cosine cost. Per-lipid scale normalization would fix that but requires
+  a retrain, so it is not implemented. If you add it: **scale only, never
+  center.** Upstream's `_generate_and_prune_optimized` keeps only the top
+  `(g_parent > 0).sum()` entries of each synthesized cell and zeroes the rest — a
+  no-op while every lipid is positive, but centering would make ~half the entries
+  negative and silently delete half of every synthesized lipid vector.
