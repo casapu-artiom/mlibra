@@ -2,8 +2,8 @@
 # =============================================================================
 # LGP + reference-only parcel factor — runai batch submitter.
 #
-# Mirrors run_lgp_batch.sh but submits ./parcelgp/run_latent.sh, which runs
-# parcelgp/lgp_parcel_experiment.py = maldi/lgp_experiment.py with the parcel
+# Mirrors run_lgp_batch.sh but submits ./local_run/run_parcel_lgp.sh, which runs
+# other_experiments/parcelgp/lgp_parcel_experiment.py = maldi/lgp_experiment.py with the parcel
 # factor inserted into the kernel. Training, checkpoint resume, normalization,
 # prediction, whole-brain reconstruction and rendering are all the EXISTING
 # pipeline, so results are directly comparable to the run_lgp_batch.sh runs.
@@ -18,7 +18,7 @@
 #
 # Compare arms afterwards with the PAIRED per-lipid test (~60x tighter than
 # comparing run means, because between-lipid variance cancels):
-#   python -m parcelgp.compare --baseline base=DIR --run parcel=DIR --metric corr
+#   python -m other_experiments.parcelgp.compare --baseline base=DIR --run parcel=DIR --metric corr
 # =============================================================================
 set -euo pipefail
 
@@ -64,7 +64,7 @@ RECON_LIPIDS_FILE="${RECONSTRUCTION_LIPIDS_FILE:-$SRC_PATH/maldi/data/lipid_subs
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 # ---- one submission -------------------------------------------------------
-# MODE=parcel is hardcoded: run_latent.sh defaults to MODE=both, which would
+# MODE=parcel is hardcoded: run_parcel_lgp.sh defaults to MODE=both, which would
 # retrain an identical baseline inside every job of the sweep.
 submit() {
     local job_name=$1 prefix=$2 slices=$3
@@ -124,7 +124,7 @@ submit() {
         -e OPENBLAS_NUM_THREADS="$CPU" \
         -e MKL_NUM_THREADS="$CPU" \
         -e OMP_WAIT_POLICY=passive \
-        -- ./parcelgp/run_latent.sh "${extra_args[@]}"
+        -- ./local_run/run_parcel_lgp.sh "${extra_args[@]}"
 }
 
 # =============================================================================
@@ -200,12 +200,12 @@ echo "Results land under $S3_OUTPUT_DIR/<EXP_NAME>/"
 echo "Parcel fields are cached under $S3_PARCEL_DIR/"
 echo
 echo "Prebuild a field (recommended for STRIDE<4, where the build is slow):"
-echo "  python -m parcelgp.build --reference-file $S3_REFERENCE_FILE \\"
+echo "  python -m other_experiments.parcelgp.build --reference-file $S3_REFERENCE_FILE \\"
 echo "      --out $S3_PARCEL_DIR/full_k128_sw1.0_s4_t5.npz \\"
 echo "      --n-parcels 128 --features full --spatial-weight 1.0 --stride 4"
 echo
 echo "Baseline: run ./submit/run_lgp_batch.sh with matching hyperparameters,"
 echo "then compare PAIRED over lipids:"
-echo "  python -m parcelgp.compare \\"
+echo "  python -m other_experiments.parcelgp.compare \\"
 echo "      --baseline base=/s3/mlibra/mlibra-data/artiom/lgb_experiment_cv/<dir> \\"
 echo "      --run parcel=$S3_OUTPUT_DIR/<parcel-dir> --metric corr"

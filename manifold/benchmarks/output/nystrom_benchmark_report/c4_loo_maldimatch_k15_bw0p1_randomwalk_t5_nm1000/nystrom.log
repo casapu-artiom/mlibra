@@ -1,0 +1,31 @@
+
+[nystrom-loo] === solve (stride 4) ===
+Stride subsample: stride=4, sub_volume.shape=(132, 80, 114)
+[stride 4] tissue nodes (thresh=5.0): 531,090
+[knn_graph] HIT  /home/casap/mlibra/output/eigenvectors/knn/bbox=None_k=15_method=faiss_stride=4_template=reference_thresh=5 (N=531,090  E=4,002,237)
+[eigensolver] using backend: cupy
+[eigensolver] HIT  /home/casap/mlibra/output/eigenvectors/eigvecs/bw=0.1_graph=bbox=None_k=15_method=faiss_stride=4_template=reference_thresh=5_modes=1000_norm=randomwalk
+[nystrom-loo] nodes=531,090
+[nystrom-loo] loaded 7,123,438 unique MALDI voxels from /home/casap/mlibra/mlibra_data/maindata_minimal.parquet
+[nystrom-loo] WARNING: distance-match only found 356,172/7,123,438 grid nodes covering the MALDI NN-distance distribution -- the matched sample is short, not padded from a different distribution.
+[nystrom-loo] distance-matched 356,172 grid nodes  (target NN-dist mean=0.0167 median=0.017  matched mean=0.0352 median=0.0352)
+
+[nystrom-loo] leave-one-out (grid-distance-matched-to-maldi) NN distance (own graph, self excluded): mean=0.0352  median=0.0352  (in bandwidth units: mean=0.35)
+
+[nystrom-loo] reconstruction of each node's OWN eigenvector from its k=15 neighbours (same stride, same basis -- no alignment needed)
+mode band        mean |corr|   mean rel-L2
+------------------------------------------
+0-9                   1.0000        0.0037
+10-49                 1.0000        0.0092
+50-99                 0.9999        0.0150
+100-999               0.9996        0.0426
+------------------------------------------
+ALL                   0.9997        0.0395
+
+[nystrom-loo] overall subspace rel-Frob error (all 1000 modes) = 0.0423
+[nystrom-loo] |corr| stays >= 0.99 up to mode 1000
+[nystrom-loo] |corr| stays >= 0.95 up to mode 1000
+[nystrom-loo] |corr| stays >= 0.90 up to mode 1000
+
+[nystrom-loo] wrote nystrom_benchmark_report/c4_loo_maldimatch_k15_bw0p1_randomwalk_t5_nm1000/nystrom.json
+[nystrom-loo] wrote nystrom_benchmark_report/c4_loo_maldimatch_k15_bw0p1_randomwalk_t5_nm1000/nystrom.png

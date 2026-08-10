@@ -10,7 +10,7 @@
 #   * the sweep TAG is folded into the job name AND EXP_PREFIX, so every
 #     (fold, model, config) writes to a distinct output dir (no clobbering).
 #
-# The runner (sota/run_sota.sh) already specifies every input/output path with a
+# The runner (local_run/run_sota.sh) already specifies every input/output path with a
 # LOCAL default; this script overrides the I/O env vars to point at the
 # S3-mounted dirs. Each job does whole-brain reconstruction + renders + per-lipid
 # diagnostics (RECONSTRUCT=whole_brain), comparable to the manifold/baseline runs.
@@ -115,29 +115,6 @@ sweep_for_model() {
     esac
 }
 
-# sweep_for_model() {
-#     case "$1" in
-#         ntf)
-#             echo "res128-tv05:N_EPOCHS=3 BATCH_SIZE=16384 NTF_MAX_RES=128 NTF_WEIGHT_DECAY=0.0001 NTF_TV_WEIGHT=0.05"
-#             ;;
-#         spa3d)
-#             echo "zw03-none:N_EPOCHS=3 BATCH_SIZE=4096 SPA3D_Z_WEIGHT=0.3 SPA3D_SPE=none"
-#             ;;
-#         deepspatial)
-#             echo "cross-reg03:N_EPOCHS=10 BATCH_SIZE=256 DS_PAIRING=cross-mouse DS_UOT_REG=0.3 DS_MAX_CELLS=8000"
-#             ;;
-#         gplfr)
-#             echo "euclidean:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=euclidean"
-#             echo "riemann:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=riemann"
-#             echo "spectral:N_EPOCHS=2 BATCH_SIZE=2000 BASE_GP=spectral"
-#             ;;
-#         *)
-#             echo "ERROR: no sweep grid defined for model '$1'" >&2
-#             return 1
-#             ;;
-#     esac
-# }
-
 
 submit() {
     local job_name=$1 model=$2 slices=$3 prefix=$4 env_str=$5
@@ -176,11 +153,9 @@ submit() {
         -e WANDB="$WANDB" \
         -e WANDB_PROJECT="$WANDB_PROJECT" \
         "${sweep_env[@]}" \
-        -- ./sota/run_sota.sh "${extra_args[@]}"
+        -- ./local_run/run_sota.sh "${extra_args[@]}"
 }
-
 MODELS=${MODELS:-"ntf spa3d deepspatial gplfr"}   # add 'gplfr' to also sweep the latent-GP
-#FOLDS=(${FOLDS:-"fold-1"})    # shared CV list; e.g. FOLDS="fold-1 fold-2 ... fold-8"
 FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")
 
 # Outer loop: folds shared across all models. Inner: per-model sweep grid.

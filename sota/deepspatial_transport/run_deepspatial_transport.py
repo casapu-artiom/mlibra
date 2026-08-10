@@ -22,7 +22,7 @@ names are the package's term for the expression channel, which here carries the
 
 This is the sole DeepSpatial implementation (the earlier harness-plugged
 regression stand-in was removed). Launch via ``MODEL=deepspatial
-./sota/run_sota.sh`` (which delegates here) or ``run_deepspatial_transport.sh``.
+./local_run/run_sota.sh`` (which delegates here) or ``run_deepspatial_transport.sh``.
 See README.md.
 """
 import logging
@@ -37,8 +37,11 @@ from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import Dataset, DataLoader
 
 _HERE = Path(__file__).resolve().parent
-_MALDI = _HERE.parent.parent / "maldi"
+_ROOT = _HERE.parent.parent
+_MALDI = _ROOT / "maldi"
 sys.path.insert(0, str(_MALDI))
+sys.path.insert(0, str(_ROOT / "manifold"))    # manifold_kernel_builder
+sys.path.insert(0, str(_ROOT / "baselines"))   # experiment_baselines
 sys.path.insert(0, str(_HERE.parent))          # sota/ (sota_utils)
 sys.path.insert(0, str(_HERE))                 # adapter
 

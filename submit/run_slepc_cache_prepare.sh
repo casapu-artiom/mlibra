@@ -233,7 +233,7 @@ submit_one() {
         -e BANDWIDTH="$BANDWIDTH" \
         -e TOL="$TOL" \
         -e FACTOR_SOLVER="$FACTOR_SOLVER" \
-        -- ./slepc/slepc_eigensolve.sh
+        -- ./local_run/slepc_eigensolve.sh
 }
 
 # -------------------------------------------------------------------------

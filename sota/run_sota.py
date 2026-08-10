@@ -2,7 +2,7 @@
 
 This driver plugs the coordinate-regression SOTA models into the *exact same*
 data-loading / normalization / reconstruction / render / metrics pipeline that
-``maldi/experiment_baselines.py`` (and hence the manifold GP runs) use -- so
+``baselines/experiment_baselines.py`` (and hence the manifold GP runs) use -- so
 their whole-brain renders, per-lipid metrics.csv and held-out diagnostics are
 directly comparable to run_manifold / run_baseline.
 
@@ -13,7 +13,7 @@ Models (``--model``):
 DeepSpatial is NOT here: it is a within-specimen slice-interpolation method, not
 a coordinate regressor, so it does not fit this harness. It lives as a separate
 faithful implementation in ``sota/deepspatial_transport/`` (run via
-``MODEL=deepspatial ./sota/run_sota.sh``, which delegates there).
+``MODEL=deepspatial ./local_run/run_sota.sh``, which delegates there).
 
 It reuses ``experiment_baselines.main`` unchanged (all the reconstruction /
 render / metrics logic) by (a) registering the model classes into its
@@ -29,10 +29,14 @@ from pathlib import Path
 
 import torch
 
-# experiment_baselines lives in ../maldi and imports its siblings (config, utils,
-# manifold_kernel_builder, ...) by bare module name -> put maldi on sys.path.
-_MALDI_DIR = Path(__file__).resolve().parent.parent / "maldi"
+# experiment_baselines lives in ../baselines and manifold_kernel_builder in
+# ../manifold; both import maldi siblings (config, utils, ...) by bare module
+# name -> put all three dirs on sys.path.
+_ROOT = Path(__file__).resolve().parent.parent
+_MALDI_DIR = _ROOT / "maldi"
 sys.path.insert(0, str(_MALDI_DIR))
+sys.path.insert(0, str(_ROOT / "manifold"))
+sys.path.insert(0, str(_ROOT / "baselines"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import experiment_baselines as eb          # noqa: E402

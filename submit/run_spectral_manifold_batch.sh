@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Spectral twin of run_manifold_batch.sh. Submits the weight-space spectral
-# Riemann runner (maldi/run_spectral_manifold.sh -> spectral_lgp_manifold_experiment.py).
+# Riemann runner (local_run/run_spectral_manifold.sh -> spectral_lgp_manifold_experiment.py).
 # Differences from run_manifold_batch.sh: the spectral GP has NO inducing points
 # and no product-ARD ScaleKernel composition, so the IND_SOURCES and PRODUCT_ARD
 # sweeps (and their env vars) are gone here. A LENGTHSCALE_INIT sweep is added in
@@ -134,7 +134,7 @@ submit() {
         -e FORCE_RECOMPUTE_GRAPH="$FORCE_RECOMPUTE_GRAPH" \
         -e N_LIST="$N_LIST" \
         -e N_PROBE="$N_PROBE" \
-        -- ./maldi/run_spectral_manifold.sh "${extra_args[@]}"
+        -- ./local_run/run_spectral_manifold.sh "${extra_args[@]}"
 }
 
 FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed

@@ -7,6 +7,7 @@ analysis
 dragon_model
 experiments
 kernel_investigations
+papers
 wandb
 reflect.sh
 sshd_config
@@ -15,3 +16,12 @@ sshd_config
 **.egg-info
 tasklist.md
 .env
+
+# local cluster-ops helpers (kept out of the repo; untracked via `git rm --cached`)
+submit/backup_size.sh
+submit/cancel_running.py
+submit/download_models.sh
+submit/query.py
+submit/retry_failed.py
+submit/rsync_pod.sh
+submit/run_idle.sh

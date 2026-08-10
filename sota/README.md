@@ -1,9 +1,9 @@
 # SOTA 3D-reconstruction models for MALDI
 
 Implementations of recent spatial-omics **3D reconstruction** methods, adapted to
-the MALDI lipid dataset. All are launched from the single `MODEL=… ./sota/run_sota.sh`
+the MALDI lipid dataset. All are launched from the single `MODEL=… ./local_run/run_sota.sh`
 entry point (see below). `ntf`/`spa3d` plug into the *same* harness the manifold-GP
-runs use (`maldi/experiment_baselines.py`) — whole-brain renders, `metrics.csv`,
+runs use (`baselines/experiment_baselines.py`) — whole-brain renders, `metrics.csv`,
 diagnostics comparable to `run_manifold` / `run_baseline`.
 
 | `--model` | Paper | File | Core mechanism |
@@ -54,7 +54,7 @@ cells/cell-types). Adaptation notes per model:
   probability-flow ODE synthesis of the tissue *between* measured sections.
   Trained on the train-fold mice, it reconstructs each held-out test mouse's full
   brain volume (per-lipid volumes + renders) plus leave-one-section-out metrics.
-  Launch with `MODEL=deepspatial ./sota/run_sota.sh` (delegates) — see
+  Launch with `MODEL=deepspatial ./local_run/run_sota.sh` (delegates) — see
   [`deepspatial_transport/`](deepspatial_transport/).
 
 ## Runner scripts
@@ -65,19 +65,19 @@ overrides those env vars (see below). They default to `RECONSTRUCT=whole_brain`,
 which produces the composite renders **and** the per-lipid true-vs-pred
 scatterplots + value-distribution diagnostics — parity with `run_manifold`.
 
-- [`sota/run_sota.sh`](run_sota.sh) — the main runner; `MODEL` selects the method.
-- [`sota/run_ntf.sh`](run_ntf.sh), [`sota/run_spa3d.sh`](run_spa3d.sh),
-  [`sota/run_deepspatial.sh`](run_deepspatial.sh) — thin per-method wrappers
+- [`local_run/run_sota.sh`](run_sota.sh) — the main runner; `MODEL` selects the method.
+- [`local_run/run_ntf.sh`](run_ntf.sh), [`local_run/run_spa3d.sh`](run_spa3d.sh),
+  [`local_run/run_deepspatial.sh`](run_deepspatial.sh) — thin per-method wrappers
   (just pin `MODEL`).
 
 ```sh
 # per-method wrappers
-N_EPOCHS=30 ./sota/run_ntf.sh
-SPA3D_SPE=alft SPA3D_Z_WEIGHT=0.5 BATCH_SIZE=4096 ./sota/run_spa3d.sh
-N_EPOCHS=60 ./sota/run_deepspatial.sh
+N_EPOCHS=30 ./local_run/run_ntf.sh
+SPA3D_SPE=alft SPA3D_Z_WEIGHT=0.5 BATCH_SIZE=4096 ./local_run/run_spa3d.sh
+N_EPOCHS=60 ./local_run/run_deepspatial.sh
 
 # or the MODEL-switch runner, with W&B logging on
-MODEL=ntf N_EPOCHS=30 BATCH_SIZE=16384 WANDB=1 ./sota/run_sota.sh
+MODEL=ntf N_EPOCHS=30 BATCH_SIZE=16384 WANDB=1 ./local_run/run_sota.sh
 ```
 
 Overridable I/O env vars (local defaults): `DATA_PATH`, `OUTPUT_DIR`,

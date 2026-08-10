@@ -124,7 +124,7 @@ submit_baseline() {
         -e MKL_NUM_THREADS="$CPU" \
         -e OMP_WAIT_POLICY=passive \
         "${extra_env[@]}" \
-        -- ./maldi/run_baseline.sh
+        -- ./local_run/run_baseline.sh
 }
 
 for FOLD in "${FOLDS_LIST[@]}"; do
@@ -133,19 +133,6 @@ for FOLD in "${FOLDS_LIST[@]}"; do
     # runai job names must be lowercase DNS-safe: fold-2 -> f2.
     fold_slug=$(slug "${FOLD//fold-/f}")
     echo "=== Fold: $FOLD  (split: $SLICES_DATASET_FILE)"
-
-    # --- Param-free baselines: one job each ---------------------------------
-    # for model in "${PLAIN_MODELS[@]}"; do
-    #     model_env=()
-    #     if [ "$model" = "xgboost" ]; then
-    #         model_env=(-e XGB_LR="$XGB_LR"
-    #                    -e XGB_N_ESTIMATORS="$XGB_N_ESTIMATORS"
-    #                    -e XGB_MAX_DEPTH="$XGB_MAX_DEPTH")
-    #     fi
-    #     submit_baseline "base-${model}-${fold_slug}-${EXP_SUFFIX}" "$model" "$MEM" "$GPU" \
-    #         -e EXP_PREFIX="$FOLD_UPPER" \
-    #         ${model_env[@]+"${model_env[@]}"}
-    # done
 
     # --- mlp_eigen: sweep NUM_MODES (fold modes into EXP_PREFIX so dirs are distinct)
     for modes in "${MODES_LIST[@]}"; do

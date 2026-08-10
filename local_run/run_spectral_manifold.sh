@@ -1,0 +1,246 @@
+#!/usr/bin/env sh
+# Launcher for the weight-space (spectral) Riemann manifold experiment, the
+# spectral twin of run_manifold.sh. Differences from run_manifold.sh: the
+# spectral GP has NO inducing points and does not support per-task lengthscales
+# or the product-ARD ScaleKernel composition, so all of those knobs are gone
+# here. Everything graph/Laplacian/eigenpair-related is identical (same caches).
+: "${NUM_MODES:=1300}"
+# Lanczos Krylov subspace floor. -1 = auto (max(1500, 3*NUM_MODES+20)).
+# At stride=1 the 1500 floor blows up GPU memory; set e.g. NCV_MIN=100.
+: "${NCV_MIN:=-1}"
+: "${LATENT_DIM:=5}"
+: "${STRIDE:=4}"
+: "${BATCH_SIZE:=1000}"
+: "${N_EPOCHS:=30}"
+: "${LEARNING_RATE:=0.001}"
+: "${GRAPHBANDWIDTH:=0.1}"
+# Diffusion scale (manifold kernel): multiplicative scale on the frozen Laplacian
+# spectrum (lambda_k -> DIFFUSION_SCALE_INIT * lambda_k in the Matern spectral
+# density). No eigenpair recompute. LEARN_DIFFUSION_SCALE=1 trains it; otherwise
+# pinned at the init (1.0 = identity). Adds -learndiff to EXP_NAME when learned.
+: "${DIFFUSION_SCALE_INIT:=1.0}"
+: "${LEARN_DIFFUSION_SCALE:=0}"
+# Free per-mode spectral weights: learn ONE positive weight per Laplacian mode
+# instead of the tied monotone Matern density S_k=(2*nu/l^2+diffusion_scale*lambda_k)^-nu.
+# Makes the prior spectral density anisotropic in lambda (can up-weight boundary-
+# discriminating modes). Warm-started AT the Matern density. LEARN_SPECTRAL_WEIGHTS=1
+# enables it; adds -learnspecw to EXP_NAME so it doesn't clobber the tied-density run.
+: "${LEARN_SPECTRAL_WEIGHTS:=0}"
+: "${NU:=2}"
+: "${KNN_K:=15}"
+: "${BUMP_SCALE:=1.0}"
+: "${BUMP_DECAY:=0.01}"
+: "${LENGTHSCALE_INIT:=1.0}"
+: "${SEED:=416465}"
+: "${KERNEL:=symmetric}"
+: "${MODE:=lgp}"
+: "${TEMPLATE_NAME:=reference}"
+: "${DATA_PATH:=/home/casap/mlibra/mlibra_data}"
+: "${EIGENVECTOR_DIR:=/home/casap/mlibra/output/eigenvectors}"
+: "${OUTPUT_DIR:=/home/casap/mlibra/output}"
+: "${MALDI_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal.parquet}"
+: "${REFERENCE_FILE:=/home/casap/mlibra/mlibra_data/reference_image.npy}"
+# Atlas level convenience: ATLAS_LEVEL=5 or 15 selects level_${ATLAS_LEVEL}annot.npy
+# under DATA_PATH. Override ANNOTATION_FILE directly to use any other volume.
+: "${ATLAS_LEVEL:=15}"
+: "${ANNOTATION_FILE:=${DATA_PATH}/level_${ATLAS_LEVEL}annot.npy}"
+: "${SLICES_DATASET_FILE:=/home/casap/mlibra_git/maldi/data/splits/fold_2.json}"
+: "${AVAILABLE_LIPIDS_FILE:=/home/casap/mlibra/mlibra_data/maindata_minimal_available_lipids.npy}"
+: "${KNN_METHOD:=faiss_cluster_weighted}"
+: "${CROSS_REGION_INFLATION:=10.0}"
+# Template-clustering node labels (--knn-method faiss_cluster_weighted): data-driven,
+# whole-brain, lipid-free labels from the reference template (no ANNOTATION_FILE).
+: "${CLUSTER_K:=64}"
+: "${CLUSTER_SPATIAL_WEIGHT:=1.0}"
+: "${CLUSTER_FIT_SUBSAMPLE:=40000}"
+: "${CLUSTER_SEED:=0}"
+# --- atlas root handling + label denoise + hard prune (faiss_atlas_weighted) ---
+# ROOT_HANDLING: dissolve (default) | ignore | cross (legacy). DENOISE_LABELS:
+# majority-vote passes before prune (0=off). PRUNE_CROSS_REGION: fraction of
+# cross-region edges hard-removed (0=off). Non-cross root / any prune → fresh
+# eigvec cache key.
+: "${ROOT_HANDLING:=dissolve}"
+: "${DENOISE_LABELS:=0}"
+: "${PRUNE_CROSS_REGION:=0.0}"
+: "${SRC_PATH:=/home/casap/mlibra_git}"
+: "${EXP_PREFIX:=FOLD-2-STATIC-INDP}"
+: "${LAPLACIAN_NORM:=randomwalk}"
+: "${THRESHOLD:=5}"
+
+# ---- FAISS CPU-only flags (env -> CLI) ------------------------------------
+# The submit script passes FAISS_CPU_* as env vars; here we translate them into
+# the Python --faiss-cpu-* flags. Python reads ONLY the CLI, never the env.
+: "${FAISS_CPU_GRAPH:=0}"
+: "${FAISS_CPU_SEARCH:=0}"
+: "${FAISS_CPU_RECON:=0}"
+FAISS_CPU_ARGS=""
+[ "$FAISS_CPU_GRAPH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-graph"
+[ "$FAISS_CPU_SEARCH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-search"
+[ "$FAISS_CPU_RECON" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --faiss-cpu-recon"
+
+# Reconstruct only the voxels the composite render actually reads (slice planes +
+# the 3D MIP's stride): ~5.5x fewer voxels, near-identical figure. Writes sparse
+# volumes to volume_sparse/ instead of the dense volume/ that napari + the
+# analysis scripts consume -- so set it to 0 if you need the full 3D volumes.
+: "${RENDER_VOXELS_ONLY:=1}"
+RENDER_ARGS=""
+[ "$RENDER_VOXELS_ONLY" != "0" ] && RENDER_ARGS="--render-voxels-only"
+
+# Force a fresh KNN-graph build (bypass the cache) -- needed to actually time
+# graph construction; otherwise the cached graph is just reloaded.
+: "${FORCE_RECOMPUTE_GRAPH:=0}"
+[ "$FORCE_RECOMPUTE_GRAPH" = "1" ] && FAISS_CPU_ARGS="$FAISS_CPU_ARGS --force-recompute-graph"
+
+# FAISS IVF sizing. Pass an int or 'sqrt' (nlist=sqrt(N), nprobe=sqrt(nlist)) --
+# 'sqrt' is what makes the CPU path fast at scale (see faiss_bench_report).
+: "${N_LIST:=sqrt}"
+: "${N_PROBE:=8}"
+
+cd $SRC_PATH
+#pip install -e .
+
+# ---- reconstruction lipids from the curated subset file -------------------
+# Reconstruct/render exactly the lipids listed in RECONSTRUCTION_LIPIDS_FILE.
+# A tiny python parser (clearer than a shell loop) emits one lipid per line;
+# with IFS=newline we then fold each line into a positional arg -- preserving
+# the spaces in names -- so --reconstruction-lipids (nargs='+') picks them up.
+: "${RECONSTRUCTION_LIPIDS_FILE:=/home/casap/mlibra_git/maldi/data/lipid_subset.txt}"
+# Built-in fallback (mirror of lipid_subset.txt) used when the file above is
+# missing/empty -- e.g. a container where the repo path differs -- so we still
+# render the intended subset instead of every lipid.
+RECON_LIPIDS_DEFAULT='PC 35:1 PE 38:1
+PA 36:1
+LPC 22:6
+PE O-36:0 PE O-38:3
+Hex2Cer 40:1;O2'
+RECON_LIPIDS=$(python - "$RECONSTRUCTION_LIPIDS_FILE" <<'PY'
+import sys
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                print(line)
+except FileNotFoundError:
+    pass
+PY
+)
+if [ -n "$RECON_LIPIDS" ]; then
+    echo "Reconstruction lipids from $RECONSTRUCTION_LIPIDS_FILE"
+else
+    echo "NOTE: $RECONSTRUCTION_LIPIDS_FILE missing/empty;" \
+         "using built-in default lipid subset."
+    RECON_LIPIDS="$RECON_LIPIDS_DEFAULT"
+fi
+IFS='
+'
+set -- "$@" --reconstruction-lipids $RECON_LIPIDS
+unset IFS
+
+# NOTE: every swept hyperparameter MUST appear here, or two configs collapse to the
+# same output dir and clobber each other's checkpoints/test/args.npy. K<modes> is
+# included because the submit sweep varies NUM_MODES at a fixed stride. SPECTRAL
+# tag distinguishes these dirs from the inducing-point (MANIFOLD) runs.
+EXP_NAME="$EXP_PREFIX-SPECTRAL-$LATENT_DIM-$STRIDE-K$NUM_MODES-$TEMPLATE_NAME-$THRESHOLD-$BATCH_SIZE-$KNN_METHOD-$CROSS_REGION_INFLATION-$KNN_K-$LAPLACIAN_NORM-$NU-$BUMP_SCALE-$BUMP_DECAY-$GRAPHBANDWIDTH-$LENGTHSCALE_INIT"
+
+# Template-clustering node labels: always pass the knobs (Python ignores them for
+# other methods). Encode K/spatial-weight/seed in the dir name ONLY for that method,
+# so existing dir names stay unchanged and a cluster sweep gets distinct dirs.
+CLUSTER_ARGS="--cluster-k $CLUSTER_K --cluster-spatial-weight $CLUSTER_SPATIAL_WEIGHT --cluster-fit-subsample $CLUSTER_FIT_SUBSAMPLE --cluster-seed $CLUSTER_SEED"
+if [ "$KNN_METHOD" = "faiss_cluster_weighted" ]; then
+    EXP_NAME="$EXP_NAME-clk$CLUSTER_K-sw$CLUSTER_SPATIAL_WEIGHT-cs$CLUSTER_SEED"
+fi
+
+# Atlas methods: encode WHICH annotation volume in the dir name so level5 vs level15
+# runs don't clobber. The historical default (level_15annot) gets NO suffix, so existing
+# dir names / caches stay valid; any other level is tagged. Mirrors the Python key logic.
+case "$KNN_METHOD" in
+    faiss_atlas_weighted|anatomical_atlas)
+        _atlas_stem="$(basename "$ANNOTATION_FILE" .npy)"
+        [ "$_atlas_stem" != "level_15annot" ] && EXP_NAME="$EXP_NAME-$_atlas_stem"
+        ;;
+esac
+
+# Atlas root handling + label denoise + hard prune: reflect in the dir name so
+# runs with different graph refinements don't clobber. Only tagged when they
+# actually change the graph (root!=cross for the atlas method; denoise>0;
+# prune>0), so legacy dir names stay valid. Mirrors the Python eigvec cache-key
+# suffixes (_root{mode} / denoise / prune).
+if [ "$KNN_METHOD" = "faiss_atlas_weighted" ] && [ "$ROOT_HANDLING" != "cross" ]; then
+    EXP_NAME="$EXP_NAME-root$ROOT_HANDLING"
+fi
+# denoise + prune only apply to the weighted methods (the Python side gates them
+# on faiss_atlas_weighted|faiss_cluster_weighted); tag the dir only there so a
+# faiss/anatomical run with a stray DENOISE_LABELS/PRUNE value isn't mislabelled.
+case "$KNN_METHOD" in
+    faiss_atlas_weighted|faiss_cluster_weighted)
+        if [ "${DENOISE_LABELS:-0}" -gt 0 ]; then
+            EXP_NAME="$EXP_NAME-dn$DENOISE_LABELS"
+        fi
+        if [ "$(awk "BEGIN{print (${PRUNE_CROSS_REGION:-0}>0)?1:0}")" = "1" ]; then
+            EXP_NAME="$EXP_NAME-prune$PRUNE_CROSS_REGION"
+        fi
+        ;;
+esac
+
+# Diffusion scale: always pass the init (1.0 = identity); learn it only when asked.
+# Encode the INIT VALUE in the tag (not just a boolean) so a sweep over inits gets
+# distinct dirs. Frozen-at-1.0 (the default) adds no suffix => unchanged dir names.
+DIFF_ARGS="--diffusion-scale-init $DIFFUSION_SCALE_INIT"
+if [ "$LEARN_DIFFUSION_SCALE" = "1" ]; then
+    DIFF_ARGS="$DIFF_ARGS --learn-diffusion-scale"
+    EXP_NAME="$EXP_NAME-learndiff$DIFFUSION_SCALE_INIT"
+elif [ "$DIFFUSION_SCALE_INIT" != "1.0" ]; then
+    EXP_NAME="$EXP_NAME-diff$DIFFUSION_SCALE_INIT"
+fi
+
+# Free per-mode spectral weights: append the flag + a dir tag only when enabled,
+# so tied-density dir names stay unchanged (mirrors the diffusion-scale handling).
+SPECTRAL_W_ARGS=""
+if [ "$LEARN_SPECTRAL_WEIGHTS" = "1" ]; then
+    SPECTRAL_W_ARGS="--learn-spectral-weights"
+    EXP_NAME="$EXP_NAME-learnspecw"
+fi
+
+python $SRC_PATH/manifold/spectral_lgp_manifold_experiment.py \
+    --exp-name $EXP_NAME \
+    --dataset-path $DATA_PATH \
+    --maldi-file $MALDI_FILE \
+    --output-dir $OUTPUT_DIR \
+    --template-name $TEMPLATE_NAME \
+    --reference-file $REFERENCE_FILE \
+    --threshold $THRESHOLD \
+    --annotations-file $ANNOTATION_FILE \
+    --eigenvector-dir $EIGENVECTOR_DIR \
+    --batch-size $BATCH_SIZE \
+    --epochs $N_EPOCHS \
+    --learning-rate $LEARNING_RATE \
+    --latent-dim $LATENT_DIM \
+    --seed $SEED \
+    --slices-dataset-file $SLICES_DATASET_FILE \
+    --num-modes $NUM_MODES \
+    --ncv-min $NCV_MIN \
+    --kernel "$KERNEL" \
+    --laplacian-norm "$LAPLACIAN_NORM" \
+    --stride $STRIDE \
+    --mode "$MODE" \
+    --nu $NU \
+    --bump-scale $BUMP_SCALE \
+    --bump-decay $BUMP_DECAY \
+    --graphbandwidth-init $GRAPHBANDWIDTH \
+    --lengthscale-init $LENGTHSCALE_INIT \
+    $DIFF_ARGS \
+    $SPECTRAL_W_ARGS \
+    --knn-method $KNN_METHOD \
+    --cross-region-inflation $CROSS_REGION_INFLATION \
+    --root-handling $ROOT_HANDLING \
+    --denoise-labels $DENOISE_LABELS \
+    --prune-cross-region $PRUNE_CROSS_REGION \
+    $CLUSTER_ARGS \
+    --knn-k $KNN_K \
+    --n-list "$N_LIST" \
+    --n-probe "$N_PROBE" \
+    --available-lipids-file $AVAILABLE_LIPIDS_FILE \
+    --do-brain-reconstruction \
+    $RENDER_ARGS \
+    $FAISS_CPU_ARGS "$@"

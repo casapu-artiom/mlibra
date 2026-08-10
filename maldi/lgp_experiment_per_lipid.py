@@ -5,7 +5,7 @@ Trains one independent GP per lipid for either the Euclidean Matern kernel
 or the Riemann Manifold kernel. Reuses:
 
   - ``IndependentMultitaskGPModel``  (from l3di.lgp)            for Euclidean
-  - ``LatentRiemannGP``              (from l3di.lgp_manifold)   for Manifold
+  - ``LatentRiemannGP``              (from manifold/lgp_manifold.py)   for Manifold
   - All MaLDI / atlas / graph / inducing-point machinery from
     ``lgp_experiment.py`` and ``lgp_manifold_experiment.py``.
 
@@ -61,9 +61,13 @@ import gpytorch
 from tqdm import tqdm
 
 # Re-use the EXISTING project pieces — no copy-paste.
+# lgp_manifold lives in manifold/ (it moved out of the l3di package), so put
+# that dir on sys.path before importing it.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "manifold"))
+
 from config import MaldiConfig
 from l3di.lgp import IndependentMultitaskGPModel
-from l3di.lgp_manifold import LatentRiemannGP, SpectralLatentGP
+from lgp_manifold import LatentRiemannGP, SpectralLatentGP
 from utils import (
     get_inducing_points,
     get_data_inducing_points,
@@ -91,16 +95,16 @@ from manifold_gp.utils.anatomical_knn import (
 from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
 from manifold_gp.kernels.surface_kernels import SurfaceRiemannMaternKernel
 
-# Reference-only parcel geometry (--parcel-field). Self-contained package at the
-# repo root; the path shim covers environments whose editable install predates it
-# (a fresh `pip install -e .` picks it up automatically via `packages = find:`).
+# Reference-only parcel geometry (--parcel-field). Self-contained package under
+# other_experiments/; the path shim puts the repo root on sys.path so
+# `other_experiments.parcelgp` resolves when not launched from the repo root.
 try:
-    from parcelgp.field import ParcelField
-    from parcelgp.kernels import wrap_scale_kernel
+    from other_experiments.parcelgp.field import ParcelField
+    from other_experiments.parcelgp.kernels import wrap_scale_kernel
 except ModuleNotFoundError:                                          # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from parcelgp.field import ParcelField
-    from parcelgp.kernels import wrap_scale_kernel
+    from other_experiments.parcelgp.field import ParcelField
+    from other_experiments.parcelgp.kernels import wrap_scale_kernel
 
 
 # =============================================================================
@@ -122,7 +126,7 @@ def parse_args() -> dict:
                    required=True,
                    help="'euclidean' → IndependentMultitaskGPModel "
                         "(reuse from l3di.lgp), 'manifold' → "
-                        "LatentRiemannGP (reuse from l3di.lgp_manifold), "
+                        "LatentRiemannGP (reuse from manifold/lgp_manifold.py), "
                         "'eigenmap' → project coords into the leading "
                         "--embed-dim Laplacian eigenfunctions, then a Euclidean "
                         "ARD Matern GP over that embedding (reuses the euclidean "
@@ -231,7 +235,7 @@ def parse_args() -> dict:
                         "covariance break across a template-derived boundary and "
                         "reach across a gap within a region, which no stationary "
                         "kernel can express. The partition is reference-only; only "
-                        "B is learned. Build one with `python -m parcelgp.build`.")
+                        "B is learned. Build one with `python -m other_experiments.parcelgp.build`.")
     p.add_argument("--parcel-rank", dest="parcel_rank", type=int, default=8,
                    help="(--parcel-field) width r of the learned parcel embedding.")
     p.add_argument("--parcel-init-scale", dest="parcel_init_scale", type=float,

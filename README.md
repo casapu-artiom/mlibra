@@ -679,7 +679,7 @@ Runs for **40 epochs** and does **not** include `--use-diffusion`.
 Trains the LGP on **all available data** (`all.json` split, no held-out test set) for **50 epochs**. Intended to produce the best-quality model for downstream whole-brain reconstruction.
 
 ```bash
-bash maldi/run_final.sh
+bash local_run/run_lgp.sh
 ```
 
 **Fixed configuration:**
@@ -853,7 +853,7 @@ This will first rsync the code, then submit 40 RunAI jobs.
 
 ```bash
 # On the remote compute node (after deploy.sh)
-bash /myhome/mlibra/maldi/run_final.sh
+bash /myhome/mlibra/local_run/run_lgp.sh
 ```
 
 ### LGPMOE Experiment

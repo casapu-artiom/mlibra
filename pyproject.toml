@@ -2,6 +2,14 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+# manifold_gp lives at manifold/manifold_gp but is imported as the top-level
+# `manifold_gp` (it is a vendored fork of upstream manifold-gp, so it keeps the
+# upstream module name). manifold/ deliberately has no __init__.py, so listing
+# it as a second discovery root maps manifold/manifold_gp -> manifold_gp.
+[tool.setuptools.packages.find]
+where = [".", "manifold"]
+include = ["l3di*", "manifold_gp*", "other_experiments*"]
+
 [project]
 name = "l3di"
 version = "0.1.0"

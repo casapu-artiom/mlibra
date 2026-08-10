@@ -3,13 +3,13 @@
 # Per-lipid GP runai batch submitter.
 #
 # Mirrors run_manifold_batch.sh but for the per-lipid pipeline
-# (./maldi/run_lgp_per_lipid.sh → lgp_experiment_per_lipid.py).
+# (./local_run/run_lgp_per_lipid.sh → lgp_experiment_per_lipid.py).
 #
 # What it does:
 #   - Loops over a small cross-product of hyperparameters
 #     (KNN_METHOD × KNN_K × INFLATION × PRUNE × …)
 #   - Submits one runai job per config, each running
-#     ./maldi/run_lgp_per_lipid.sh inside the standard container
+#     ./local_run/run_lgp_per_lipid.sh inside the standard container
 #   - Each job trains only the lipids listed in $LIPIDS_FILE
 #     (default: 10 lipids — fast enough for parallel sweeps)
 #
@@ -212,16 +212,16 @@ submit() {
         -e OPENBLAS_NUM_THREADS="$CPU" \
         -e MKL_NUM_THREADS="$CPU" \
         -e OMP_WAIT_POLICY=passive \
-        -- ./maldi/run_lgp_per_lipid.sh "${extra_args[@]}"
+        -- ./local_run/run_lgp_per_lipid.sh "${extra_args[@]}"
 }
 
 # ---- one PARCEL submission ------------------------------------------------
-# Runs ./parcelgp/run_parcel.sh (per-lipid GP + reference-only parcel factor)
-# rather than ./maldi/run_lgp_per_lipid.sh. The parcel factor multiplies the
+# Runs ./local_run/run_parcel_per_lipid.sh (per-lipid GP + reference-only parcel factor)
+# rather than ./local_run/run_lgp_per_lipid.sh. The parcel factor multiplies the
 # spatial kernel by exp(-||z(x)-z(x')||^2/2) with z(x)=m(x)^T B; the partition
 # comes from the reference image alone and only B is learned.
 #
-# MODE=parcel is hardcoded: run_parcel.sh defaults to MODE=both, which would run
+# MODE=parcel is hardcoded: run_parcel_per_lipid.sh defaults to MODE=both, which would run
 # an identical baseline inside EVERY job of the sweep -- N times the compute, all
 # writing the same baseline directory. The baseline is an ordinary no-parcel run;
 # take it from the euclidean sweep above or from an existing per_lipid_cv run with
@@ -282,7 +282,7 @@ submit_parcel() {
         -e OPENBLAS_NUM_THREADS="$CPU" \
         -e MKL_NUM_THREADS="$CPU" \
         -e OMP_WAIT_POLICY=passive \
-        -- ./parcelgp/run_parcel.sh "${extra_args[@]}"
+        -- ./local_run/run_parcel_per_lipid.sh "${extra_args[@]}"
 }
 
 # =============================================================================
@@ -678,7 +678,7 @@ echo "Submitted $((exp_num - 1)) jobs (DRY_RUN=$DRY_RUN)."
 echo "Results land under $S3_OUTPUT_DIR/<EXP_NAME>/"
 echo ""
 echo "To visualise once done:"
-echo "  RUN_DIR=$S3_OUTPUT_DIR/<one-run-name> ./maldi/visualize_lipid_gp.sh"
+echo "  RUN_DIR=$S3_OUTPUT_DIR/<one-run-name> ./manifold/viz/visualize_lipid_gp.sh"
 echo ""
 echo "To aggregate metrics across runs:"
 echo "  python -c 'import pandas as pd, pathlib as P; \\"

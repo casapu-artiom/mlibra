@@ -1,0 +1,27 @@
+[
+  {
+    "knn_method": "faiss",
+    "knn_k": 15,
+    "stride": 4,
+    "threshold": 5,
+    "cross_region_inflation": 50.0,
+    "group": "all",
+    "n": 7366017,
+    "bw": 0.09999998658895493,
+    "bump_scale": 1.0,
+    "alpha": 0.09999998658895493,
+    "bump_decay": 0.01,
+    "within_support": 7365156,
+    "beyond_support": 861,
+    "within_half_alpha": 7358531,
+    "frac_within_support": 0.9998831118635757,
+    "frac_beyond_support": 0.00011688813642433896,
+    "bump_gt_half": 7361883,
+    "bump_mean_in_support": 0.9686713210621585,
+    "d_median": 0.016986997798085213,
+    "d_p95": 0.024138659983873365,
+    "d_p99": 0.027184015959501262,
+    "d_max": 0.1510409414768219,
+    "d_mean": 0.01671854503231893
+  }
+]

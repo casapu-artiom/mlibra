@@ -1,0 +1,2 @@
+n_runs,n_folds,n_lipids,test_rmse_z_mean,test_rmse_z_median,test_corr_mean,test_corr_median,test_r2_mean,test_r2_median,mean_pred_std_z_mean,mean_pred_std_z_median,fit_sec_mean,fit_sec_median
+224,8,1120,0.8286307911787715,0.8059588372707367,0.5034648502592458,0.547823011305602,0.28298235578223047,0.29253404333117083,0.8122560137616737,0.8181124329566956,988.2595188626221,834.9490304708481

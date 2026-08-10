@@ -130,7 +130,7 @@ submit() {
         -e ROOT_HANDLING="${ROOT_HANDLING:-dissolve}" \
         -e DENOISE_LABELS="${DENOISE_LABELS:-3}" \
         -e PRUNE_CROSS_REGION="${PRUNE_CROSS_REGION:-0.0}" \
-        -- ./maldi/run_manifold.sh "${extra_args[@]}"
+        -- ./local_run/run_manifold.sh "${extra_args[@]}"
 }
 
 # FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8" "difficult")           # lowercase, dashed

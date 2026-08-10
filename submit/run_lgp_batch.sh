@@ -70,7 +70,7 @@ submit() {
         -e NO_RSAMPLE="$norsample" \
         -e LEARN_INDUCING="${LEARN_INDUCING:-false}" \
         -e ARD="${ARD:-false}" \
-        -- ./maldi/run_final.sh "${extra_args[@]}"
+        -- ./local_run/run_lgp.sh "${extra_args[@]}"
 }
 
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"

@@ -1,0 +1,2 @@
+knn_method,knn_k,stride,threshold,cross_region_inflation,group,n,bw,bump_scale,alpha,bump_decay,within_support,beyond_support,within_half_alpha,frac_within_support,frac_beyond_support,bump_gt_half,bump_mean_in_support,d_median,d_p95,d_p99,d_max,d_mean
+faiss,15,4,5,50.0,all,7366017,0.09999998658895493,1.0,0.09999998658895493,0.01,7365156,861,7358531,0.9998831118635757,0.00011688813642433896,7361883,0.9686713210621585,0.016986997798085213,0.024138659983873365,0.027184015959501262,0.1510409414768219,0.01671854503231893

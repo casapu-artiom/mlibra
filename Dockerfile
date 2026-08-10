@@ -1,134 +1,97 @@
-ARG BASE_IMAGE=pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
+ARG BASE_IMAGE=jupyter/base-notebook:python-3.10
 
-FROM ${BASE_IMAGE} AS runtime
-
-ARG PYTHON_VERSION=3.12
-ARG APP_USER=appuser
-ARG APP_UID=1000
-ARG APP_GID=100
-ARG DEBIAN_FRONTEND=noninteractive
-# faiss is compiled from source (step below). 120 = Blackwell (sm_120).
-ARG FAISS_VERSION=v1.14.1
-ARG CUDA_ARCHS="80;86;89;90;120"
-
-ENV APP_USER=${APP_USER}
-ENV APP_GID=${APP_GID}
+FROM ${BASE_IMAGE} as builder
 
 USER root
+RUN apt-get update && apt-get install -yq --no-install-recommends \
+    build-essential git && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# ---- 1. System packages (Simplified) ----
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssh-server gosu curl wget git vim htop rsync build-essential \
-    libopenblas-dev software-properties-common libgflags-dev \
-    && rm -rf /var/lib/apt/lists/*
+# remove the nodejs pin if needed - see https://github.com/jupyter/docker-stacks/issues/1990
+RUN sed -i '/nodejs/d' /opt/conda/conda-meta/pinned
 
-RUN add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python${PYTHON_VERSION} \
-        python${PYTHON_VERSION}-venv \
-        python${PYTHON_VERSION}-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN python -m venv --system-site-packages /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-RUN set -eux; \
-    # Make sure target group exists (it should, on Debian/Ubuntu, but be safe)
-    if ! getent group ${APP_GID} >/dev/null; then \
-        groupadd -g ${APP_GID} ${APP_USER}; \
-    fi; \
-    # Rename the existing UID 1000 user, or create one if it doesn't exist
-    if getent passwd ${APP_UID} >/dev/null; then \
-        existing=$(getent passwd ${APP_UID} | cut -d: -f1); \
-        if [ "$existing" != "${APP_USER}" ]; then \
-            usermod -l ${APP_USER} -d /home/${APP_USER} -m -g ${APP_GID} "$existing"; \
-        else \
-            usermod -g ${APP_GID} ${APP_USER}; \
-        fi; \
-    else \
-        useradd -m -u ${APP_UID} -g ${APP_GID} -s /bin/bash ${APP_USER}; \
-    fi; \
-    echo "${APP_USER} ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-
-# ---- 3. SSH Configuration ----
-# Allow both APP_USER and root to ssh in. PermitRootLogin prohibit-password is
-# set via sed (not append) because sshd honours the FIRST matching directive, so
-# a base-image `PermitRootLogin no` earlier in the file would otherwise win --
-# and prohibit-password permits key auth for root while still refusing passwords.
-RUN mkdir -p /run/sshd \
-    && sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config \
-    && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
-    && echo "AllowUsers ${APP_USER} root" >> /etc/ssh/sshd_config
-
-# ---- 4. Install Dependencies Directly ----
-# Using --break-system-packages because modern Ubuntu/Debian requires it 
-# to install via pip outside of a venv.
+# switch to the notebook user
+USER $NB_USER
+# install jupyterlab, papermill, git extension and renku-jupyterlab-ts
 COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m pip install --no-cache-dir -U pip && \
+    python3 -m pip install --no-cache-dir -r /tmp/requirements.txt && \
+    jupyter labextension disable "@jupyterlab/apputils-extension:announcements" && \
+    rm -rf "/home/${NB_USER}/.cache"
 
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --break-system-packages --no-build-isolation -r /tmp/requirements.txt
+# jupyter sets channel priority to strict which often causes very long error messages
+RUN conda config --system --set channel_priority flexible && \
+    conda clean --all -f -y
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git build-essential cmake ninja-build swig \
-        libopenblas-dev libomp-dev \
-    && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir numpy
 
-# ---- 4b. Build faiss (GPU) from source, once, at image build time ----
-# Moved out of entrypoint.sh so it is baked into the image instead of compiled
-# on every container boot. Mirrors the previous entrypoint build exactly.
-RUN git clone --depth 1 --branch ${FAISS_VERSION} \
-        https://github.com/facebookresearch/faiss.git /opt/faiss \
-    && cmake -B /opt/faiss/build -S /opt/faiss \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DFAISS_ENABLE_GPU=ON \
-        -DFAISS_ENABLE_PYTHON=ON \
-        -DBUILD_SHARED_LIBS=ON \
-        -DFAISS_OPT_LEVEL=avx2 \
-        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
-        -DPython_EXECUTABLE=$(which python) \
-    && make -C /opt/faiss/build -j"$(nproc)" faiss faiss_avx2 swigfaiss swigfaiss_avx2 \
-    && make -C /opt/faiss/build install \
-    && (cd /opt/faiss/build/faiss/python && python setup.py install) \
-    # `libfaiss_python_callbacks.so` is built for the python bindings but is NOT
-    # installed by `make install`; _swigfaiss.so links it via an RPATH into the
-    # build tree, so it must be copied somewhere on the loader path before the
-    # build tree is deleted (otherwise: "cannot open shared object file").
-    && find /opt/faiss/build -name 'libfaiss_python_callbacks*.so' \
-        -exec cp {} /usr/local/lib/ \; \
-    && ldconfig \
-    && rm -rf /opt/faiss/build
+FROM $BASE_IMAGE
 
-    # PETSc/SLEPc build needs gfortran + an MPI (the base has gcc/g++/make/cmake/curl
-# via build-essential, but neither a Fortran compiler nor MPI). openmpi-bin also
-# provides the `mpirun` the eigensolver entrypoint shells out to at runtime.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        gfortran openmpi-bin libopenmpi-dev \
-    && rm -rf /var/lib/apt/lists/*
+LABEL maintainer="Swiss Data Science Center <info@datascience.ch>"
 
-# Build PETSc + SLEPc + MUMPS from source and install petsc4py/slepc4py into the
-# inherited /opt/venv (on PATH from the base image). WITH_MUMPS=1 is what makes
-# the 64-bit parallel direct solver available for the shift-invert path.
-# PREFIX=/opt installs the libs to /opt/petsc and /opt/slepc.
-COPY slepc/build_slepc_petsc.sh /tmp/build_slepc_petsc.sh
-RUN PREFIX=/opt WITH_MUMPS=1 bash /tmp/build_slepc_petsc.sh \
-    && rm -f /tmp/build_slepc_petsc.sh
+USER root
+SHELL [ "/bin/bash", "-c", "-o", "pipefail" ]
 
-# Make the prefix installs discoverable at runtime: PETSC_DIR/SLEPC_DIR for the
-# python bindings, LD_LIBRARY_PATH so the loader finds libpetsc/libslepc (+ the
-# bundled MUMPS/ScaLAPACK/metis shared objects).
-ENV PETSC_DIR=/opt/petsc
-ENV SLEPC_DIR=/opt/slepc
-ENV LD_LIBRARY_PATH=/opt/petsc/lib:/opt/slepc/lib:${LD_LIBRARY_PATH}
+# Install additional dependencies and nice-to-have packages
+RUN apt-get update && apt-get install -yq --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    gnupg \
+    graphviz \
+    jq \
+    less \
+    libsm6 \
+    libxext-dev \
+    libxrender1 \
+    libyaml-0-2 \
+    libyaml-dev \
+    lmodern \
+    musl-dev \
+    nano \
+    netcat \
+    rclone \
+    unzip \
+    vim \
+    git \
+    emacs \
+    openssh-server && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -s /usr/lib/x86_64-linux-musl/libc.so /lib/libc.musl-x86_64.so.1 && \
+    rm -rf /tmp/git-lfs*
 
-# ---- 5. Entrypoint setup ----
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+USER $NB_USER
 
-RUN chown -R ${APP_USER}:${APP_GID} /opt/venv /home/${APP_USER}
-WORKDIR /home/${APP_USER}
+# setup sshd
+RUN mkdir -p "$HOME/.ssh" && \
+    touch "$HOME/.ssh/authorized_keys" && \
+    chmod u=rw,g=,o= "$HOME/.ssh/authorized_keys"
 
-EXPOSE 2222
-ENTRYPOINT ["/entrypoint.sh"]
+# configure bash and shell prompt
+ENV PATH=$HOME/.local/bin:$PATH
+
+
+# Setup ssh keys
+USER root
+RUN mkdir -p /opt/ssh/sshd_config.d /opt/ssh/ssh_host_keys /opt/ssh/pid && \
+    ssh-keygen -q -N "" -t dsa -f /opt/ssh/ssh_host_keys/ssh_host_dsa_key && \
+    ssh-keygen -q -N "" -t rsa -b 4096 -f /opt/ssh/ssh_host_keys/ssh_host_rsa_key && \
+    ssh-keygen -q -N "" -t ecdsa -f /opt/ssh/ssh_host_keys/ssh_host_ecdsa_key && \
+    ssh-keygen -q -N "" -t ed25519 -f /opt/ssh/ssh_host_keys/ssh_host_ed25519_key
+
+COPY sshd_config /opt/ssh/sshd_config
+
+RUN chown -R 0:100 /opt/ssh/ && \
+    chmod -R u=rwX,g=rX,o= /opt/ssh && \
+    chmod -R u=rwX,g=rwX,o= /opt/ssh/pid
+
+
+CMD [ "jupyter", "server", "--ip", "0.0.0.0" ]
+
+USER $NB_USER
+COPY --chown=1000:100 --from=builder /opt/conda /opt/conda
+
+ARG CONDA_ENVS_DIRS
+ENV CONDA_ENVS_DIRS=${CONDA_ENVS_DIRS:-/opt/conda/envs}

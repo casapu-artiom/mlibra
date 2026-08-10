@@ -5,7 +5,7 @@ package (v1.0.0, PyPI) on MALDI as the paper actually intends: **within-specimen
 slice interpolation**. This is the sole DeepSpatial implementation — an earlier
 harness-plugged stand-in that reframed it as noise→data conditional regression
 (to fit the per-voxel eval) was removed in favour of the real method here.
-Launch via `MODEL=deepspatial ./sota/run_sota.sh` (which delegates here) or
+Launch via `MODEL=deepspatial ./local_run/run_sota.sh` (which delegates here) or
 `./sota/deepspatial_transport/run_deepspatial_transport.sh`. The method:
 
 1. **UOT** establishes cross-section cell (voxel) correspondences,

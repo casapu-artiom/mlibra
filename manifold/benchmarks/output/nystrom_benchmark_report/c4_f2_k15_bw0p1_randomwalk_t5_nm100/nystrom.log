@@ -1,0 +1,57 @@
+
+[nystrom] === COARSE solve (stride 4) ===
+Stride subsample: stride=4, sub_volume.shape=(132, 80, 114)
+[stride 4] tissue nodes (thresh=5.0): 531,090
+[knn_graph] HIT  /home/casap/mlibra/output/eigenvectors/knn/bbox=None_k=15_method=faiss_stride=4_template=reference_thresh=5 (N=531,090  E=4,002,237)
+[eigensolver] using backend: cupy
+[eigensolver] MISS key=bw=0.1_knn_key=bbox=None_k=15_method=faiss_stride=4_template=reference_thresh=5_modes=100_norm=randomwalk -- computing
+[eigensolver] N=531,090  NNZ=8,535,564  density=0.003026%
+[eigensolver] CuPy Lanczos SpMV: 0it [00:00, ?it/s][eigensolver] CuPy Lanczos SpMV: 186it [00:00, 1630.81it/s][eigensolver] CuPy Lanczos SpMV: 376it [00:00, 1772.55it/s][eigensolver] CuPy Lanczos SpMV: 555it [00:00, 1247.80it/s][eigensolver] CuPy Lanczos SpMV: 694it [00:00, 981.63it/s] [eigensolver] CuPy Lanczos SpMV: 805it [00:00, 818.65it/s][eigensolver] CuPy Lanczos SpMV: 897it [00:01, 693.12it/s][eigensolver] CuPy Lanczos SpMV: 974it [00:01, 604.46it/s][eigensolver] CuPy Lanczos SpMV: 1040it [00:01, 540.29it/s][eigensolver] CuPy Lanczos SpMV: 1097it [00:01, 491.73it/s][eigensolver] CuPy Lanczos SpMV: 1148it [00:04, 70.33it/s] [eigensolver] CuPy Lanczos SpMV: 1184it [00:04, 81.74it/s][eigensolver] CuPy Lanczos SpMV: 1219it [00:04, 95.90it/s][eigensolver] CuPy Lanczos SpMV: 1254it [00:04, 113.21it/s][eigensolver] CuPy Lanczos SpMV: 1288it [00:04, 132.83it/s][eigensolver] CuPy Lanczos SpMV: 1321it [00:05, 153.78it/s][eigensolver] CuPy Lanczos SpMV: 1353it [00:05, 174.82it/s][eigensolver] CuPy Lanczos SpMV: 1385it [00:05, 194.97it/s][eigensolver] CuPy Lanczos SpMV: 1416it [00:05, 212.23it/s][eigensolver] CuPy Lanczos SpMV: 1446it [00:05, 225.92it/s][eigensolver] CuPy Lanczos SpMV: 1475it [00:05, 235.88it/s][eigensolver] CuPy Lanczos SpMV: 1504it [00:06, 126.23it/s][eigensolver] CuPy Lanczos SpMV: 1724it [00:06, 433.63it/s][eigensolver] CuPy Lanczos SpMV: 1829it [00:06, 541.10it/s][eigensolver] CuPy Lanczos SpMV: 1918it [00:06, 604.73it/s][eigensolver] CuPy Lanczos SpMV: 2006it [00:06, 632.04it/s][eigensolver] CuPy Lanczos SpMV: 2089it [00:06, 627.42it/s][eigensolver] CuPy Lanczos SpMV: 2166it [00:06, 603.45it/s][eigensolver] CuPy Lanczos SpMV: 2236it [00:06, 571.02it/s][eigensolver] CuPy Lanczos SpMV: 2300it [00:07, 536.59it/s][eigensolver] CuPy Lanczos SpMV: 2359it [00:07, 503.29it/s][eigensolver] CuPy Lanczos SpMV: 2413it [00:07, 473.32it/s][eigensolver] CuPy Lanczos SpMV: 2463it [00:07, 446.30it/s][eigensolver] CuPy Lanczos SpMV: 2510it [00:07, 424.92it/s][eigensolver] CuPy Lanczos SpMV: 2554it [00:07, 410.55it/s][eigensolver] CuPy Lanczos SpMV: 2596it [00:07, 395.81it/s][eigensolver] CuPy Lanczos SpMV: 2636it [00:08, 381.60it/s][eigensolver] CuPy Lanczos SpMV: 2675it [00:08, 368.00it/s][eigensolver] CuPy Lanczos SpMV: 2712it [00:08, 355.55it/s][eigensolver] CuPy Lanczos SpMV: 2748it [00:08, 344.08it/s][eigensolver] CuPy Lanczos SpMV: 2783it [00:08, 333.50it/s][eigensolver] CuPy Lanczos SpMV: 2817it [00:08, 323.70it/s][eigensolver] CuPy Lanczos SpMV: 2850it [00:08, 314.55it/s][eigensolver] CuPy Lanczos SpMV: 2882it [00:08, 306.08it/s][eigensolver] CuPy Lanczos SpMV: 2913it [00:09, 164.26it/s][eigensolver] CuPy Lanczos SpMV: 3131it [00:09, 512.27it/s][eigensolver] CuPy Lanczos SpMV: 3242it [00:09, 629.45it/s][eigensolver] CuPy Lanczos SpMV: 3333it [00:09, 685.92it/s][eigensolver] CuPy Lanczos SpMV: 3423it [00:09, 701.71it/s][eigensolver] CuPy Lanczos SpMV: 3508it [00:09, 684.67it/s][eigensolver] CuPy Lanczos SpMV: 3587it [00:09, 649.79it/s][eigensolver] CuPy Lanczos SpMV: 3660it [00:10, 608.70it/s][eigensolver] CuPy Lanczos SpMV: 3727it [00:10, 567.91it/s][eigensolver] CuPy Lanczos SpMV: 3788it [00:10, 530.34it/s][eigensolver] CuPy Lanczos SpMV: 3844it [00:10, 496.87it/s][eigensolver] CuPy Lanczos SpMV: 3896it [00:10, 467.09it/s][eigensolver] CuPy Lanczos SpMV: 3944it [00:10, 440.99it/s][eigensolver] CuPy Lanczos SpMV: 3989it [00:10, 417.86it/s][eigensolver] CuPy Lanczos SpMV: 4032it [00:10, 397.45it/s][eigensolver] CuPy Lanczos SpMV: 4072it [00:11, 379.92it/s][eigensolver] CuPy Lanczos SpMV: 4111it [00:11, 362.65it/s][eigensolver] CuPy Lanczos SpMV: 4148it [00:11, 350.40it/s][eigensolver] CuPy Lanczos SpMV: 4183it [00:11, 338.06it/s][eigensolver] CuPy Lanczos SpMV: 4217it [00:11, 326.96it/s][eigensolver] CuPy Lanczos SpMV: 4250it [00:11, 316.76it/s][eigensolver] CuPy Lanczos SpMV: 4282it [00:11, 308.63it/s]                                                           [eigensolver] computed in 12.9s
+[eigensolver] saved -> /home/casap/mlibra/output/eigenvectors/eigvecs/bw=0.1_knn_key=bbox=None_k=15_method=faiss_stride=4_template=reference_thresh=5_modes=100_norm=randomwalk.eigpairs.npz
+[nystrom] === FINE solve (stride 2, ground truth) ===
+Stride subsample: stride=2, sub_volume.shape=(264, 160, 228)
+[stride 2] tissue nodes (thresh=5.0): 4,248,215
+[knn_graph] MISS key=bbox=None_k=15_method=faiss_stride=2_template=reference_thresh=5 -- training (method='faiss')
+[knn_graph] trained in 68.0s (N=4,248,215  E=31,023,866)
+[knn_graph] saved -> /home/casap/mlibra/output/eigenvectors/knn/bbox=None_k=15_method=faiss_stride=2_template=reference_thresh=5.knngraph.npz
+[eigensolver] using backend: cupy
+[eigensolver] MISS key=bw=0.1_knn_key=bbox=None_k=15_method=faiss_stride=2_template=reference_thresh=5_modes=100_norm=randomwalk -- computing
+[eigensolver] N=4,248,215  NNZ=66,295,947  density=0.000367%
+[eigensolver] CuPy Lanczos SpMV: 0it [00:00, ?it/s][eigensolver] CuPy Lanczos SpMV: 1it [00:00,  2.00it/s][eigensolver] CuPy Lanczos SpMV: 2it [00:01,  1.78it/s][eigensolver] CuPy Lanczos SpMV: 135it [00:01, 174.30it/s][eigensolver] CuPy Lanczos SpMV: 196it [00:01, 223.33it/s][eigensolver] CuPy Lanczos SpMV: 248it [00:01, 241.14it/s][eigensolver] CuPy Lanczos SpMV: 292it [00:01, 229.42it/s][eigensolver] CuPy Lanczos SpMV: 328it [00:01, 214.64it/s][eigensolver] CuPy Lanczos SpMV: 358it [00:02, 201.81it/s][eigensolver] CuPy Lanczos SpMV: 384it [00:02, 188.84it/s][eigensolver] CuPy Lanczos SpMV: 407it [00:02, 176.67it/s][eigensolver] CuPy Lanczos SpMV: 427it [00:02, 165.95it/s][eigensolver] CuPy Lanczos SpMV: 446it [00:02, 155.96it/s][eigensolver] CuPy Lanczos SpMV: 463it [00:02, 147.37it/s][eigensolver] CuPy Lanczos SpMV: 479it [00:03, 139.73it/s][eigensolver] CuPy Lanczos SpMV: 494it [00:03, 133.02it/s][eigensolver] CuPy Lanczos SpMV: 508it [00:03, 127.16it/s][eigensolver] CuPy Lanczos SpMV: 521it [00:03, 122.06it/s][eigensolver] CuPy Lanczos SpMV: 534it [00:03, 117.40it/s][eigensolver] CuPy Lanczos SpMV: 546it [00:03, 113.40it/s][eigensolver] CuPy Lanczos SpMV: 558it [00:03, 93.53it/s] Traceback (most recent call last):
+  File "/home/casap/mlibra_git/benchmarks/nystrom_benchmark.py", line 485, in <module>
+    main()
+  File "/home/casap/mlibra_git/benchmarks/nystrom_benchmark.py", line 318, in main
+    fine = build_stride(reference_image, annotation_volume,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/casap/mlibra_git/benchmarks/nystrom_benchmark.py", line 162, in build_stride
+    eigval, eigvec = solver.compute_or_load(
+                     ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/casap/mlibra_git/manifold_gp/utils/compute_eigenvectors.py", line 588, in compute_or_load
+    evals, evecs = self.compute(laplacian_op)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/casap/mlibra_git/manifold_gp/utils/compute_eigenvectors.py", line 230, in compute
+    evals, evecs = self._compute_cupy(laplacian_op)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/casap/mlibra_git/manifold_gp/utils/compute_eigenvectors.py", line 299, in _compute_cupy
+    evals_cp, evecs_cp = cplinalg.eigsh(
+                         ^^^^^^^^^^^^^^^
+  File "/home/casap/miniconda3/envs/conda_brain_env/lib/python3.12/site-packages/cupyx/scipy/sparse/linalg/_eigen.py", line 100, in eigsh
+    lanczos(a, V, u, alpha, beta, 0, ncv)
+  File "/home/casap/miniconda3/envs/conda_brain_env/lib/python3.12/site-packages/cupyx/scipy/sparse/linalg/_eigen.py", line 246, in aux
+    vv.fill(0)
+  File "cupy/_core/core.pyx", line 925, in cupy._core.core._ndarray_base.fill
+  File "cupy/_core/core.pyx", line 949, in cupy._core.core._ndarray_base.fill
+  File "cupy/cuda/memory.pyx", line 738, in cupy.cuda.memory.MemoryPointer.memset_async
+  File "cupy_backends/cuda/api/runtime.pyx", line 716, in cupy_backends.cuda.api.runtime.memsetAsync
+  File "cupy_backends/cuda/api/runtime.pyx", line 146, in cupy_backends.cuda.api.runtime.check_status
+cupy_backends.cuda.api.runtime.CUDARuntimeError: cudaErrorIllegalAddress: an illegal memory access was encountered
+Traceback (most recent call last):
+  File "cupy_backends/cuda/api/driver.pyx", line 234, in cupy_backends.cuda.api.driver.moduleUnload
+  File "cupy_backends/cuda/api/driver.pyx", line 63, in cupy_backends.cuda.api.driver.check_status
+cupy_backends.cuda.api.driver.CUDADriverError: CUDA_ERROR_ILLEGAL_ADDRESS: an illegal memory access was encountered
+Exception ignored in: 'cupy.cuda.function.Module.__dealloc__'
+Traceback (most recent call last):
+  File "cupy_backends/cuda/api/driver.pyx", line 234, in cupy_backends.cuda.api.driver.moduleUnload
+  File "cupy_backends/cuda/api/driver.pyx", line 63, in cupy_backends.cuda.api.driver.check_status
+cupy_backends.cuda.api.driver.CUDADriverError: CUDA_ERROR_ILLEGAL_ADDRESS: an illegal memory access was encountered
+                                                         Faiss assertion 'err == cudaSuccess' failed in virtual void faiss::gpu::StandardGpuResourcesImpl::deallocMemory(int, void*) at /home/casap/faiss/faiss/gpu/StandardGpuResources.cpp:654; details: Failed to cudaFree pointer 0x1200a00000 (error 700 an illegal memory access was encountered)

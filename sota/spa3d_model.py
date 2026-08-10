@@ -32,7 +32,7 @@ Two ingredients from the paper, adapted to the MALDI coords->lipids task:
    from a fresh random subsample every step (non-physical and unstable).
 
 Requires ``torch_geometric`` (same dependency the ``gcn`` baseline uses).
-Contract mirrors ``maldi/experiment_baselines.py`` model wrappers.
+Contract mirrors ``baselines/experiment_baselines.py`` model wrappers.
 """
 import logging
 

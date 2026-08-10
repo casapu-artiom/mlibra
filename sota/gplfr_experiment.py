@@ -20,15 +20,17 @@ from pathlib import Path
 import torch
 
 # The gplfr package lives beside this file in sota/; the MALDI harness modules
-# (experiment, config, utils, manifold_kernel_builder) live in ../maldi. Put both
-# on sys.path so this driver runs from anywhere (it used to rely on being
-# launched from maldi/). l3di / manifold_gp are pip-installed.
+# (experiment, config, utils) live in ../maldi and manifold_kernel_builder in
+# ../manifold. Put them on sys.path so this driver runs from anywhere (it used
+# to rely on being launched from maldi/). l3di / manifold_gp are pip-installed;
+# lgp_manifold now lives in ../manifold (it moved out of the l3di package).
 _HERE = Path(__file__).resolve().parent            # sota/
 sys.path.insert(0, str(_HERE.parent / "maldi"))    # experiment, config, ...
+sys.path.insert(0, str(_HERE.parent / "manifold"))  # manifold_kernel_builder
 sys.path.insert(0, str(_HERE))                     # import gplfr (sota/gplfr)
 
 from l3di.lgp import IndependentMultitaskGPModel
-from l3di.lgp_manifold import LatentRiemannGP, SpectralLatentGP
+from lgp_manifold import LatentRiemannGP, SpectralLatentGP
 from gplfr import GPLFR
 from experiment import MaldiExperiment
 from config import MaldiConfig

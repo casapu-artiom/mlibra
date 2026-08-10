@@ -1,0 +1,38 @@
+
+[nystrom] === COARSE solve (stride 8) ===
+Stride subsample: stride=8, sub_volume.shape=(66, 40, 57)
+[stride 8] tissue nodes (thresh=40.0): 36,631
+[knn_graph] HIT  /home/casap/mlibra/output/eigenvectors/knn/bbox=None_k=15_method=faiss_stride=8_template=allen_25um_thresh=40 (N=36,631  E=285,418)
+[eigensolver] using backend: cupy
+[eigensolver] HIT  /home/casap/mlibra/output/eigenvectors/eigvecs/bw=0.1_knn_key=bbox=None_k=15_method=faiss_stride=8_template=allen_25um_thresh=40_modes=1000_norm=randomwalk
+[nystrom] === FINE solve (stride 4, ground truth) ===
+Stride subsample: stride=4, sub_volume.shape=(132, 80, 114)
+[stride 4] tissue nodes (thresh=40.0): 292,745
+[knn_graph] HIT  /home/casap/mlibra/output/eigenvectors/knn/bbox=None_k=15_method=faiss_stride=4_template=allen_25um_thresh=40 (N=292,745  E=2,258,697)
+[eigensolver] using backend: cupy
+[eigensolver] HIT  /home/casap/mlibra/output/eigenvectors/eigvecs/bw=0.1_knn_key=bbox=None_k=15_method=faiss_stride=4_template=allen_25um_thresh=40_modes=1000_norm=randomwalk
+
+[nystrom] coarse nodes=36,631  fine nodes=292,745
+[nystrom] shared (coarse∩fine)=36,631  in-between (held-out)=256,114
+[nystrom] coord-alignment guard: max NN distance at shared nodes = 0.00e+00  (must be ~0)
+[nystrom] in-sample Nyström floor (smoothing at on-graph nodes) rel-Frob err = 0.3344
+
+[nystrom] in-between NN distance to coarse graph: mean=0.0624  median=0.062  (in bandwidth units: mean=0.62)
+
+[nystrom] reconstruction of the FINE eigenbasis at held-out nodes
+mode band        mean |corr|   mean rel-L2
+------------------------------------------
+0-9                   0.9996        0.0240
+10-49                 0.9987        0.0515
+50-99                 0.9968        0.0874
+100-999               0.9388        0.3328
+------------------------------------------
+ALL                   0.9447        0.3062
+
+[nystrom] overall subspace rel-Frob error (all 1000 modes) = 0.3511
+[nystrom] |corr| stays >= 0.99 up to mode 182
+[nystrom] |corr| stays >= 0.95 up to mode 599
+[nystrom] |corr| stays >= 0.90 up to mode 754
+
+[nystrom] wrote nystrom_benchmark_report/c8_f4_k15_bw0p1_randomwalk_t40_nm1000/nystrom.json
+[nystrom] wrote nystrom_benchmark_report/c8_f4_k15_bw0p1_randomwalk_t40_nm1000/nystrom.png

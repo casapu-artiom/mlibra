@@ -28,7 +28,7 @@ MALDI adaptation notes:
     / CUDA compile), so it runs in the existing container. It is fully
     differentiable (gradients flow into the looked-up table entries).
 
-I/O contract mirrors the baselines in ``maldi/experiment_baselines.py``:
+I/O contract mirrors the baselines in ``baselines/experiment_baselines.py``:
 ``fit(coords_train, y_train, coords_test, y_test, args) -> (pred_tr, pred_te)``,
 ``predict(coords_std) -> pred``, ``save(path)``, ``load(path, p, args)``.
 coords are standardized (n,3); y is per-lipid log-mean/std-normalized.
