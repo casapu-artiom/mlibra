@@ -12,9 +12,12 @@ mean -- so it can only do worse than a plain Matern.
 ZERO-MISALIGNMENT DESIGN
 ------------------------
 This script does NOT reimplement the graph, the coordinate normalization, the
-KNN engine, or the bump. It imports and calls `visualize_laplacian.setup()`,
-which builds the *exact* deployed objects from the *exact* same cache keys the
-viewer uses:
+KNN engine, or the bump. It carries `setup()` and `bump_function()` COPIED
+VERBATIM from the napari viewer (`manifold/viz/visualize_laplacian.py`), so it
+builds the *exact* deployed objects from the *exact* same cache keys the viewer
+uses -- without importing the viewer, which would drag in napari/Qt and prevent
+this from running headless. If you change the graph, eigensolve or bump in one
+place, mirror it in the other:
 
   * ctx["knn"]            : the FAISS NearestNeighbors index (same engine the
                             kernel queries -- not a cKDTree)
@@ -55,8 +58,8 @@ Run:
       --bump-decay-sweep  0.01 0.05 0.1 \
       --out-dir ./bump_report
 
-Must be importable in the SAME environment as visualize_laplacian (torch, faiss,
-manifold_gp, etc.). Distances are computed once per group; --bump-scale-sweep and
+Needs torch, faiss and manifold_gp -- but NOT napari/Qt: it is fully headless.
+Distances are computed once per group; --bump-scale-sweep and
 --bump-decay-sweep then re-bin/re-weight them cheaply (bump_scale sets the support
 radius alpha=bump_scale*bw; bump_decay only reshapes the in-support weight).
 
@@ -82,12 +85,28 @@ import torch
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "maldi"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "manifold"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "manifold" / "viz"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Reuse the viewer's real machinery -- this is the whole point.
-import visualize_laplacian as vl
-from visualize_laplacian import setup, bump_function
+from manifold_gp.kernels.riemann_matern_kernel import RiemannMaternKernel
+from manifold_gp.operators.graph_laplacian_operator import GraphLaplacianOperator
+from manifold_gp.utils.anatomical_knn import (
+    inflate_cross_region_edges, labels_for_nodes_from_sub_atlas,
+)
+from manifold_gp.utils.compute_eigenvectors import (
+    LaplacianEigensolver, resolve_ncv_min, make_key as make_eig_key,
+)
+from manifold_gp.utils.nearest_neighbors import (
+    KnnGraphCache, make_key as make_graph_key, resolve_nlist, resolve_nprobe,
+)
+from utils import (
+    crop_or_stride_volume, reference_ccf_from_subvolume, coord_norm_from_reference,
+)
+
+try:
+    from manifold_gp.utils import bump_function as _lib_bump_function
+    _USING_LIB_BUMP = True
+except ImportError:
+    _USING_LIB_BUMP = False
 
 try:
     import matplotlib
@@ -96,6 +115,162 @@ try:
     HAVE_MPL = True
 except Exception:
     HAVE_MPL = False
+
+
+# =============================================================================
+# Graph/Laplacian/kernel construction.
+#
+# Copied VERBATIM from the napari viewer (visualize_laplacian.py) so this
+# benchmark is self-contained and carries no GUI dependency: the viewer needs
+# napari/Qt, this script must run headless on a cluster node. Keeping the code
+# identical is what makes the numbers comparable -- if you change the graph,
+# eigensolve or bump here, mirror it there (and vice versa).
+# =============================================================================
+def bump_function(d, scale, decay):
+    if _USING_LIB_BUMP:
+        d_t = d if torch.is_tensor(d) else torch.as_tensor(d)
+        scale_t = scale if torch.is_tensor(scale) else torch.as_tensor(float(scale), dtype=d_t.dtype, device=d_t.device)
+        decay_t = decay if torch.is_tensor(decay) else torch.as_tensor(float(decay), dtype=d_t.dtype, device=d_t.device)
+        return _lib_bump_function(d_t, scale_t, decay_t)
+    d = torch.as_tensor(d) if not torch.is_tensor(d) else d
+    scale = float(scale); decay = float(decay)
+    out = torch.zeros_like(d)
+    inside = d < scale
+    if inside.any():
+        u = (d[inside] / scale).clamp(0.0, 1.0 - 1e-6)
+        out[inside] = torch.exp(-decay / (1.0 - u * u))
+        out[inside] = out[inside] / float(np.exp(-decay))
+    return out
+
+
+def setup(args: dict, log: logging.Logger):
+    device = torch.device(args["device"])
+    template_full = np.load(args["reference_file"])
+    annotations_full = np.load(args["annotations_file"]) if args["annotations_file"] else None
+
+    sub_volume, sub_atlas, voxel_offset, voxel_scale_mm = crop_or_stride_volume(
+        template_full, annotations_full,
+        stride=args["stride"],
+    )
+    reference_ccf = reference_ccf_from_subvolume(
+        sub_volume, voxel_offset, voxel_scale_mm, args["threshold"],
+    )
+    reference_nodes_mm = torch.tensor(reference_ccf, dtype=torch.float32)
+    # Single source of truth shared with training (utils.coord_norm_from_reference):
+    # per-axis mean + scalar (isotropic) std from reference_image > 0. Computed
+    # straight from the reference image the visualizer already loaded, so it
+    # never depends on a training run having happened in this environment.
+    coord_mean, coord_std = coord_norm_from_reference(template_full)
+    reference_nodes = ((reference_nodes_mm - coord_mean) / coord_std).to(device)
+
+    node_voxel_idx = np.argwhere(sub_volume > args["threshold"]).astype(np.int32)
+    assert node_voxel_idx.shape[0] == reference_nodes.shape[0]
+
+    # Resolve the FAISS IVF nlist ('sqrt' -> round(sqrt(N)), or an int) BEFORE it
+    # enters the cache key or a train call -- matches every other caller
+    # (maldi_kernel_explorer, lgp_manifold_experiment, ...) so 'sqrt' hits the
+    # same cached graph the training pipeline wrote, and never reaches FAISS raw.
+    nlist = resolve_nlist(args["n_list"], reference_nodes.shape[0])
+    nprobe = resolve_nprobe(args["n_probe"], nlist)
+
+    sv_scale = np.array([args["stride"], args["stride"], args["stride"]], dtype=np.float32)
+    sv_translate = np.asarray(voxel_offset, dtype=np.float32)
+
+    eigenvector_dir = Path(args["eigenvector_dir"])
+    graphs = KnnGraphCache(cache_dir=eigenvector_dir / "knn", verbose=True)
+    graph_key_parts = {
+        "template": args["template_name"],
+        "stride": args["stride"],
+        "thresh": args["threshold"],
+        "method": args["knn_method"],
+        "k": args["knn_k"],
+        "nlist": nlist,
+        "bbox": None,
+    }
+    if args["knn_method"] == "anatomical_atlas":
+        graph_key_parts["atlas"] = "annotation_coarse_d4"
+        graph_key_parts["conn"] = 3
+    graph_key = make_graph_key(graph_key_parts)
+
+    if args["knn_method"] == "faiss":
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=graph_key, method="faiss", coords=reference_nodes,
+            k=args["knn_k"], nlist=nlist, nprobe=nprobe, extra=graph_key_parts,
+            device=args["device"], force_recompute=args["force_recompute_graph"],
+        )
+    elif args["knn_method"] == "anatomical_atlas":
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=graph_key, method="anatomical_atlas", volume=sub_volume,
+            threshold=args["threshold"], atlas_volume=sub_atlas, connectivity=3,
+            coords=reference_nodes, k=args["knn_k"], nlist=nlist, nprobe=nprobe,
+            extra=graph_key_parts, device=args["device"], force_recompute=args["force_recompute_graph"],
+        )
+    elif args["knn_method"] == "faiss_atlas_weighted":
+        base_key_parts = dict(graph_key_parts)
+        base_key_parts["method"] = "faiss"
+        base_key = make_graph_key(base_key_parts)
+        knn, edge_index, edge_value = graphs.train_or_load(
+            key=base_key, method="faiss", coords=reference_nodes,
+            k=args["knn_k"], nlist=nlist, nprobe=nprobe, extra=base_key_parts,
+            device=args["device"], force_recompute=args["force_recompute_graph"],
+        )
+        node_labels = labels_for_nodes_from_sub_atlas(sub_volume, sub_atlas, args["threshold"])
+        inflation = float(args.get("cross_region_inflation", 10.0))
+        edge_index, edge_value, _info = inflate_cross_region_edges(
+            edge_index, edge_value, node_labels, inflation=inflation, treat_zero_as_cross=True,
+        )
+        graph_key_parts["weighting"] = f"atlas_x{inflation:g}"
+        graph_key = make_graph_key(graph_key_parts)
+    else:
+        raise ValueError(f"unknown knn_method: {args['knn_method']}")
+
+    bw = float(args["graphbandwidth"])
+    bw_tensor = torch.tensor(bw, device=device)
+    laplacian_op = GraphLaplacianOperator(
+        edge_value, edge_index, knn.x.shape[0], bw_tensor, args["laplacian_norm"],
+    )
+
+    eigvec_key_parts = {
+        "graph": graph_key, "norm": args["laplacian_norm"], "bw": bw, "modes": args["num_modes"],
+    }
+    eigvec_key = make_eig_key(eigvec_key_parts)
+    ncv_min = resolve_ncv_min(args["num_modes"], args.get("ncv_min", -1))
+    solver = LaplacianEigensolver(
+        num_modes=args["num_modes"], backend="cupy", tol=1e-4, ncv_min=ncv_min, verbose=True,
+    )
+    eigval, eigvec = solver.compute_or_load(
+        laplacian_op, cache_dir=eigenvector_dir / "eigvecs", key=eigvec_key,
+        graphbandwidth=bw, laplacian_normalization=args["laplacian_norm"],
+        extra=eigvec_key_parts, force_recompute=args["force_recompute_eigvecs"], device=device,
+    )
+
+    matern_kernel = RiemannMaternKernel(
+        nu=args["nu"],
+        lengthscale=args["lengthscale"],
+        knn=knn,
+        edge_index=edge_index,
+        edge_value=edge_value,
+        eigval=eigval,
+        eigvec=eigvec,
+        nearest_neighbors=args["knn_k"],
+        laplacian_normalization=args["laplacian_norm"],
+        num_modes=args["num_modes"],
+        bump_scale=args["bump_scale"],
+        bump_decay=args["bump_decay"],
+        graphbandwidth_init=bw
+    ).to(device)
+
+    return dict(
+        device=device, template_full=template_full, sub_volume=sub_volume,
+        node_voxel_idx=node_voxel_idx, reference_nodes=reference_nodes,
+        sv_scale=sv_scale, sv_translate=sv_translate,
+        knn=knn, edge_index=edge_index, edge_value=edge_value,
+        laplacian_op=laplacian_op, eigval=eigval, eigvec=eigvec, bw=bw,
+        coord_mean=coord_mean, coord_std=coord_std,
+        voxel_offset=voxel_offset, voxel_scale_mm=voxel_scale_mm,
+        stride=int(args["stride"]), threshold=int(args["threshold"]),
+        matern_kernel=matern_kernel
+    )
 
 
 # ---------------------------------------------------------------------------

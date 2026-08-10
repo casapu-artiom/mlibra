@@ -17,6 +17,10 @@ sshd_config
 tasklist.md
 .env
 
+# napari/matplotlib explorers — local-only working tools. A curated subset is
+# re-published elsewhere for submission. Untracked via `git rm --cached -r`.
+manifold/viz
+
 # local cluster-ops helpers (kept out of the repo; untracked via `git rm --cached`)
 submit/backup_size.sh
 submit/cancel_running.py
