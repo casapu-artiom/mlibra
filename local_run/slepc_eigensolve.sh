@@ -56,8 +56,15 @@ CROSS_REGION_INFLATION="${CROSS_REGION_INFLATION:-10.0}"  # faiss_atlas_weighted
 ROOT_HANDLING="${ROOT_HANDLING:-cross}"          # dissolve | ignore | cross
 DENOISE_LABELS="${DENOISE_LABELS:-0}"            # majority-vote passes (0 = off)
 PRUNE_CROSS_REGION="${PRUNE_CROSS_REGION:-0.0}"  # hard-prune fraction (0 = off)
-NLIST="${NLIST:-1}"                      # FAISS IVF nlist: int or 'sqrt'
-NPROBE="${NPROBE:-1}"                     # FAISS IVF nprobe: int or 'sqrt'
+# FAISS IVF sizing -- int or 'sqrt'. Matches run_manifold.sh / run_manifold_batch.sh
+# (and run_slepc_cache_prepare.sh): nlist='sqrt' = round(sqrt(N)), resolved with the
+# SAME N as the training runs, so this solve is a drop-in cache hit for them. nprobe
+# is a FIXED 8 -- in 3D recall saturates there regardless of N, and nprobe is never
+# cache-keyed, so all producers must agree on it to bake the same graph.
+# NOTE: nlist IS cache-keyed when !=1, so this changes the key vs the old NLIST=1
+# default; set NLIST=1 NPROBE=1 to reproduce the legacy exact-flat behaviour.
+NLIST="${NLIST:-sqrt}"                    # FAISS IVF nlist: int or 'sqrt'
+NPROBE="${NPROBE:-8}"                     # FAISS IVF nprobe: int or 'sqrt'
 BANDWIDTH="${BANDWIDTH:-1.0}"
 NORMALIZATION="${NORMALIZATION:-randomwalk}"
 TEMPLATE="${TEMPLATE:-reference}"
