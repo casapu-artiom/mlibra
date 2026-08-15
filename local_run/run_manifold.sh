@@ -11,6 +11,7 @@
 : "${INDUCING_FROM_MALDI_NODES:=1}"
 : "${INDUCING_DENSITY_FRAC:=0.8}"
 : "${LATENT_DIM:=5}"
+: "${BETA:=1.0}"        # KL weight; a float, or "elbo" for B/N
 : "${STRIDE:=4}"
 : "${BATCH_SIZE:=1000}"
 : "${N_EPOCHS:=30}"
@@ -234,6 +235,10 @@ case "$KNN_METHOD" in
         ;;
 esac
 
+# beta last, after every conditional suffix, so it reads as the final
+# discriminator and existing dir names are untouched when beta==1.0.
+[ "$BETA" != "1.0" ] && EXP_NAME="$EXP_NAME-beta$BETA"
+
 python $SRC_PATH/manifold/lgp_manifold_experiment.py \
     --exp-name $EXP_NAME \
     --dataset-path $DATA_PATH \
@@ -245,6 +250,7 @@ python $SRC_PATH/manifold/lgp_manifold_experiment.py \
     --annotations-file $ANNOTATION_FILE \
     --eigenvector-dir $EIGENVECTOR_DIR \
     --batch-size $BATCH_SIZE \
+    --beta "$BETA" \
     --epochs $N_EPOCHS \
     --learning-rate $LEARNING_RATE \
     --latent-dim $LATENT_DIM \

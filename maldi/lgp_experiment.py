@@ -55,6 +55,11 @@ def parse_args():
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=2000, help="Batch size for training")
     parser.add_argument("--load-args", dest="load_args", action='store_true', help="Load arguments from a file instead of command line.")
     parser.add_argument("--no-rsample", dest="no_rsample", action='store_false', help="Use rsample instead of mean.")
+    parser.add_argument("--beta", type=str, default="1.0",
+                        help="KL weight in the ELBO. A float (1.0 = the historical "
+                             "default: full KL added to a minibatch-sized NLL), or "
+                             "'elbo' for B/N, which makes the per-batch loss "
+                             "proportional to the ELBO over the whole dataset.")
     parser.add_argument("--use-diffusion", dest="use_diffusion", action='store_true', help="Use diffusion model in the experiment.")
     parser.add_argument("--do-brain-reconstruction", dest="do_brain_reconstruction", action='store_true', help="Perform whole brain prediction")
     parser.add_argument("--render-voxels-only", dest="render_voxels_only", action="store_true", help="Reconstruct only the voxels the composite render reads (slice planes + 3D MIP stride): ~5.5x fewer voxels, near-identical figure. Writes sparse volumes to volume_sparse/ with a _sparse suffix; the dense volume/ dir is not produced.")
@@ -119,6 +124,7 @@ def setup_experiment(args):
         activation='silu',
         device=config.device,
         use_rsample=use_rsample,
+        beta=args.get("beta", 1.0),
     )
     return MaldiExperiment(config, lgp_model, coord_mean, coord_std)
 

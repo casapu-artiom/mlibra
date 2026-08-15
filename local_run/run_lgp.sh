@@ -2,6 +2,7 @@
 : "${NUM_INDUCING_POINTS:=1000}"
 : "${INDUCING_SOURCE:=reference}"
 : "${LATENT_DIM:=5}"
+: "${BETA:=1.0}"        # KL weight; a float, or "elbo" for B/N
 : "${BATCH_SIZE:=1000}"
 : "${N_EPOCHS:=10}"
 : "${LEARNING_RATE:=0.001}"
@@ -50,6 +51,9 @@ else
 fi
 
 EXP_NAME="$EXP_PREFIX-LGPALL-$SAMPLING_TAG-$LATENT_DIM-$INDUCING_SOURCE-$NUM_INDUCING_POINTS-$BATCH_SIZE-$LI_TAG-$ARD_TAG"
+# Only tag when beta departs from the historical 1.0, so existing run dirs
+# (and every path in report_all) keep their names.
+[ "$BETA" != "1.0" ] && EXP_NAME="$EXP_NAME-beta$BETA"
 
 cd $SRC_PATH
 #pip install -e .
@@ -107,6 +111,7 @@ python $SRC_PATH/maldi/lgp_experiment.py \
     --seed $SEED \
     --slices-dataset-file $SLICES_DATASET_FILE \
     --num-inducing $NUM_INDUCING_POINTS \
+    --beta "$BETA" \
     --inducing-source "$INDUCING_SOURCE" \
     --kernel "$KERNEL" \
     --mode "$MODE" \

@@ -1,3 +1,4 @@
+import logging
 import math
 
 import gpytorch
@@ -17,6 +18,8 @@ from gpytorch.variational import (CholeskyVariationalDistribution,
                                   VariationalStrategy)
 from gpytorch.likelihoods.multitask_gaussian_likelihood import MultitaskGaussianLikelihood
 from gpytorch.constraints import GreaterThan
+
+from l3di.lgp import resolve_beta
 from torch import nn
 from tqdm import tqdm
 import wandb
@@ -248,10 +251,11 @@ class ManifoldLGP(nn.Module):
     Manifold Graph Coordinates -> Latent Riemann GP -> MLP -> 172 Channels
     """
     def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model, use_rsample=True,
-                 hyperpriors=True, lengthscale_prior_mean=None):
+                 hyperpriors=True, lengthscale_prior_mean=None, beta=1.0):
         super().__init__()
         self.mode = "manifold_lgp"
         self.use_rsample = use_rsample
+        self.beta = beta   # KL weight; float or 'elbo' (=B/N), see resolve_beta
         self.p = p  # number of channels (e.g., 172)
         self.d = d  # latent dimension (e.g., 10)
 
@@ -335,6 +339,9 @@ class ManifoldLGP(nn.Module):
         self.to(self.device)
         self.train()
 
+        beta = resolve_beta(getattr(self, "beta", 1.0), dataloader)
+        logging.info(f"training with KL weight beta={beta:.6g}")
+
         for epoch in range(current_epoch, epochs):
             mean_loss, reconstr_loss, kl_loss, mse_loss = 0, 0, 0, 0
             
@@ -351,7 +358,7 @@ class ManifoldLGP(nn.Module):
                 optimizer.zero_grad()
                 x_reconstructed, gp_posterior = self(coord)
 
-                loss, recon_loss, kl_div = self.loss_function(x, x_reconstructed, beta=1.0)
+                loss, recon_loss, kl_div = self.loss_function(x, x_reconstructed, beta=beta)
                 loss.backward()
                 optimizer.step()
                 
@@ -480,9 +487,10 @@ class SpectralManifoldLGP(nn.Module):
     Manifold Graph Coordinates -> Latent Riemann GP -> MLP -> 172 Channels
     """
     def __init__(self, p, d, n_neurons, dropout, activation, device, gp_model,
-                 hyperpriors=True, lengthscale_prior_mean=None):
+                 hyperpriors=True, lengthscale_prior_mean=None, beta=1.0):
         super().__init__()
         self.mode = "spectral_manifold_lgp"
+        self.beta = beta   # KL weight; float or 'elbo' (=B/N), see resolve_beta
         self.p = p  # number of channels (e.g., 172)
         self.d = d  # latent dimension (e.g., 10)
 
@@ -563,6 +571,9 @@ class SpectralManifoldLGP(nn.Module):
         self.to(self.device)
         self.train()
 
+        beta = resolve_beta(getattr(self, "beta", 1.0), dataloader)
+        logging.info(f"training with KL weight beta={beta:.6g}")
+
         for epoch in range(current_epoch, epochs):
             mean_loss, reconstr_loss, kl_loss, mse_loss = 0, 0, 0, 0
             
@@ -579,7 +590,7 @@ class SpectralManifoldLGP(nn.Module):
                 optimizer.zero_grad()
                 x_reconstructed, gp_posterior = self(coord)
 
-                loss, recon_loss, kl_div = self.loss_function(x, x_reconstructed, beta=1.0)
+                loss, recon_loss, kl_div = self.loss_function(x, x_reconstructed, beta=beta)
                 loss.backward()
                 optimizer.step()
                 

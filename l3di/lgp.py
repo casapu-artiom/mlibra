@@ -1,3 +1,5 @@
+import logging
+
 import gpytorch
 import numpy as np
 import torch
@@ -152,14 +154,39 @@ class IndependentMultitaskGPModel(ApproximateGP):
         return MultivariateNormal(mean_x, covar_x)
 
 
+def resolve_beta(beta, dataloader) -> float:
+    """Turn the --beta setting into the multiplier the training loop applies.
+
+    A float is used as given. 'elbo' asks for the KL weight that makes the
+    per-minibatch loss proportional to the ELBO over the whole dataset: the
+    loop sums the NLL over a minibatch of B but adds the FULL KL every step,
+    so the KL has to be scaled by B/N to keep the ratio the full-data
+    objective has. N differs per fold, hence resolving it here rather than
+    asking the caller for a number.
+    """
+    if isinstance(beta, str) and beta.strip().lower() == "elbo":
+        try:
+            n = len(dataloader.dataset)
+            b = dataloader.batch_size or 1
+        except (AttributeError, TypeError):
+            logging.warning("beta='elbo' but the dataloader size is unknown; using 1.0")
+            return 1.0
+        scaled = b / max(n, 1)
+        logging.info(f"beta='elbo' -> B/N = {b}/{n} = {scaled:.6g}")
+        return scaled
+    return float(beta)
+
+
 class LGP(nn.Module):
     """
     Latent Gaussian Process model with a conditional likelihood on the latent space.
     """
-    def __init__(self, p, d, n_neurons, dropout, activation,  device, gp_model, use_rsample=True):
+    def __init__(self, p, d, n_neurons, dropout, activation,  device, gp_model, use_rsample=True,
+                 beta=1.0):
         super(LGP, self).__init__()
         self.mode = "lgp"
         self.use_rsample = use_rsample
+        self.beta = beta          # KL weight; float, or 'elbo' for B/N (see resolve_beta)
         self.p = p  # number of channels
         self.d = d  # latent dimension
 
@@ -240,6 +267,10 @@ class LGP(nn.Module):
         self.to(self.device)
         self.train()
 
+        beta = resolve_beta(getattr(self, "beta", 1.0), dataloader)
+        logging.info(f"training with KL weight beta={beta:.6g}")
+        wandb.log({"beta": beta})
+
         for epoch in range(current_epoch, epochs):
             mean_loss = 0
             reconstr_loss = 0
@@ -252,7 +283,7 @@ class LGP(nn.Module):
                 optimizer.zero_grad()
                 x_reconstructed, gp_posterior = self(coord)
 
-                loss, recon_loss, kl_div = self.loss_function(x, x_reconstructed, beta=1.0)
+                loss, recon_loss, kl_div = self.loss_function(x, x_reconstructed, beta=beta)
                 loss.backward()
                 optimizer.step()
                 mean_loss += loss.item()
