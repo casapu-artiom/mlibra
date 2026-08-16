@@ -50,7 +50,7 @@ N_PROBE=${N_PROBE:-8}
 N_EPOCHS=30
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
 S3_EIGENVECTOR_DIR="/s3/mlibra/mlibra-data/artiom/eigenvectors"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/experiment_batch_cv_prune_low_bw"
+S3_OUTPUT_DIR="${S3_OUTPUT_DIR:-/s3/mlibra/mlibra-data/artiom/experiment_batch_cv_new_beta}"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -84,6 +84,7 @@ submit() {
         --cpu-memory-limit "$MEM" --cpu-memory-request "$MEM" \
         --gpu-request-type portion --gpu-portion-request "$GPU" \
         -e EXP_PREFIX="$prefix" \
+        -e BETA="${BETA:-1.0}" \
         -e WANDB_API_KEY="$WANDB_API_KEY" \
         -e DATA_PATH="$S3_DATA_PATH" \
         -e OUTPUT_DIR="$S3_OUTPUT_DIR" \
@@ -133,21 +134,7 @@ submit() {
         -- ./local_run/run_manifold.sh "${extra_args[@]}"
 }
 
-# FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8" "difficult")           # lowercase, dashed
-# GRAPH_BANDWIDTHS=(0.5 1.0)
-# BUMP_SCALES=(1 20 80)
-# BUMP_DECAYS=(0.01 0.1)
-
-# FOLDS=("fold-3")           # lowercase, dashed
-# KNN_K=(5 15)
-# KNN_METHODS=("faiss" "anatomical_atlas")
-# LAPLACIAN_NORMS=("symmetric" "randomwalk")
-# GRAPH_BANDWIDTHS=(0.5 1.0)
-# BUMP_SCALES=(1 20 80)
-# BUMP_DECAYS=(0.1 1.0)
-
-#FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
-FOLDS=("fold-2" "fold-7")           # lowercase, dashed
+FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
 KNN_K=(15)
 # Graph methods to sweep. Override at submit time (space-separated), e.g.
 #   MAN_KNN_METHODS_STR="faiss faiss_cluster_weighted" ATLAS_LEVEL=5 ./submit/run_manifold_batch.sh
@@ -167,13 +154,11 @@ MAN_INFLATIONS=(50)
 # clobbers. e.g. MAN_PRUNE_CROSS_REGIONS=(0.0 0.5 0.9) compares off / mild / hard.
 ROOT_HANDLINGS=("dissolve")
 MAN_DENOISE_LABELS=(3)
-MAN_PRUNE_CROSS_REGIONS=(0.95 0.97)
+MAN_PRUNE_CROSS_REGIONS=(0.95)
 LAPLACIAN_NORMS=("randomwalk")
 GRAPH_BANDWIDTHS=(0.05)
-BUMP_SCALES=(1.0 3.0 6.0)
+BUMP_SCALES=(1.0)
 BUMP_DECAYS=(0.01)
-# BUMP_SCALES=(1 20 80)
-# BUMP_DECAYS=(0.1 1.0
 NU=(2)
 THRESHOLDS=(5)
 # Inducing-point placement setups swept together:
@@ -197,12 +182,6 @@ DIFFUSION_SCALES=("1:1.0")
 # plain-geodesic runs. e.g. ("0:2.5" "1:2.5") = geodesic-only + product baseline.
 PRODUCT_ARD=("0:2.5")
 
-# (stride, num_modes) pairs swept together:
-#   (1) stride=4, num_modes=1300
-#   (2) stride=8, num_modes=6000
-#STRIDE_NUM_MODES=("4:1300" "8:6000")
-#STRIDE_NUM_MODES=("4:50" "4:100" "4:300" "4:1300" "4:2300")
-#STRIDE_NUM_MODES=("4:1300")
 STRIDE_NUM_MODES=("4:100" "4:300")
 
 # Fixed across the whole sweep

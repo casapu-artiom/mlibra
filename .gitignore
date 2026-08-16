@@ -29,3 +29,17 @@ submit/query.py
 submit/retry_failed.py
 submit/rsync_pod.sh
 submit/run_idle.sh
+reports/figures/all_models_corr_mse.png
+reports/figures/all_models_corr_statistics.png
+reports/figures/lgp_architecture_titled.pdf
+reports/figures/lgp_architecture_titled.png
+reports/figures/lgp_architecture.pdf
+reports/figures/lgp_architecture.py
+reports/figures/lipid_volume_panel.pdf
+reports/figures/lipid_volume_panel.png
+reports/figures/lipid_volume_panel.py
+reports/figures/per_lipid_vs_lgp_lift.png
+reports/figures/per_lipid_vs_lgp.png
+manifold/visualizations/.cache/eig_16e75573a4d3_3000.npz
+manifold/visualizations/.cache/pool_fbaab3ba5b.npz
+submit/backup_to_passport.py

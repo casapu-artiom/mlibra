@@ -26,7 +26,7 @@ GPU=0.5
 
 N_EPOCHS=20
 S3_DATA_PATH="/s3/mlibra/mlibra-data/maldi/"
-S3_OUTPUT_DIR="/s3/mlibra/mlibra-data/artiom/lgb_experiment_cv"
+S3_OUTPUT_DIR="${S3_OUTPUT_DIR:-/s3/mlibra/mlibra-data/artiom/lgp_experiment_cv_new_beta}"
 S3_MALDI_FILE="/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet"
 S3_TEMPLATE_NAME="reference"
 S3_REFERENCE_FILE="/s3/mlibra/mlibra-data/reference_image.npy"
@@ -64,6 +64,7 @@ submit() {
         -e SRC_PATH="$SRC_PATH" \
         -e N_EPOCHS="$N_EPOCHS" \
         -e LATENT_DIM=5 \
+        -e BETA="${BETA:-1.0}" \
         -e NUM_INDUCING_POINTS=2000 \
         -e INDUCING_SOURCE="$inducing_source" \
         -e NUM_MODES=2000 \
@@ -76,7 +77,6 @@ submit() {
 EXP_SUFFIX="artiom-$(date +'%y%m%d-%H-%M')"
 
 FOLDS=("fold-1" "fold-2" "fold-3" "fold-4" "fold-5" "fold-6" "fold-7" "fold-8")           # lowercase, dashed
-#FOLDS=("fold-2")           # lowercase, dashed
 NO_RSAMPLES=("true" "false")
 LOG_TRANSFORM=("" "--log-transform")
 IND_SOURCES=("reference" "data")
@@ -105,8 +105,3 @@ for fold in "${FOLDS[@]}"; do
         done
     done
 done
-
-#run_or_echo submit "gp-lgp-fold-3-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3"
-#run_or_echo submit "gp-lgp-fold-3-log-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_FOLD_3}" "FOLD_3" --log-transform
-# run_or_echo submit "gp-lgp-difficult-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_DIFFICULT}" "DIFFICULT"
-# run_or_echo submit "gp-lgp-difficult-log-${EXP_SUFFIX}" "${S3_SLICES_DATASET_FILE_DIFFICULT}" "DIFFICULT" --log-transform

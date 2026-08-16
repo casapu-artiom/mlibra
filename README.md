@@ -27,20 +27,29 @@
    - 5.9 [CV Result Collection — `collect-cv-lgp.py`](#59-cv-result-collection--collect-cv-lgppy)
    - 5.10 [Output Directory Layout](#510-output-directory-layout)
 6. [The `multimodal/` Extension](#6-the-multimodal-extension)
-7. [Shell Scripts & Use Cases](#7-shell-scripts--use-cases)
-   - 7.1 [`deploy.sh` — Code Sync](#71-deploysh--code-sync)
-   - 7.2 [`run_all.sh` — Single LGP Fold Run](#72-run_allsh--single-lgp-fold-run)
-   - 7.3 [`run_all_moe.sh` — Single LGPMOE Fold Run](#73-run_all_moesh--single-lgpmoe-fold-run)
-   - 7.4 [`run_final.sh` — Full-Data Final Model](#74-run_finalsh--full-data-final-model)
-   - 7.5 [`do_cv.sh` — Local CV Grid](#75-do_cvsh--local-cv-grid)
-   - 7.6 [`submit_cv.sh` — Cluster CV Grid](#76-submit_cvsh--cluster-cv-grid)
-8. [Cross-Validation Protocol](#8-cross-validation-protocol)
-9. [Experiment Naming Convention](#9-experiment-naming-convention)
-10. [Installation](#10-installation)
-11. [Running an Experiment](#11-running-an-experiment)
-12. [Testing](#12-testing)
-13. [Infrastructure & Deployment](#13-infrastructure--deployment)
-14. [Dependencies](#14-dependencies)
+7. [The `manifold/` Extension — Riemann Manifold GP](#7-the-manifold-extension--riemann-manifold-gp)
+   - 7.1 [What It Changes](#71-what-it-changes)
+   - 7.2 [Module Layout](#72-module-layout)
+   - 7.3 [Installation](#73-installation)
+   - 7.4 [Running Locally](#74-running-locally)
+   - 7.5 [Cluster Submission](#75-cluster-submission)
+   - 7.6 [Geometry Caches](#76-geometry-caches)
+   - 7.7 [Output Layout](#77-output-layout)
+   - 7.8 [Tooling](#78-tooling)
+8. [Shell Scripts & Use Cases](#8-shell-scripts--use-cases)
+   - 8.1 [`deploy.sh` — Code Sync](#81-deploysh--code-sync)
+   - 8.2 [`run_all.sh` — Single LGP Fold Run](#82-run_allsh--single-lgp-fold-run)
+   - 8.3 [`run_all_moe.sh` — Single LGPMOE Fold Run](#83-run_all_moesh--single-lgpmoe-fold-run)
+   - 8.4 [`run_final.sh` — Full-Data Final Model](#84-run_finalsh--full-data-final-model)
+   - 8.5 [`do_cv.sh` — Local CV Grid](#85-do_cvsh--local-cv-grid)
+   - 8.6 [`submit_cv.sh` — Cluster CV Grid](#86-submit_cvsh--cluster-cv-grid)
+9. [Cross-Validation Protocol](#9-cross-validation-protocol)
+10. [Experiment Naming Convention](#10-experiment-naming-convention)
+11. [Installation](#11-installation)
+12. [Running an Experiment](#12-running-an-experiment)
+13. [Testing](#13-testing)
+14. [Infrastructure & Deployment](#14-infrastructure--deployment)
+15. [Dependencies](#15-dependencies)
 
 ---
 
@@ -126,6 +135,18 @@ mlibra/
 │   ├── experiment.py            # MultiModalExperiment
 │   ├── multimodallgp_experiment.py  # CLI entry point
 │   └── utils.py
+│
+├── manifold/                    # Extension: Riemann manifold (graph-Laplacian) GP
+│   ├── lgp_manifold.py          # ManifoldLGP / SpectralManifoldLGP + their latent GPs
+│   ├── lgp_manifold_experiment.py           # CLI entry point (inducing points)
+│   ├── spectral_lgp_manifold_experiment.py  # CLI entry point (weight space)
+│   ├── manifold_gp/             # Vendored IMGP package (kernels, operators, utils)
+│   ├── slepc/, docker/          # MPI eigensolver; training/notebook images
+│   ├── benchmarks/, visualizations/, notebooks/, toy_example/
+│   └── README.md                # Full documentation for this module
+│
+├── local_run/                   # In-container worker scripts (env -> CLI -> python)
+├── submit/                      # RunAI submission sweeps + pod helpers
 │
 ├── tests/                       # Pytest test suite
 │   ├── conftest.py              # Shared fixtures (device, mock data)
@@ -607,9 +628,246 @@ The multimodal model uses `LGPMultiModal` from `l3di/lgpmultimodal.py` (see [Sec
 
 ---
 
-## 7. Shell Scripts & Use Cases
+## 7. The `manifold/` Extension — Riemann Manifold GP
 
-### 7.1 `deploy.sh` — Code Sync
+The `manifold/` directory replaces the Euclidean kernel of the baseline LGP with a **graph-Laplacian Riemann–Matérn kernel** built on the brain's own geometry, so covariance is measured along tissue rather than straight through it. Everything downstream — data loading, CV splits, the MLP decoder, prediction, whole-brain reconstruction — is shared with `maldi/`, which makes the two directly comparable on the same folds and metrics.
+
+> **Full documentation:** [`manifold/README.md`](manifold/README.md). This chapter is the installation / submission quick start.
+
+### 7.1 What It Changes
+
+Instead of `k(x, y) = Matérn(‖x − y‖)`, the manifold path:
+
+1. Discretises the CCF reference template into a graph — nodes are voxels above `--threshold`, subsampled by `--stride`.
+2. Connects each node to its `k` nearest neighbours with **FAISS**, so edges follow tissue and not air.
+3. Optionally biases the graph by anatomy: edges crossing an Allen atlas region boundary get their length inflated (soft prior, `--cross-region-inflation`) or are removed outright (hard prune, `--prune-cross-region`).
+4. Forms the **graph Laplacian** and solves for its lowest `--num-modes` eigenpairs `(λ_k, φ_k)`.
+5. Defines the kernel as a Matérn spectral filter over those eigenpairs — `k(x, y) = Σ_k S(λ_k) φ_k(x) φ_k(y)` — with a Nyström bump extension for queries that are not exact graph nodes.
+6. Plugs that kernel into the same latent-GP-plus-MLP-decoder stack. Because an MLP sits between the GP latent and the observations, training uses a Monte-Carlo ELBO (`rsample` + decode) rather than `gpytorch.VariationalELBO`, plus MAP-II hyperparameter priors.
+
+Two model stacks are provided: `LatentRiemannGP` + `ManifoldLGP` (inducing points) and `SpectralLatentGP` + `SpectralManifoldLGP` (weight space — no inducing points, diagonal posterior directly over the spectrum). They share every graph/eigenpair cache, so running both separates "does the geometry help?" from "does the inducing approximation hurt?".
+
+### 7.2 Module Layout
+
+```
+manifold/
+├── lgp_manifold.py                      # LatentRiemannGP, ManifoldLGP,
+│                                        #   SpectralLatentGP, SpectralManifoldLGP
+├── lgp_manifold_experiment.py           # ENTRY POINT — inducing-point run
+├── spectral_lgp_manifold_experiment.py  # ENTRY POINT — weight-space (spectral) run
+├── manifold_kernel_builder.py           # Shared graph → Laplacian → eigenpairs → kernel
+├── compute_eigenvectors.py              # Offline GPU (cupy) eigensolve into the shared cache
+├── check_eigencache.py                  # Which eigenvector caches exist / are missing
+├── model_hyperparams.py                 # Dump trained hyperparameters from checkpoints
+├── download_bg_atlas.py                 # Fetch + depth-coarsen the Allen/BrainGlobe annotation
+├── manifold_gp/                         # Vendored IMGP package (kernels, operators, utils)
+├── slepc/                               # MPI/SLEPc eigensolver + PETSc build script
+├── docker/                              # Training / SLEPc / notebook images + entrypoint
+├── benchmarks/                          # Bump support, Nyström, bandwidth, spectral sweeps
+├── visualizations/                      # napari manifold-vs-Euclidean explorer + its engine
+├── notebooks/                           # Narrative notebooks (boundary story, distance study)
+└── toy_example/                         # Synthetic manifolds (swiss roll, box + cylinder)
+```
+
+`manifold/` has no `__init__.py` — it is a script directory. Only `manifold/manifold_gp` is installed, as the **top-level** module `manifold_gp` (it is a fork of [Implicit Manifold GP Regression](https://arxiv.org/abs/2310.19390), so it keeps the upstream name).
+
+Three further working directories — `viz/` (the napari explorer fleet), `experiments/` (one-off validation probes) and `analysis/` (figure notebooks and their cache builders) — are `.gitignore`d and absent from a clone. Nothing in the training or submission path depends on them; see [`manifold/README.md`](manifold/README.md) for what they contain.
+
+### 7.3 Installation
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+
+# Installs BOTH l3di and the vendored manifold_gp — pyproject.toml lists
+# `manifold` as a second package-discovery root for exactly this reason.
+pip install -e .
+pip install -r requirements.txt
+
+# FAISS is NOT in requirements.txt (the container compiles it from source with
+# GPU support). Locally, install a wheel:
+pip install faiss-gpu-cu12          # or: pip install faiss-cpu
+
+# Optional — napari explorers under manifold/visualizations and manifold/toy_example
+pip install napari napari-animation
+
+# Optional — only for manifold/slepc/slepc_eigensolve.py (needs gfortran + MPI)
+PREFIX=/opt WITH_MUMPS=1 bash manifold/slepc/build_slepc_petsc.sh
+export PETSC_DIR=/opt/petsc SLEPC_DIR=/opt/slepc
+export LD_LIBRARY_PATH=/opt/petsc/lib:/opt/slepc/lib:$LD_LIBRARY_PATH
+```
+
+Do **not** `pip install manifold-gp` from PyPI — it would shadow the fork.
+
+Beyond the baseline data files, the atlas-weighted graph methods need an annotation volume (`level_15annot.npy`, `level_5annot.npy`, or a `ccf_depth{N}annot.npy` produced by `manifold/download_bg_atlas.py --max-depth N`).
+
+**Docker** — build from the repo root, since the `COPY` paths are repo-relative:
+
+```bash
+docker build -f manifold/docker/Dockerfile -t artiomartiom/sdsc:maldi_manifold_all_latest .
+```
+
+The image is `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel` plus `requirements.txt`, FAISS built from source with GPU support, PETSc + SLEPc + MUMPS, an sshd on port 2222, and a dual-mode entrypoint: **no arguments** starts sshd for interactive/VS Code Remote work, **with arguments** it activates the venv, drops to `appuser` via `gosu`, and execs the command. Every boot clones/updates the repo at `/myhome/mlibra` and `pip install -e`s it.
+
+### 7.4 Running Locally
+
+The recommended path is `local_run/run_manifold.sh` — the *same* script the cluster executes, with every knob defaulted as an environment variable. It composes `EXP_NAME` from all swept hyperparameters (so two configs can never share an output directory), translates env vars into CLI flags, and calls the Python entry point:
+
+```bash
+DATA_PATH=/path/to/mlibra_data \
+OUTPUT_DIR=/path/to/output \
+EIGENVECTOR_DIR=/path/to/output/eigenvectors \
+SLICES_DATASET_FILE=$PWD/maldi/data/splits/fold_2.json \
+STRIDE=4 NUM_MODES=300 KNN_K=15 \
+KNN_METHOD=faiss_atlas_weighted CROSS_REGION_INFLATION=50 \
+GRAPHBANDWIDTH=0.05 LAPLACIAN_NORM=randomwalk \
+N_EPOCHS=30 BATCH_SIZE=1000 LATENT_DIM=5 \
+  ./local_run/run_manifold.sh
+```
+
+The spectral twin is `local_run/run_spectral_manifold.sh`. Or call Python directly for a smoke run:
+
+```bash
+python manifold/lgp_manifold_experiment.py \
+  --mode lgp --exp-name manifold_smoke \
+  --dataset-path /path/to/mlibra_data \
+  --maldi-file /path/to/maindata_minimal.parquet \
+  --available-lipids-file /path/to/maindata_minimal_available_lipids.npy \
+  --reference-file /path/to/reference_image.npy \
+  --annotations-file /path/to/level_15annot.npy \
+  --template-name reference \
+  --eigenvector-dir /path/to/output/eigenvectors \
+  --output-dir /path/to/output \
+  --slices-dataset-file maldi/data/splits/fold_2.json \
+  --stride 8 --threshold 5 --knn-k 15 --num-modes 100 \
+  --knn-method faiss --laplacian-norm randomwalk \
+  --graphbandwidth-init 0.05 --nu 2 \
+  --num-inducing 200 --latent-dim 5 \
+  --epochs 2 --batch-size 1000 --learning-rate 0.001 --seed 42
+```
+
+Start coarse (large stride, few modes): the first run pays for the graph build and the eigensolve, every later run on the same geometry is a cache hit. Metrics go to Weights & Biases — export `WANDB_API_KEY`, or set `WANDB_MODE=offline`.
+
+The main geometry flags are `--stride`, `--threshold`, `--knn-k`, `--knn-method` (`faiss` / `anatomical_atlas` / `faiss_atlas_weighted` / `faiss_cluster_weighted`), `--laplacian-norm`, `--graphbandwidth-init`, `--num-modes`; the anatomy prior is `--cross-region-inflation`, `--root-handling`, `--denoise-labels`, `--prune-cross-region`; the kernel is `--nu`, `--bump-scale`, `--bump-decay`, `--per-task-lengthscale`, `--diffusion-scale-init` / `--learn-diffusion-scale`, `--product-ard-matern`. See [`manifold/README.md`](manifold/README.md) for the complete tables.
+
+### 7.5 Cluster Submission
+
+Jobs go to the same **RunAI** cluster as the baseline. The chain is:
+
+```
+./submit/run_manifold_batch.sh                       (your machine)
+   └── runai training submit ... -e KEY=VAL ...  --  ./local_run/run_manifold.sh
+          └── python manifold/lgp_manifold_experiment.py    (in the container)
+```
+
+Everything the container needs travels as environment variables, and `run_manifold.sh` is the single env→CLI translation layer — so local and cluster runs are the same code path producing the same experiment names.
+
+**Prerequisite:** a `.env` at the repo root containing `export WANDB_API_KEY=...`; the batch scripts refuse to run without it.
+
+```bash
+DRY_RUN=1 ./submit/run_manifold_batch.sh    # print the runai commands, submit nothing
+./submit/run_manifold_batch.sh              # submit the sweep
+```
+
+The sweep grid is a block of bash arrays in the middle of the script — `FOLDS`, `STRIDE_NUM_MODES` (`"stride:modes"` pairs), `MAN_KNN_METHODS`, `MAN_INFLATIONS`, `ROOT_HANDLINGS`, `MAN_DENOISE_LABELS`, `MAN_PRUNE_CROSS_REGIONS`, `LAPLACIAN_NORMS`, `GRAPH_BANDWIDTHS`, `NU`, `BUMP_SCALES`, `BUMP_DECAYS`, `THRESHOLDS`, `KNN_K`, `IND_SOURCES`, `DIFFUSION_SCALES`, `PRODUCT_ARD`. Edit and resubmit. Refinement knobs that only apply to the weighted graph methods collapse to their no-op value for plain `faiss`, so nothing is submitted redundantly.
+
+Useful submit-time overrides:
+
+```bash
+ATLAS_LEVEL=5 ./submit/run_manifold_batch.sh                        # other annotation volume
+BETA=0.1 ./submit/run_manifold_batch.sh                             # KL weight (tags the output dir)
+S3_OUTPUT_DIR=/s3/.../my_batch ./submit/run_manifold_batch.sh
+FAISS_CPU=1 FORCE_RECOMPUTE_GRAPH=1 ./submit/run_manifold_batch.sh  # CPU-only FAISS timing
+N_LIST=sqrt N_PROBE=8 FAISS_CPU=1 ./submit/run_manifold_batch.sh    # fast approximate CPU build
+RECONSTRUCTION_LIPIDS_FILE=/path/lipids.txt ./submit/run_manifold_batch.sh
+```
+
+Each job defaults to 4 CPU / 48 GB / 0.5 GPU on `artiomartiom/sdsc:maldi_manifold_all_latest`.
+
+| Script | Purpose |
+|---|---|
+| `submit/run_manifold_batch.sh` | The manifold sweep (inducing-point runner) |
+| `submit/run_spectral_manifold_batch.sh` | The spectral twin; shares all graph/eigenvector caches |
+| `submit/run_slepc_cache_prepare.sh` | GPU-free eigenpair pre-computation via MPI + SLEPc shift-invert |
+| `submit/run_lgp_batch.sh` | The Euclidean LGP baseline on the same folds |
+| `submit/run_parcel_lgp_batch.sh`, `run_sota_batch.sh`, `run_submit_baselines_sweep.sh`, `run_submit_per_lipid.sh` | The other comparison sweeps on the same folds |
+
+The surrounding cluster-ops helpers (keep-alive pod, resumable rsync over the port-forward, run-directory downloads, job query / cancel / retry) are `.gitignore`d local-only tooling and are not in the repo — nothing in the training or submission path needs them. Working against a pod interactively is just:
+
+```bash
+runai workspace port-forward <job> --port 2222:2222 &
+ssh -p 2222 appuser@localhost          # or: runai workspace exec <job> -it -- bash
+rsync -avP -e 'ssh -p 2222' ./localdir/ appuser@localhost:/dest/
+```
+
+with the pod submitted **without a command**, so the image's entrypoint starts `sshd` rather than dropping into job mode.
+
+### 7.6 Geometry Caches
+
+The expensive geometry is computed once and reused. Under `--eigenvector-dir`:
+
+```
+<eigenvector-dir>/
+├── knn/     <graph-key>.{npz,json}      # edge_index, edge_value, node coords
+└── eigvecs/ <eig-key>.eigpairs.npz      # eigval (M,), eigvec (N, M)  + .meta.json
+```
+
+Keys come from the `make_key` helpers in `manifold_gp.utils`, which **every** producer and consumer calls — so a cache written by a training run, by `manifold/compute_eigenvectors.py` (offline GPU), or by `manifold/slepc/slepc_eigensolve.py` (MPI/SLEPc) is a drop-in hit for the others. Eigenpairs are nested, so a cached 2300-mode solve satisfies a 300-mode request by truncation, and the annotation filename stem is part of the key so different atlas levels never collide.
+
+Pre-compute ahead of a sweep, then check what you have:
+
+```bash
+python manifold/compute_eigenvectors.py \
+  --reference-volume /path/reference_image.npy \
+  --annotations-volume /path/level_15annot.npy \
+  --output-path /path/eigenvectors \
+  --stride 4 --threshold 5 --knn-k 15 --modes 2300 \
+  --nlist 1 --bandwidth 0.05 --normalization randomwalk \
+  --knn-method faiss_atlas_weighted --cross-region-inflation 50 \
+  --root-handling dissolve --denoise-labels 3 --prune-cross-region 0.95
+
+python manifold/check_eigencache.py --eigenvector-dir /path/eigenvectors --list
+```
+
+### 7.7 Output Layout
+
+`EXP_NAME` encodes every swept hyperparameter; conditional suffixes are appended only when a knob is non-default, so historical directory names stay valid:
+
+```
+{EXP_PREFIX}-MANIFOLD-{RSAMPLE|MEAN}-{latent}-{stride}-K{modes}-{template}-{threshold}
+  -{ind_source}-{num_inducing}-{batch}-{knn_method}-{inflation}-{knn_k}-{lap_norm}
+  -{nu}-{bump_scale}-{bump_decay}-{bandwidth}
+  [-learndiff{init}] [-prodard{nu}] [-blend{frac}] [-{atlas_stem}]
+  [-root{mode}] [-dn{N}] [-prune{F}] [-beta{β}]
+```
+
+```
+{OUTPUT_DIR}/{EXP_NAME}/
+├── args.npy, config.json     # exact arguments + human-readable snapshot
+├── model.pth                 # trained weights (also the source of truth for inducing geometry)
+├── checkpoints/              # model_{epoch}.pth
+├── train/, test/             # predictions.npy, true_values.npy, scatter plots
+├── volume/                   # dense per-lipid whole-brain volumes
+├── volume_sparse/            # written instead of volume/ under --render-voxels-only
+└── renders/                  # composite figures, diagnostics, error slices
+```
+
+`--render-voxels-only` (on by default in `run_manifold.sh`) reconstructs only the voxels the composite render reads — ~5.5× fewer for a near-identical figure. Set `RENDER_VOXELS_ONLY=0` when you need dense volumes for napari or the analysis scripts.
+
+### 7.8 Tooling
+
+All of it reads the same caches as training, so nothing is recomputed:
+
+- **`manifold/benchmarks/`** — `bump_support_report.py` (are your points inside the kernel's bump support, or silently falling back to the prior?), `nystrom_benchmark.py` (accuracy of the out-of-sample extension), `graph_bandwidth_sweep.py` (pick a bandwidth that is neither saturated nor collapsed), `spectral_distance_sweep.py` + `spectral_sweep_report.py` (which distance metric the lipid covariance actually decays along), `eigensolver_compare.py`. Each has a matching `.sh` with a worked invocation.
+- **`manifold/visualizations/`** — a napari explorer that fits a Euclidean and a manifold kernel side by side and reports the border-budget numbers, its standalone numeric engine, and a raw-MALDI-over-the-template viewer.
+- **`manifold/notebooks/`** — the boundary-behaviour and distance-metric narrative notebooks, with their pooled anchor caches checked in so they run without a rebuild.
+- **`manifold/toy_example/`** — synthetic folded geometries where a manifold kernel should win, for sanity-checking the whole stack.
+- Local-only (`.gitignore`d): `manifold/viz/` (the wider napari explorer fleet), `manifold/experiments/` (validation probes), `manifold/analysis/` (figure notebooks and cache builders).
+
+---
+
+## 8. Shell Scripts & Use Cases
+
+### 8.1 `deploy.sh` — Code Sync
 
 Synchronises the local repository to a remote compute node over SSH (port 2222):
 
@@ -619,7 +877,7 @@ Synchronises the local repository to a remote compute node over SSH (port 2222):
 
 Uses `rsync` with exclusions for `.git/`, `.gitignore`, and build artefacts. The remote target is `root@localhost:/myhome/` (tunnelled via a local port forward). This is intended to be run before submitting jobs to the cluster.
 
-### 7.2 `run_all.sh` — Single LGP Fold Run
+### 8.2 `run_all.sh` — Single LGP Fold Run
 
 **This is the core worker script** executed by each cluster job. It accepts four positional arguments:
 
@@ -654,7 +912,7 @@ bash maldi/run_all.sh 500 10 1 2000
 CV-FOLD-{FOLD}-{LATENT_DIM}-{NUM_INDUCING}-{BATCH_SIZE}{N_PIXELS}_log
 ```
 
-### 7.3 `run_all_moe.sh` — Single LGPMOE Fold Run
+### 8.3 `run_all_moe.sh` — Single LGPMOE Fold Run
 
 Same as `run_all.sh` but calls `lgpmoe_experiment.py` with an additional parameter:
 
@@ -674,7 +932,7 @@ lgpmoe_CV-FOLD-{FOLD}-{LATENT_DIM}-{NUM_INDUCING}-{BATCH_SIZE}-MOE-{NUM_EXPERTS}
 
 Runs for **40 epochs** and does **not** include `--use-diffusion`.
 
-### 7.4 `run_final.sh` — Full-Data Final Model
+### 8.4 `run_final.sh` — Full-Data Final Model
 
 Trains the LGP on **all available data** (`all.json` split, no held-out test set) for **50 epochs**. Intended to produce the best-quality model for downstream whole-brain reconstruction.
 
@@ -692,7 +950,7 @@ bash local_run/run_lgp.sh
 
 No `--use-diffusion` flag. Experiment name: `LGPALL-{LATENT_DIM}-{NUM_INDUCING}-{BATCH_SIZE}{N_PIXELS}_log`
 
-### 7.5 `do_cv.sh` — Local CV Grid
+### 8.5 `do_cv.sh` — Local CV Grid
 
 Runs the full CV grid sequentially **without** cluster submission. Iterates the same hyperparameter grid as `submit_cv.sh`:
 
@@ -710,7 +968,7 @@ FOLD          in {1, 2, 3, 4, 5}
 
 Total: **40 runs** (2 × 2 × 2 × 5). Useful for debugging on a machine with sufficient memory and GPU.
 
-### 7.6 `submit_cv.sh` — Cluster CV Grid
+### 8.6 `submit_cv.sh` — Cluster CV Grid
 
 Submits the same 40-run grid to a **RunAI** Kubernetes cluster:
 
@@ -731,7 +989,7 @@ Sequence:
 
 ---
 
-## 8. Cross-Validation Protocol
+## 9. Cross-Validation Protocol
 
 The CV scheme evaluates **spatial generalisation**: given training data from several brain sections (from multiple biological replicates), can the model predict lipid intensities at unseen sections from different replicates?
 
@@ -748,7 +1006,7 @@ Predictions are always made by querying the trained GP at the 3-D CCF coordinate
 
 ---
 
-## 9. Experiment Naming Convention
+## 10. Experiment Naming Convention
 
 Experiment names are constructed programmatically from the configuration:
 
@@ -765,7 +1023,7 @@ The `{n_pixels}` suffix is appended by `MaldiConfig.from_args()` and the `_log` 
 
 ---
 
-## 10. Installation
+## 11. Installation
 
 ### Prerequisites
 
@@ -813,7 +1071,7 @@ The container also configures an SSH server (port 2222) to support the `deploy.s
 
 ---
 
-## 11. Running an Experiment
+## 12. Running an Experiment
 
 ### Minimal Local Test
 
@@ -878,7 +1136,7 @@ python multimodallgp_experiment.py \
 
 ---
 
-## 12. Testing
+## 13. Testing
 
 Tests are located in `tests/` and use **pytest**.
 
@@ -912,7 +1170,7 @@ pytest tests/test_lgp_kernel.py -v
 
 ---
 
-## 13. Infrastructure & Deployment
+## 14. Infrastructure & Deployment
 
 ### Compute Environment
 
@@ -946,7 +1204,7 @@ All training metrics are logged to **Weights & Biases** (`wandb`). The following
 
 ---
 
-## 14. Dependencies
+## 15. Dependencies
 
 ### Core (`l3di`)
 
