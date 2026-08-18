@@ -42,7 +42,11 @@ install_authorized_keys "/root/.ssh" "root:root"
 # ---- Maldi Repo Check and Install ----
 if [ ! -d /myhome/mlibra ]; then
 echo "[entrypoint] recreating /mydata/maldi. Cloning..."
-    gosu "${APP_USER}" git clone https://github.com/casapu-artiom/mlibra.git /myhome/mlibra
+    gosu "${APP_USER}" git clone https://github.com/SwissDataScienceCenter/mlibra.git /myhome/mlibra
+fi
+if [! -d /myhome/mlibra/euclid]; then
+echo "[entrypoint] recreating /mydata/maldi/euclid. Cloning..."
+    gosu git clone https://github.com/lamanno-epfl/EUCLID.git /myhome/mlibra/euclid
 fi
 cd /myhome/mlibra
 

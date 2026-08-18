@@ -67,7 +67,8 @@ Usage examples:
 import sys as _sys
 from pathlib import Path as _Path
 _REPO_ = _Path(__file__).resolve().parents[1]
-for _p in (str(_REPO_), str(_REPO_ / "maldi"), str(_REPO_ / "manifold"),):
+for _p in (str(_REPO_), str(_REPO_ / "maldi"), str(_REPO_ / "manifold"),
+           str(_Path(__file__).resolve().parent),):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
 # --- end bootstrap ---
@@ -154,7 +155,7 @@ def parse_args():
     # Baseline-specific knobs
     parser.add_argument("--model", type=str, default="linear",
                         choices=["mean", "linear", "xgboost", "mlp", "mlp_eigen",
-                                 "gcn", "gcn_faiss"])
+                                 "gcn", "gcn_faiss", "euclid"])
     parser.add_argument("--ridge-alpha", type=float, default=1.0)
     parser.add_argument("--mlp-hidden", type=int, nargs="+", default=[128, 128, 128])
     parser.add_argument("--mlp-dropout", type=float, default=0.1)
@@ -183,6 +184,24 @@ def parse_args():
                         help="(--model gcn_faiss) nearest reference nodes blended by "
                              "inverse-distance (Shepard) interpolation at read-out. "
                              "1 = the old nearest-node lookup.")
+
+    # EUCLID knobs (--model euclid). EUCLID's own settings are the defaults and
+    # there is nothing else to tune: the grid, radius, exp(-d) weights, the leaf
+    # gate and the int(ccf*10)-1 index map all come from their code and their
+    # shipped 100um volumes.
+    parser.add_argument("--euclid-repo", dest="euclid_repo", type=str, default=None,
+                        help="Path to the EUCLID checkout (default: <repo>/euclid). "
+                             "Its anatomical_interpolation is executed as-is.")
+    parser.add_argument("--euclid-w", dest="euclid_w", type=float, default=50,
+                        help="EUCLID's `w`: low-intensity voxels are dropped below "
+                             "this (their anatomical_interpolation default is 50).")
+    parser.add_argument("--euclid-jobs", dest="euclid_jobs", type=int, default=1,
+                        help="Processes to fan EUCLID's per-lipid kernel across "
+                             "(~242 s/lipid single-threaded; 173 lipids = 11.6 h at 1).")
+    parser.add_argument("--euclid-verify-reduction", dest="euclid_verify_reduction",
+                        action="store_true",
+                        help="Check the per-voxel row reduction against EUCLID's "
+                             "unreduced iterrows() path on one lipid. Slow.")
 
     # Reconstruction
     parser.add_argument("--template-name", dest="template_name", type=str, required=True, help="Template name.")
@@ -905,8 +924,157 @@ class GCNFaissBaseline:
         self._node_preds = None   # recomputed lazily (graph re-attached in main)
 
 
+class EuclidBaseline:
+    """EUCLID's `anatomical_interpolation`, run unmodified (see euclid_kernel).
+
+    Transductive: nothing is trained. `fit` hands the fold's TRAIN rows to
+    EUCLID's own driver, which builds the 100um donor volume and interpolates it;
+    `predict` reads those volumes. Held-out rows are never passed in, so the fold
+    is respected by construction.
+
+    Predictions come back in EUCLID's `normalize_to_255(log(x))` units, so a
+    per-lipid affine fitted on TRAIN maps them into the harness's (log - mean)/std
+    space. Correlation — the headline metric — is invariant to that; it only makes
+    r2/rmse readable.
+    """
+    kind = "euclid"
+
+    def __init__(self):
+        self.volumes = None
+        self.lipids = None
+        self.volume_dir = None
+        self.affine = None            # (p, 2): slope, intercept
+        self.coord_mean = self.coord_std = None
+        self.col_means = self.col_stds = None
+        self.log_transform = True
+
+    # -- context from main() ----------------------------------------------
+    def set_fit_context(self, coord_mean, coord_std, col_means, col_stds,
+                        log_transform, lipid_names):
+        """fit() receives standardized log values, but EUCLID's driver applies its
+        own log to raw intensities — so we need the stats to invert the harness's
+        normalization, the coordinate frame to recover CCF mm, and the lipid names
+        in the column order _load_split read them."""
+        self.coord_mean, self.coord_std = coord_mean, coord_std
+        self.col_means, self.col_stds = col_means, col_stds
+        self.log_transform = log_transform
+        self.lipids = [str(n) for n in lipid_names]
+
+    def _mm(self, coords_std):
+        c = coords_std if torch.is_tensor(coords_std) else torch.tensor(coords_std)
+        return (c.cpu().float() * self.coord_std + self.coord_mean).numpy()
+
+    def _raw(self, y_norm):
+        return _denormalize(y_norm, self.col_means, self.col_stds, self.log_transform).numpy()
+
+    def _apply_affine(self, sampled):
+        out = sampled * self.affine[:, 0] + self.affine[:, 1]
+        return np.nan_to_num(out, nan=0.0)   # 0 == the per-lipid train mean
+
+    # -- fit ---------------------------------------------------------------
+    def fit(self, coords_train, y_train, coords_test, y_test, args):
+        from euclid_kernel import (run_anatomical_interpolation, sample_volumes,
+                                   verify_row_reduction)
+        if self.coord_mean is None:
+            raise RuntimeError("main() must call set_fit_context() before fit()")
+
+        _t = time.time()
+        def _phase(msg):
+            logging.info(f"[euclid] {msg}  (+{time.time() - _t:.0f}s)")
+
+        mm_train, mm_test = self._mm(coords_train), self._mm(coords_test)
+        raw_train = self._raw(y_train)
+        w = float(args.get("euclid_w", 50))
+        self.volume_dir = Path(args["output_dir"]) / args["exp_name"] / "euclid_volumes"
+        _phase(f"phase 1/5 inputs ready: {len(mm_train):,} train / {len(mm_test):,} "
+               f"test pixels, {len(self.lipids)} lipids, w={w}, "
+               f"volumes -> {self.volume_dir}")
+
+        if args.get("euclid_verify_reduction"):
+            verify_row_reduction(mm_train, raw_train, self.lipids[0],
+                                 self.volume_dir.parent / "euclid_verify",
+                                 w=w, euclid_repo=args.get("euclid_repo"))
+
+        self.volumes = run_anatomical_interpolation(
+            mm_train, raw_train, self.lipids, self.volume_dir,
+            w=w, euclid_repo=args.get("euclid_repo"),
+            n_jobs=int(args.get("euclid_jobs", 1)),
+        )
+        _phase(f"phase 2/5 interpolation done: {len(self.volumes)} volumes")
+
+        s_train = sample_volumes(self.volumes, self.lipids, mm_train)
+        s_test = sample_volumes(self.volumes, self.lipids, mm_test)
+        _phase("phase 3/5 volumes sampled at train + test pixels")
+
+        # Per-lipid affine, fitted on TRAIN only. Closed form in float64 rather
+        # than np.polyfit: on ~5M float32 points polyfit's Vandermonde is
+        # ill-conditioned and silently returns a slope of the WRONG SIGN
+        # (observed: corr +0.52, polyfit slope -0.08, with a RankWarning).
+        yt = y_train.numpy()
+        self.affine = np.zeros((len(self.lipids), 2), dtype=np.float64)
+        for j in range(len(self.lipids)):
+            m = np.isfinite(s_train[:, j]) & np.isfinite(yt[:, j])
+            if m.sum() <= 10:
+                continue
+            x = s_train[m, j].astype(np.float64)
+            y = yt[m, j].astype(np.float64)
+            xm, ym = x.mean(), y.mean()
+            var = np.mean((x - xm) ** 2)
+            if var <= 0:
+                continue
+            a = np.mean((x - xm) * (y - ym)) / var
+            self.affine[j] = (a, ym - a * xm)
+        neg = int((self.affine[:, 0] < 0).sum())
+        _phase(f"phase 4/5 calibrated {int((self.affine[:, 0] != 0).sum())}"
+               f"/{len(self.lipids)} lipids onto harness scale"
+               + (f"  WARNING: {neg} with NEGATIVE slope" if neg else ""))
+
+        pred_tr = self._apply_affine(s_train)
+        pred_te = self._apply_affine(s_test)
+
+        # Held-out corr right here, so the log carries the headline number
+        # without waiting for metrics.csv at the end of the run.
+        yte = y_test.numpy()
+        cs = []
+        for j in range(len(self.lipids)):
+            m = np.isfinite(pred_te[:, j]) & np.isfinite(yte[:, j])
+            if m.sum() > 10 and np.std(pred_te[m, j]) > 0:
+                cs.append(np.corrcoef(pred_te[m, j], yte[m, j])[0, 1])
+        if cs:
+            cs = np.array(cs)
+            _phase(f"phase 5/5 held-out corr (normalized log space): "
+                   f"mean {cs.mean():.4f}  median {np.median(cs):.4f}  "
+                   f"min {cs.min():.4f}  max {cs.max():.4f}  over {len(cs)} lipids")
+
+        return (torch.tensor(pred_tr, dtype=torch.float32),
+                torch.tensor(pred_te, dtype=torch.float32))
+
+    # -- predict -----------------------------------------------------------
+    def predict(self, coords_std):
+        from euclid_kernel import sample_volumes
+        s = sample_volumes(self.volumes, self.lipids, self._mm(coords_std))
+        return torch.tensor(self._apply_affine(s), dtype=torch.float32)
+
+    # -- persistence -------------------------------------------------------
+    def save(self, path):
+        # The volumes are already on disk where EUCLID wrote them (~10 MB each);
+        # store the pointer, not a second copy.
+        torch.save({"volume_dir": str(self.volume_dir), "lipids": self.lipids,
+                    "affine": self.affine, "coord_mean": self.coord_mean,
+                    "coord_std": self.coord_std}, path)
+
+    def load(self, path, p, args):
+        d = torch.load(path, map_location="cpu", weights_only=False)
+        self.volume_dir = Path(d["volume_dir"])
+        self.lipids, self.affine = d["lipids"], d["affine"]
+        self.coord_mean, self.coord_std = d["coord_mean"], d["coord_std"]
+        self.volumes = {lip: np.load(self.volume_dir / f"{lip}_interpolation_log.npy")
+                        for lip in self.lipids}
+
+
 MODEL_REGISTRY = {
     "mean":      MeanBaseline,
+    "euclid":    EuclidBaseline,
     "linear":    LinearBaseline,
     "xgboost":   XGBoostBaseline,
     "mlp":       MLPBaseline,
@@ -1288,6 +1456,12 @@ def main():
         torch.save(coord_mean, coord_mean_path)
         torch.save(coord_std, coord_std_path)
         logging.info(f"train: {y_train_norm.shape[0]:,} rows, {y_train_norm.shape[1]} lipids")
+
+        # Transductive models (euclid) run on raw intensities in CCF mm, so they
+        # need the frames fit() cannot recover from its standardized inputs.
+        if hasattr(model, "set_fit_context"):
+            model.set_fit_context(coord_mean, coord_std, col_means, col_stds,
+                                  config.log_transform, config.selected_lipids_names)
 
         y_test_logged, y_test_original, coords_test, pixel_idx_test = _load_split(
             config, train=False,
