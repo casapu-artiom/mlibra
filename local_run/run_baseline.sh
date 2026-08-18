@@ -153,10 +153,19 @@ if { [ "$MODEL" = "mlp_eigen" ] || [ "$MODEL" = "gcn_faiss" ]; } \
     fi
 fi
 
-# Only EUCLID_W changes the result, so it is the only thing in the name.
+# Every input that changes an EUCLID result goes in the name, so no two configs
+# can share a dir: the w threshold, and BOTH volumes (the annotation is the
+# structure gate, the reference is the `reference < 4` background mask). The
+# atlas is named by its file stems rather than a mode word, so swapping
+# level_15annot for ccf_depth7annot also lands somewhere new. EUCLID_JOBS and
+# RENDER_VOXELS_ONLY are deliberately absent: neither changes a prediction.
 if [ "$MODEL" = "euclid" ]; then
     [ "$EUCLID_W" != "50" ] && EXP_NAME="$EXP_NAME-w$EUCLID_W"
-    [ "$EUCLID_ATLAS" = "own" ] && EXP_NAME="$EXP_NAME-ownatlas"
+    if [ "$EUCLID_ATLAS" = "own" ]; then
+        EXP_NAME="$EXP_NAME-$(basename "$ANNOTATION_FILE" .npy)-$(basename "$REFERENCE_FILE" .npy)"
+    else
+        EXP_NAME="$EXP_NAME-euclidatlas"
+    fi
 fi
 
 # ---- reconstruction lipids from the curated subset file (mirror run_manifold) ----

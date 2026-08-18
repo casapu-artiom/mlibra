@@ -7,6 +7,10 @@
 # kernel is single-threaded and costs ~242 s per lipid on the 132x80x114 grid, so
 # the only lever is EUCLID_JOBS: one process per lipid. 25-way takes 173 lipids
 # from 11.6 h to ~30 min. Ask for CPU == EUCLID_JOBS or the cgroup throttles them.
+# Cost scales with how permissive the gate is: measured 242 s/lipid on EUCLID's
+# 672-label leaf annotation vs 527 s/lipid on level_15annot, whose root label
+# alone covers 57% of tissue -- coarser atlas, fewer candidates rejected, more
+# accumulation. Budget ~2x the wall clock for the atlas=own arm.
 #
 # NO GPU: nothing here touches torch beyond the harness's tensor bookkeeping.
 #
@@ -170,8 +174,13 @@ done
 
 echo
 echo "Submitted $n_submitted jobs. Suffix: $EXP_SUFFIX  Output: $S3_OUTPUT_DIR"
-echo "Each job: ~30 min interpolation (173 lipids / $EUCLID_JOBS procs) + reconstruction."
-echo "Run dirs: <FOLD>-BASELINES-EUCLID-256[-w0][-ownatlas]10"
-echo "            no suffix   = EUCLID atlas, w=50 (their defaults)"
-echo "            -w0         = intensity filter off (the fair corr arm)"
-echo "            -ownatlas   = this repo's reference + annotation"
+echo "Each job: interpolation (173 lipids / $EUCLID_JOBS procs) + reconstruction."
+echo "  atlas=euclid ~30 min/job   (leaf gate: ~1.6% of the donor sphere passes,"
+echo "                              so most candidates are rejected cheaply)"
+echo "  atlas=own    ~60 min/job   (level_15annot's root label covers 57% of tissue,"
+echo "                              so far more donors pass and get accumulated)"
+echo "Run dirs: <FOLD>-BASELINES-EUCLID-256[-w<W>]-<atlas>10   (all 32 distinct)"
+echo "            -w0                            intensity filter off (fair corr arm)"
+echo "            (no -w)                        w=50, EUCLID's default"
+echo "            -euclidatlas                   their 672-label leaf volumes"
+echo "            -<annot_stem>-<ref_stem>       this repo's pair, named by file"
