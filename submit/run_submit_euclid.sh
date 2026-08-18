@@ -63,7 +63,17 @@ if [ "$GPU" != "0" ]; then
     GPU_ARGS=(--gpu-request-type portion --gpu-portion-request "$GPU")
 fi
 
-# --- Sweep ------------------------------------------------------------------
+# --- Sweep: atlas x fold x w  (2 x 8 x 2 = 32 jobs) -------------------------
+# ATLAS_LIST picks which volumes drive their pipeline:
+#   euclid -> the two 100um .npy from the EUCLID repo, staged at EUCLID_DATA_DIR.
+#             Their annotation IS the Allen 672-label leaf volume (verified
+#             identical to BrainGlobe allen_mouse_25um[::4] and to
+#             download_bg_atlas.py --max-depth 9).
+#   own    -> this repo's REFERENCE_FILE + ANNOTATION_FILE, subsampled [::4].
+#             Note level_15annot's root label alone covers 57% of tissue, so the
+#             structure gate is largely inert over most of the brain -- this arm
+#             is close to an ungated Shepard smoother, by construction.
+ATLAS_LIST=(${ATLAS_LIST:-euclid own})
 W_LIST=(${W_LIST:-0 50})
 FOLDS_LIST=(${FOLDS_LIST:-fold-1 fold-2 fold-3 fold-4 fold-5 fold-6 fold-7 fold-8})
 
@@ -77,14 +87,15 @@ S3_DATA_PATH=${S3_DATA_PATH:-/s3/mlibra/mlibra-data/maldi/}
 S3_OUTPUT_DIR=${S3_OUTPUT_DIR:-/s3/mlibra/mlibra-data/artiom/euclid_cv}
 S3_MALDI_FILE=${S3_MALDI_FILE:-/s3/mlibra/mlibra-data/maldi/maindata_minimal.parquet}
 S3_AVAILABLE_LIPIDS_FILE=${S3_AVAILABLE_LIPIDS_FILE:-/s3/mlibra/mlibra-data/maldi/maindata_minimal_available_lipids.npy}
-# The template only sets the reconstruction voxel set and the render backdrop.
-# NO annotation is passed: EUCLID's structure gate is its own shipped
-# annotation_image100um.npy (the Allen 672-label leaf volume, == BrainGlobe
-# allen_mouse_25um[::4]), read inside their anatomical_interpolation from the
-# checkout. ANNOTATION_FILE / ATLAS_LEVEL are inert for this model. ccf_bg_reference is the BrainGlobe reference
-# EUCLID's volumes are derived from ([::4] of allen_mouse_25um), which keeps the
-# reconstruction grid consistent with the atlas the method actually uses.
-S3_REFERENCE_FILE=${S3_REFERENCE_FILE:-/s3/mlibra/mlibra-data/ccf_bg_reference.npy}
+# REFERENCE_FILE always sets the reconstruction voxel set and the render
+# backdrop; for ATLAS=own it ALSO drives EUCLID's `reference < 4` background
+# mask. ANNOTATION_FILE is used only by ATLAS=own, as the structure gate.
+# Defaults are this repo's LGP-comparable pair; set S3_REFERENCE_FILE=
+# .../ccf_bg_reference.npy if you would rather reconstruct on the BrainGlobe grid.
+S3_REFERENCE_FILE=${S3_REFERENCE_FILE:-/s3/mlibra/mlibra-data/reference_image.npy}
+S3_ANNOTATION_FILE=${S3_ANNOTATION_FILE:-/s3/mlibra/mlibra-data/level_15annot.npy}
+# EUCLID's own two 100um volumes, staged outside the code checkout.
+S3_EUCLID_DATA_DIR=${S3_EUCLID_DATA_DIR:-/s3/mlibra/mlibra-data/artiom/euclid_data}
 SRC_PATH=${SRC_PATH:-/myhome/mlibra}
 SPLITS_DIR=${SPLITS_DIR:-/myhome/mlibra/maldi/data/splits}
 # Curated 5-lipid subset that gets reconstructed + rendered. Lives in the repo
@@ -99,9 +110,9 @@ EXP_SUFFIX=${EXP_SUFFIX:-$(date +'%y%m%d-%H-%M')}
 
 n_submitted=0
 submit_euclid() {
-    local job_name=$1 fold_upper=$2 slices=$3 w=$4
+    local job_name=$1 fold_upper=$2 slices=$3 w=$4 atlas=$5
     n_submitted=$((n_submitted + 1))
-    echo ">>> [$n_submitted] $job_name  (fold=$fold_upper w=$w jobs=$EUCLID_JOBS)"
+    echo ">>> [$n_submitted] $job_name  (fold=$fold_upper atlas=$atlas w=$w jobs=$EUCLID_JOBS)"
     run_or_echo runai training submit "$job_name" \
         -i "$IMAGE" \
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
@@ -118,6 +129,9 @@ submit_euclid() {
         -e RECONSTRUCTION_LIPIDS_FILE="$RECON_LIPIDS_FILE" \
         -e TEMPLATE_NAME="reference" \
         -e REFERENCE_FILE="$S3_REFERENCE_FILE" \
+        -e ANNOTATION_FILE="$S3_ANNOTATION_FILE" \
+        -e EUCLID_ATLAS="$atlas" \
+        -e EUCLID_DATA_DIR="$S3_EUCLID_DATA_DIR" \
         -e SRC_PATH="$SRC_PATH" \
         -e EUCLID_REPO="$EUCLID_REPO" \
         -e EUCLID_W="$w" \
@@ -134,6 +148,7 @@ submit_euclid() {
 echo "image   : $IMAGE"
 echo "output  : $S3_OUTPUT_DIR"
 echo "folds   : ${FOLDS_LIST[*]}"
+echo "atlas   : ${ATLAS_LIST[*]}   (euclid=${S3_EUCLID_DATA_DIR}, own=${S3_ANNOTATION_FILE})"
 echo "w       : ${W_LIST[*]}"
 echo "workers : $EUCLID_JOBS (cpu=$CPU mem=$MEM gpu=$GPU)"
 echo "renders : $RECON_LIPIDS_FILE  (render_voxels_only=$RENDER_VOXELS_ONLY)"
@@ -144,15 +159,19 @@ for FOLD in "${FOLDS_LIST[@]}"; do
     SLICES_DATASET_FILE="${SPLITS_DIR}/${FOLD//-/_}.json"
     FOLD_UPPER=${FOLD^^}
     fold_slug="${FOLD//fold-/f}"
-    for w in "${W_LIST[@]}"; do
-        # runai job names must be lowercase and DNS-safe.
-        submit_euclid "euclid-w${w}-${fold_slug}-${EXP_SUFFIX}" \
-                      "$FOLD_UPPER" "$SLICES_DATASET_FILE" "$w"
+    for atlas in "${ATLAS_LIST[@]}"; do
+        for w in "${W_LIST[@]}"; do
+            # runai job names must be lowercase and DNS-safe.
+            submit_euclid "euclid-${atlas}-w${w}-${fold_slug}-${EXP_SUFFIX}" \
+                          "$FOLD_UPPER" "$SLICES_DATASET_FILE" "$w" "$atlas"
+        done
     done
 done
 
 echo
 echo "Submitted $n_submitted jobs. Suffix: $EXP_SUFFIX  Output: $S3_OUTPUT_DIR"
 echo "Each job: ~30 min interpolation (173 lipids / $EUCLID_JOBS procs) + reconstruction."
-echo "Run dirs: <FOLD>-BASELINES-EUCLID-256      (w=50, EUCLID's default)"
-echo "          <FOLD>-BASELINES-EUCLID-256-w0   (filter off, the fair corr arm)"
+echo "Run dirs: <FOLD>-BASELINES-EUCLID-256[-w0][-ownatlas]10"
+echo "            no suffix   = EUCLID atlas, w=50 (their defaults)"
+echo "            -w0         = intensity filter off (the fair corr arm)"
+echo "            -ownatlas   = this repo's reference + annotation"

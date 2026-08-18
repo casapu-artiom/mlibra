@@ -195,6 +195,19 @@ def parse_args():
     parser.add_argument("--euclid-w", dest="euclid_w", type=float, default=50,
                         help="EUCLID's `w`: low-intensity voxels are dropped below "
                              "this (their anatomical_interpolation default is 50).")
+    parser.add_argument("--euclid-reference", dest="euclid_reference", type=str,
+                        default=None,
+                        help="Reference volume for EUCLID's `reference < 4` "
+                             "background mask. Default: reference_image100um.npy "
+                             "from --euclid-repo. 25um volumes are subsampled "
+                             "[::4] onto their 100um grid.")
+    parser.add_argument("--euclid-annotation", dest="euclid_annotation", type=str,
+                        default=None,
+                        help="Annotation volume for EUCLID's same-structure donor "
+                             "gate. Default: annotation_image100um.npy from "
+                             "--euclid-repo (the Allen 672-label leaf volume). "
+                             "A coarser atlas weakens the gate: level_15annot's "
+                             "root label alone covers 57%% of tissue.")
     parser.add_argument("--euclid-jobs", dest="euclid_jobs", type=int, default=1,
                         help="Processes to fan EUCLID's per-lipid kernel across "
                              "(~242 s/lipid single-threaded; 173 lipids = 11.6 h at 1).")
@@ -943,6 +956,7 @@ class EuclidBaseline:
         self.volumes = None
         self.lipids = None
         self.volume_dir = None
+        self.exp_path = None
         self.affine = None            # (p, 2): slope, intercept
         self.coord_mean = self.coord_std = None
         self.col_means = self.col_stds = None
@@ -950,7 +964,7 @@ class EuclidBaseline:
 
     # -- context from main() ----------------------------------------------
     def set_fit_context(self, coord_mean, coord_std, col_means, col_stds,
-                        log_transform, lipid_names):
+                        log_transform, lipid_names, exp_path):
         """fit() receives standardized log values, but EUCLID's driver applies its
         own log to raw intensities — so we need the stats to invert the harness's
         normalization, the coordinate frame to recover CCF mm, and the lipid names
@@ -959,6 +973,10 @@ class EuclidBaseline:
         self.col_means, self.col_stds = col_means, col_stds
         self.log_transform = log_transform
         self.lipids = [str(n) for n in lipid_names]
+        # MaldiConfig rewrites exp_name (it appends the epoch count), so the run
+        # dir is NOT output_dir/exp_name -- take the resolved path from main() or
+        # the volumes land in a sibling directory.
+        self.exp_path = Path(exp_path)
 
     def _mm(self, coords_std):
         c = coords_std if torch.is_tensor(coords_std) else torch.tensor(coords_std)
@@ -985,20 +1003,22 @@ class EuclidBaseline:
         mm_train, mm_test = self._mm(coords_train), self._mm(coords_test)
         raw_train = self._raw(y_train)
         w = float(args.get("euclid_w", 50))
-        self.volume_dir = Path(args["output_dir"]) / args["exp_name"] / "euclid_volumes"
+        self.volume_dir = self.exp_path / "euclid_volumes"
         _phase(f"phase 1/5 inputs ready: {len(mm_train):,} train / {len(mm_test):,} "
                f"test pixels, {len(self.lipids)} lipids, w={w}, "
                f"volumes -> {self.volume_dir}")
 
         if args.get("euclid_verify_reduction"):
             verify_row_reduction(mm_train, raw_train, self.lipids[0],
-                                 self.volume_dir.parent / "euclid_verify",
+                                 self.exp_path / "euclid_verify",
                                  w=w, euclid_repo=args.get("euclid_repo"))
 
         self.volumes = run_anatomical_interpolation(
             mm_train, raw_train, self.lipids, self.volume_dir,
             w=w, euclid_repo=args.get("euclid_repo"),
             n_jobs=int(args.get("euclid_jobs", 1)),
+            reference_file=args.get("euclid_reference"),
+            annotation_file=args.get("euclid_annotation"),
         )
         _phase(f"phase 2/5 interpolation done: {len(self.volumes)} volumes")
 
@@ -1461,7 +1481,8 @@ def main():
         # need the frames fit() cannot recover from its standardized inputs.
         if hasattr(model, "set_fit_context"):
             model.set_fit_context(coord_mean, coord_std, col_means, col_stds,
-                                  config.log_transform, config.selected_lipids_names)
+                                  config.log_transform, config.selected_lipids_names,
+                                  config.exp_path)
 
         y_test_logged, y_test_original, coords_test, pixel_idx_test = _load_split(
             config, train=False,

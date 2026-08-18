@@ -125,6 +125,22 @@ class _Postproc:
 # Driving it
 # ---------------------------------------------------------------------------
 
+def load_grid_volume(path, kind="volume"):
+    """Load a reference/annotation volume onto EUCLID's 100um grid.
+
+    Accepts a 100um volume as-is, or subsamples a 25um one with [::4,::4,::4] --
+    the exact operation that reproduces EUCLID's shipped annotation from
+    BrainGlobe's allen_mouse_25um (verified: 1.0000 exact match).
+    """
+    a = np.load(path)
+    if a.shape[0] > 200:
+        a = np.ascontiguousarray(a[::4, ::4, ::4])
+        logging.info(f"[euclid] {kind}: {Path(path).name} subsampled 25um -> 100um {a.shape}")
+    else:
+        logging.info(f"[euclid] {kind}: {Path(path).name} {a.shape}")
+    return a
+
+
 def euclid_voxel(coords_mm: np.ndarray) -> np.ndarray:
     """EUCLID's pixel -> voxel map: `int(ccf * 10) - 1`, from
     `anatomical_interpolation`."""
@@ -202,7 +218,8 @@ def _report_donor_survival(values_raw, w, euclid_repo=None):
     return med
 
 
-def _run_one(lipid, coords_mm, values_col, w, out_dir, euclid_repo):
+def _run_one(lipid, coords_mm, values_col, w, out_dir, euclid_repo,
+             reference_file=None, annotation_file=None):
     """One lipid through EUCLID's driver. Module-level and self-contained so it
     can be shipped to a worker process (the exec'd function itself won't pickle,
     so each worker re-lifts it)."""
@@ -215,11 +232,14 @@ def _run_one(lipid, coords_mm, values_col, w, out_dir, euclid_repo):
     # just a progress bar redrawn into the log file. Same iteration, no bar.
     ns["tqdm"] = functools.partial(tqdm, disable=True)
     repo = Path(euclid_repo) if euclid_repo else DEFAULT_EUCLID_REPO
+    ref = (load_grid_volume(reference_file, "reference") if reference_file
+           else np.load(repo / "reference_image100um.npy"))
+    ann = (load_grid_volume(annotation_file, "annotation") if annotation_file
+           else np.load(repo / "annotation_image100um.npy"))
     post = _Postproc(
         _Adata(np.asarray(values_col, dtype=np.float64).reshape(-1, 1),
                pd.DataFrame(coords_mm, columns=["xccf", "yccf", "zccf"]), [lipid]),
-        np.load(repo / "reference_image100um.npy"),
-        np.load(repo / "annotation_image100um.npy"),
+        ref, ann,
     )
     ns["anatomical_interpolation"](post, [lipid], output_dir=str(out_dir), w=w)
     el = time.monotonic() - t0
@@ -229,7 +249,7 @@ def _run_one(lipid, coords_mm, values_col, w, out_dir, euclid_repo):
 
 def run_anatomical_interpolation(coords_mm, values_raw, lipid_names, out_dir,
                                  w=50, euclid_repo=None, reduce_rows=True,
-                                 n_jobs=1):
+                                 n_jobs=1, reference_file=None, annotation_file=None):
     """Run EUCLID's `anatomical_interpolation` over `lipid_names`.
 
     coords_mm : (n, 3) xccf/yccf/zccf in mm — TRAIN rows only.
@@ -243,7 +263,15 @@ def run_anatomical_interpolation(coords_mm, values_raw, lipid_names, out_dir,
     untouched either way.
     """
     repo = Path(euclid_repo) if euclid_repo else DEFAULT_EUCLID_REPO
-    shape = np.load(repo / "reference_image100um.npy").shape
+    shape = (load_grid_volume(reference_file, "reference").shape if reference_file
+             else np.load(repo / "reference_image100um.npy").shape)
+    if reference_file or annotation_file:
+        logging.warning(
+            "[euclid] NOT using EUCLID's shipped volumes: "
+            f"reference={reference_file or 'euclid'} annotation={annotation_file or 'euclid'}. "
+            "Their gate assumes the Allen 672-label LEAF annotation and their "
+            "`reference < 4` background mask assumes BrainGlobe's intensity scale."
+        )
     if reduce_rows:
         coords_mm, values_raw = _reduce_rows(coords_mm, values_raw, shape)
     values_raw = np.asarray(values_raw)
@@ -307,7 +335,7 @@ def run_anatomical_interpolation(coords_mm, values_raw, lipid_names, out_dir,
             gen = Parallel(n_jobs=n_jobs, backend="loky",
                            return_as="generator_unordered")(
                 delayed(_run_one)(lip, coords_mm, values_raw[:, j], w, out_dir,
-                                  euclid_repo)
+                                  euclid_repo, reference_file, annotation_file)
                 for j, lip in todo
             )
             for k, (lip, secs) in enumerate(gen, 1):

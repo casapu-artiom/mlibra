@@ -58,6 +58,10 @@ fi
 : "${EUCLID_REPO:=/home/casap/mlibra_git/euclid}"
 : "${EUCLID_W:=50}"
 : "${EUCLID_JOBS:=25}"
+: "${EUCLID_ATLAS:=euclid}"
+# Dir holding EUCLID's two 100um .npy volumes, if they are staged outside the
+# code checkout (e.g. on S3). Empty = read them from $EUCLID_REPO.
+: "${EUCLID_DATA_DIR:=}"
 EUCLID_ARGS=""
 if [ "$MODEL" = "euclid" ]; then
     # The EUCLID checkout is not part of this repo (it is a separate clone, and
@@ -69,6 +73,21 @@ if [ "$MODEL" = "euclid" ]; then
             echo "run_baseline: FAILED to clone EUCLID into $EUCLID_REPO" >&2; exit 1; }
     fi
     EUCLID_ARGS="--euclid-repo $EUCLID_REPO --euclid-w $EUCLID_W --euclid-jobs $EUCLID_JOBS"
+    # EUCLID_ATLAS picks which volumes drive their pipeline:
+    #   euclid -> their 100um reference/annotation (the Allen 672-label leaf
+    #             volume). Read from EUCLID_DATA_DIR if set, else the checkout.
+    #   own    -> this repo's REFERENCE_FILE + ANNOTATION_FILE, subsampled [::4].
+    case "$EUCLID_ATLAS" in
+        own)
+            EUCLID_ARGS="$EUCLID_ARGS --euclid-reference $REFERENCE_FILE --euclid-annotation $ANNOTATION_FILE"
+            ;;
+        euclid)
+            if [ -n "$EUCLID_DATA_DIR" ]; then
+                EUCLID_ARGS="$EUCLID_ARGS --euclid-reference $EUCLID_DATA_DIR/reference_image100um.npy --euclid-annotation $EUCLID_DATA_DIR/annotation_image100um.npy"
+            fi
+            ;;
+        *) echo "run_baseline: EUCLID_ATLAS must be 'euclid' or 'own' (got '$EUCLID_ATLAS')" >&2; exit 1 ;;
+    esac
     [ -n "$EUCLID_VERIFY_REDUCTION" ] && EUCLID_ARGS="$EUCLID_ARGS --euclid-verify-reduction"
 fi
 
@@ -135,8 +154,9 @@ if { [ "$MODEL" = "mlp_eigen" ] || [ "$MODEL" = "gcn_faiss" ]; } \
 fi
 
 # Only EUCLID_W changes the result, so it is the only thing in the name.
-if [ "$MODEL" = "euclid" ] && [ "$EUCLID_W" != "50" ]; then
-    EXP_NAME="$EXP_NAME-w$EUCLID_W"
+if [ "$MODEL" = "euclid" ]; then
+    [ "$EUCLID_W" != "50" ] && EXP_NAME="$EXP_NAME-w$EUCLID_W"
+    [ "$EUCLID_ATLAS" = "own" ] && EXP_NAME="$EXP_NAME-ownatlas"
 fi
 
 # ---- reconstruction lipids from the curated subset file (mirror run_manifold) ----
