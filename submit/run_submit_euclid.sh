@@ -54,11 +54,11 @@ fi
 IMAGE=${IMAGE:-artiomartiom/sdsc:maldi_manifold_all_latest}
 # One core per concurrent lipid. Their kernel is a single-threaded numba loop, so
 # extra threads per worker buy nothing -- width is what matters.
-EUCLID_JOBS=${EUCLID_JOBS:-25}
+EUCLID_JOBS=${EUCLID_JOBS:-16}
 CPU=${CPU:-$EUCLID_JOBS}
 # ~400 MB per worker (each holds its own reference/annotation/working volumes)
 # plus ~3 GB in the parent for the 173-lipid parquet. 25 workers -> ~13 GB.
-MEM=${MEM:-40G}
+MEM=${MEM:-20G}
 # CPU-only: nothing here touches CUDA. GPU=0 omits the runai gpu flags entirely
 # (a portion request of 0 is not a valid value); set GPU=0.2 to attach one anyway.
 GPU=${GPU:-0}
@@ -141,11 +141,6 @@ submit_euclid() {
         -e EUCLID_W="$w" \
         -e EUCLID_JOBS="$EUCLID_JOBS" \
         -e RENDER_VOXELS_ONLY="$RENDER_VOXELS_ONLY" \
-        -e OMP_NUM_THREADS=1 \
-        -e OPENBLAS_NUM_THREADS=1 \
-        -e MKL_NUM_THREADS=1 \
-        -e NUMEXPR_NUM_THREADS=1 \
-        -e OMP_WAIT_POLICY=passive \
         -- ./local_run/run_baseline.sh
 }
 
