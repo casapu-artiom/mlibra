@@ -286,6 +286,21 @@ def run_anatomical_interpolation(coords_mm, values_raw, lipid_names, out_dir,
 
     todo = [(j, lip) for j, lip in enumerate(lipid_names)
             if not (out_dir / f"{lip}_interpolation_log.npy").exists()]
+
+    # Resolve the worker count. Nothing auto-detects unless asked: n_jobs <= 0
+    # means "use every core we are actually allowed", via joblib.cpu_count(),
+    # which honours cgroup quotas and CPU affinity -- so a pod that was granted
+    # fewer cores than requested cannot end up oversubscribed. Also clamp to the
+    # work available: spawning 25 processes for 5 lipids just wastes ~400 MB each.
+    if n_jobs <= 0:
+        from joblib import cpu_count
+        detected = cpu_count()
+        n_jobs = max(1, min(detected, len(todo) or 1))
+        logging.info(f"[euclid] n_jobs=auto -> {n_jobs} "
+                     f"(joblib.cpu_count()={detected}, {len(todo)} lipids to run)")
+    elif todo and n_jobs > len(todo):
+        logging.info(f"[euclid] n_jobs={n_jobs} capped to {len(todo)} (lipids to run)")
+        n_jobs = len(todo)
     if len(todo) < len(lipid_names):
         logging.info(f"[euclid] {len(lipid_names) - len(todo)} volume(s) already on "
                      f"disk in {out_dir}; recomputing {len(todo)}")

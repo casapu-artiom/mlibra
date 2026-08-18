@@ -58,7 +58,7 @@ EUCLID_JOBS=${EUCLID_JOBS:-16}
 CPU=${CPU:-$EUCLID_JOBS}
 # ~400 MB per worker (each holds its own reference/annotation/working volumes)
 # plus ~3 GB in the parent for the 173-lipid parquet. 25 workers -> ~13 GB.
-MEM=${MEM:-20G}
+MEM=${MEM:-40G}
 # CPU-only: nothing here touches CUDA. GPU=0 omits the runai gpu flags entirely
 # (a portion request of 0 is not a valid value); set GPU=0.2 to attach one anyway.
 GPU=${GPU:-0}
@@ -169,10 +169,16 @@ done
 
 echo
 echo "Submitted $n_submitted jobs. Suffix: $EXP_SUFFIX  Output: $S3_OUTPUT_DIR"
+# Wall clock = ceil(n_lipids / EUCLID_JOBS) waves x seconds-per-lipid. The
+# per-lipid cost depends on how permissive the gate is: measured 242 s on
+# EUCLID's 672-label leaf annotation vs 527 s on level_15annot, whose root label
+# alone covers 57% of tissue (coarser atlas -> fewer candidates rejected -> more
+# accumulation). Computed rather than hard-coded so it tracks EUCLID_JOBS.
+est() { awk -v n=173 -v j="$EUCLID_JOBS" -v s="$1" 'BEGIN{printf "%.0f", ((int((n+j-1)/j))*s)/60}'; }
 echo "Each job: interpolation (173 lipids / $EUCLID_JOBS procs) + reconstruction."
-echo "  atlas=euclid ~30 min/job   (leaf gate: ~1.6% of the donor sphere passes,"
+echo "  atlas=euclid ~$(est 242) min/job   (leaf gate: ~1.6% of the donor sphere passes,"
 echo "                              so most candidates are rejected cheaply)"
-echo "  atlas=own    ~60 min/job   (level_15annot's root label covers 57% of tissue,"
+echo "  atlas=own    ~$(est 527) min/job   (level_15annot's root label covers 57% of tissue,"
 echo "                              so far more donors pass and get accumulated)"
 echo "Run dirs: <FOLD>-BASELINES-EUCLID-256[-w<W>]-<atlas>10   (all 32 distinct)"
 echo "            -w0                            intensity filter off (fair corr arm)"

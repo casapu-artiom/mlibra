@@ -210,7 +210,10 @@ def parse_args():
                              "root label alone covers 57%% of tissue.")
     parser.add_argument("--euclid-jobs", dest="euclid_jobs", type=int, default=1,
                         help="Processes to fan EUCLID's per-lipid kernel across "
-                             "(~242 s/lipid single-threaded; 173 lipids = 11.6 h at 1).")
+                             "(~242 s/lipid single-threaded; 173 lipids = 11.6 h at 1). "
+                             "0 or negative = auto: joblib.cpu_count(), which "
+                             "respects cgroup quotas and CPU affinity. Always "
+                             "capped at the number of lipids left to run.")
     parser.add_argument("--euclid-verify-reduction", dest="euclid_verify_reduction",
                         action="store_true",
                         help="Check the per-voxel row reduction against EUCLID's "
