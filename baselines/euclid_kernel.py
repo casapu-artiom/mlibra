@@ -284,8 +284,33 @@ def run_anatomical_interpolation(coords_mm, values_raw, lipid_names, out_dir,
 
     _report_donor_survival(values_raw, w, euclid_repo)
 
+    # Resume: a lipid is done only if its volume is on disk AND readable. A job
+    # killed mid-`np.save` (OOM, preemption) leaves a truncated .npy, and a bare
+    # .exists() would skip it -- the run would then recompute every OTHER lipid
+    # and only blow up at the collection step below. Validate the header instead;
+    # mmap_mode reads it without pulling 9.6 MB per file off S3.
+    done, broken = [], []
+    for j, lip in enumerate(lipid_names):
+        f = out_dir / f"{lip}_interpolation_log.npy"
+        if not f.exists():
+            continue
+        try:
+            np.load(f, mmap_mode="r")
+            done.append(lip)
+        except Exception as e:
+            broken.append((lip, type(e).__name__))
+            f.unlink()
+    if broken:
+        logging.warning(
+            f"[euclid] {len(broken)} volume(s) were truncated/unreadable and have "
+            f"been deleted for recompute (likely a killed job): "
+            f"{[b[0] for b in broken][:5]}"
+        )
     todo = [(j, lip) for j, lip in enumerate(lipid_names)
             if not (out_dir / f"{lip}_interpolation_log.npy").exists()]
+    if done:
+        logging.info(f"[euclid] resuming: {len(done)} volume(s) already complete in "
+                     f"{out_dir}; {len(todo)} to run")
 
     # Resolve the worker count. Nothing auto-detects unless asked: n_jobs <= 0
     # means "use every core we are actually allowed", via joblib.cpu_count(),
