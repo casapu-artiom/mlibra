@@ -93,7 +93,7 @@ W_LIST=(${W_LIST:-0 50})
 #   global -> one constant making log(x) > 0. Reaches their assumed scale but
 #             moves the data off the 0 their `reference < 4` sentinel sits on,
 #             so it changes the w=0 arm too and makes w=50 fully inert.
-NORM_LIST=(${NORM_LIST:-none})
+NORM_LIST=(${NORM_LIST:-none max})
 FOLDS_LIST=(${FOLDS_LIST:-fold-1 fold-2 fold-3 fold-4 fold-5 fold-6 fold-7 fold-8})
 
 # --- Reconstruction ---------------------------------------------------------
