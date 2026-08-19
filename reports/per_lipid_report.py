@@ -104,6 +104,17 @@ FULL_LGP_METRIC_MAP = {"r2": "test_r2", "corr": "test_corr"}
 # so for those the kernel_family column instead carries a human-readable
 # description of the model itself, keyed off the lgp_report family label.
 _FULL_LGP_DESC = {
+    # EUCLID's anatomical_interpolation (their code, run unmodified). The family
+    # carries the two settings that change the estimator: `w` (their 0-255
+    # intensity threshold) and which atlas drives the structure gate.
+    "baseline-euclid-w0-euclidatlas":
+        "EUCLID anatomical_interpolation, intensity filter off, their 672-label leaf gate",
+    "baseline-euclid-w50-euclidatlas":
+        "EUCLID anatomical_interpolation, their w=50 render filter, their leaf gate",
+    "baseline-euclid-w0-level_15annot":
+        "EUCLID anatomical_interpolation, filter off, level_15 gate (root = 57% of tissue)",
+    "baseline-euclid-w50-level_15annot":
+        "EUCLID anatomical_interpolation, w=50, level_15 gate (root = 57% of tissue)",
     "lgp": "whole-brain Euclidean (Matern) latent GP",
     "manifold": "whole-brain Riemann manifold latent GP (inducing-point)",
     "spectral": "whole-brain Riemann manifold latent GP (spectral / weight-space eigenbasis)",

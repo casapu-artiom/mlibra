@@ -165,6 +165,32 @@ def derive_family(run_dir: Path, args: dict | None) -> str:
             tag += "-bottleneck"
         if model:
             tag += f"-{model}"
+        if model == "euclid":
+            # The EUCLID arms are not variants of one model: `w` is a threshold on
+            # their 0-255 rescale (their default 50 keeps 7.6% of donors and
+            # scores ~0.19 held-out; 0 keeps 90% and scores ~0.54), and the atlas
+            # decides whether the structure gate bites at all (their 672-label
+            # leaf volume vs level_15annot, whose root label alone covers 57% of
+            # tissue). Pooling them would average unrelated methods into one row,
+            # so split the family like gplfr splits on base_gp.
+            w = (args or {}).get("euclid_w")
+            if w is not None:
+                tag += f"-w{int(w) if float(w).is_integer() else w}"
+            elif "-W0" in name:
+                tag += "-w0"
+            ann = (args or {}).get("euclid_annotation")
+            stem = Path(ann).stem if ann else ""
+            if stem:
+                # EUCLID's shipped volume is annotation_image100um.npy; anything
+                # else is one of ours, named by its file stem.
+                tag += ("-euclidatlas" if stem.startswith("annotation_image")
+                        else f"-{stem}")
+            elif "OWNATLAS" in name:
+                # Pre-EUCLID_ATLAS runs recorded no atlas path, only the old
+                # -ownatlas tag; do not mislabel those as the leaf volume.
+                tag += "-ownatlas"
+            else:
+                tag += "-euclidatlas"
         return tag + parcel
     if "GPLFR" in name:
         # Split by the latent-GP kernel (euclidean / riemann / spectral) so the
