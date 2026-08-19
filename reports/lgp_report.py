@@ -178,6 +178,17 @@ def derive_family(run_dir: Path, args: dict | None) -> str:
                 tag += f"-w{int(w) if float(w).is_integer() else w}"
             elif "-W0" in name:
                 tag += "-w0"
+            # The prescale changes which donors survive `w`, so it is a
+            # different estimator, not a variant: pool it with `none` and the
+            # w=50 collapse (25% of lipids return a constant) averages into the
+            # arms where it does not happen.
+            nz = (args or {}).get("euclid_normalize")
+            if nz and nz != "none":
+                tag += f"-norm{nz}"
+            elif not nz and "-NORM" in name.upper():
+                # Runs whose args predate the knob record nothing; fall back to
+                # the dir name so they are not mislabelled as unnormalized.
+                tag += "-norm" + name.upper().split("-NORM", 1)[1].split("-")[0].lower()
             ann = (args or {}).get("euclid_annotation")
             stem = Path(ann).stem if ann else ""
             if stem:

@@ -49,6 +49,7 @@ import logging
 import os
 import textwrap
 import time
+import warnings
 from collections import defaultdict
 from pathlib import Path
 
@@ -187,6 +188,75 @@ def _reduce_rows(coords_mm, values_raw, shape):
     ccf = (np.stack([vx, vy, vz], 1) + 1.5) / 10.0
     logging.info(f"[euclid] {len(values_raw):,} pixels -> {uniq.size:,} voxel rows")
     return ccf, reduced
+
+
+def prescale_intensities(values_raw, mode="none"):
+    """Put raw intensities on the scale `normalize_to_255` was written for.
+
+    Their rescale masks NaN + the bottom decile to a literal 0, then maps the
+    array onto 0-255 with `(a - a.min()) * 255 / (a.max() - a.min())`. On uMAIA
+    data `log(x) > 0`, so that 0 is the array MINIMUM and the data reaches 255.
+    Our intensities are ~1e-4, every `log(x)` is negative, and the 0 becomes the
+    array MAXIMUM instead -- the data is squeezed into `[0, 255*(1 - Lmax/Lp10)]`,
+    a per-lipid ceiling measured at 27-155 on fold 5. `w` is an absolute cutoff
+    on that scale, so a single `w=50` deletes 16-100% of the donors depending on
+    which lipid it lands on.
+
+    Modes
+    -----
+    none    Ship the intensities as they are (the historical behaviour).
+    max     Divide each lipid by its own TRAIN max so its largest intensity sits
+            just under 1. `log` stays negative, so the 0-fill is still the array
+            max and the data floor -- and with it their `reference < 4` sentinel,
+            which is also a literal 0 -- stays exactly where it is. Every lipid
+            now reaches 255, so `w` means the same thing for all of them.
+            At `w=0` this is a no-op by construction: the 255-space tensor is
+            multiplied by one positive per-lipid constant, their interpolation
+            and box-fill are both linear and homogeneous, and EuclidBaseline's
+            per-lipid affine absorbs the constant. Metrics are unchanged.
+    global  One constant across all lipids, large enough that `log(x) > 0`.
+            This does reach their assumed scale, but it moves the data OFF the
+            0 the sentinel sits on: the floor lands at 189-245 while the signal
+            spread is only 10-66, so background donors become far more extreme
+            than they are today and `w=50` goes fully inert (100% survival).
+            It therefore changes the `w=0` arm as well. Offered for comparison,
+            not recommended as the default.
+
+    Returns (values, scale) with `scale` the per-lipid multiplier actually
+    applied, so callers can log it. Fitted on the rows handed in -- pass TRAIN
+    only.
+    """
+    v = np.asarray(values_raw)
+    p = v.shape[1]
+    if mode == "none":
+        return v, np.ones(p, dtype=np.float64)
+    if mode == "max":
+        # np.errstate does not cover nanmax's all-NaN RuntimeWarning, and a lipid
+        # that is entirely zero hits exactly that -- warn about it ourselves,
+        # below, instead of letting numpy print it once per worker.
+        pos = np.where(np.isfinite(v) & (v > 0), v, np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mx = np.nanmax(pos, axis=0)
+        # A lipid that is entirely zero/NaN has no scale to fit; leave it alone
+        # rather than emitting inf and poisoning their np.log.
+        bad = ~np.isfinite(mx) | (mx <= 0)
+        scale = np.where(bad, 1.0, (1.0 - 1e-6) / np.where(bad, 1.0, mx))
+        if bad.any():
+            logging.warning(f"[euclid] prescale=max: {int(bad.sum())} lipid(s) have no "
+                            f"positive intensity and were left unscaled")
+    elif mode == "global":
+        pos = v[np.isfinite(v) & (v > 0)]
+        if pos.size == 0:
+            raise ValueError("prescale=global: no positive intensities to scale from")
+        scale = np.full(p, float(np.exp(1.0) / pos.min()), dtype=np.float64)
+    else:
+        raise ValueError(f"unknown euclid_normalize mode {mode!r} "
+                         "(expected none / max / global)")
+    logging.info(f"[euclid] prescale={mode}: per-lipid multiplier "
+                 f"median {np.median(scale):.4g} "
+                 f"(min {scale.min():.4g}, max {scale.max():.4g})")
+    return v * scale, scale
 
 
 def _report_donor_survival(values_raw, w, euclid_repo=None):
@@ -366,7 +436,7 @@ def run_anatomical_interpolation(coords_mm, values_raw, lipid_names, out_dir,
         if n_jobs == 1:
             for k, (j, lip) in enumerate(todo, 1):
                 _, secs = _run_one(lip, coords_mm, values_raw[:, j], w, out_dir,
-                                   euclid_repo)
+                                   euclid_repo, reference_file, annotation_file)
                 _progress(k, lip, secs)
         else:
             from joblib import Parallel, delayed

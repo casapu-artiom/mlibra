@@ -67,7 +67,7 @@ if [ "$GPU" != "0" ]; then
     GPU_ARGS=(--gpu-request-type portion --gpu-portion-request "$GPU")
 fi
 
-# --- Sweep: atlas x fold x w  (2 x 8 x 2 = 32 jobs) -------------------------
+# --- Sweep: atlas x fold x w x norm  (2 x 8 x 2 x 1 = 32 jobs by default) ---
 # ATLAS_LIST picks which volumes drive their pipeline:
 #   euclid -> the two 100um .npy from the EUCLID repo, staged at EUCLID_DATA_DIR.
 #             Their annotation IS the Allen 672-label leaf volume (verified
@@ -79,6 +79,21 @@ fi
 #             is close to an ungated Shepard smoother, by construction.
 ATLAS_LIST=(${ATLAS_LIST:-euclid own})
 W_LIST=(${W_LIST:-0 50})
+# NORM_LIST picks the intensity scale their normalize_to_255 sees:
+#   none   -> as-is. Our intensities are ~1e-4 so every log(x) is negative, the
+#             NaN-fill 0 becomes the array MAX, and the rescale tops out at
+#             27-155 instead of 255 (per lipid). w=50 then deletes 16-100% of
+#             the donors depending on the lipid: ~25% of lipids come back a flat
+#             constant and 85/173 score bit-identically across two different
+#             atlases, i.e. the structure gate has nothing left to gate.
+#   max    -> per-lipid divide by the TRAIN max, so each lipid reaches 255 and w
+#             means one thing for all of them. At w=0 this is a no-op by
+#             construction (a positive per-lipid multiplier, which the harness's
+#             per-lipid affine absorbs), so pairing it with w=0 is the control.
+#   global -> one constant making log(x) > 0. Reaches their assumed scale but
+#             moves the data off the 0 their `reference < 4` sentinel sits on,
+#             so it changes the w=0 arm too and makes w=50 fully inert.
+NORM_LIST=(${NORM_LIST:-none})
 FOLDS_LIST=(${FOLDS_LIST:-fold-1 fold-2 fold-3 fold-4 fold-5 fold-6 fold-7 fold-8})
 
 # --- Reconstruction ---------------------------------------------------------
@@ -114,9 +129,9 @@ EXP_SUFFIX=${EXP_SUFFIX:-$(date +'%y%m%d-%H-%M')}
 
 n_submitted=0
 submit_euclid() {
-    local job_name=$1 fold_upper=$2 slices=$3 w=$4 atlas=$5
+    local job_name=$1 fold_upper=$2 slices=$3 w=$4 atlas=$5 norm=$6
     n_submitted=$((n_submitted + 1))
-    echo ">>> [$n_submitted] $job_name  (fold=$fold_upper atlas=$atlas w=$w jobs=$EUCLID_JOBS)"
+    echo ">>> [$n_submitted] $job_name  (fold=$fold_upper atlas=$atlas w=$w norm=$norm jobs=$EUCLID_JOBS)"
     run_or_echo runai training submit "$job_name" \
         -i "$IMAGE" \
         --cpu-core-limit "$CPU" --cpu-core-request "$CPU" \
@@ -139,6 +154,7 @@ submit_euclid() {
         -e SRC_PATH="$SRC_PATH" \
         -e EUCLID_REPO="$EUCLID_REPO" \
         -e EUCLID_W="$w" \
+        -e EUCLID_NORM="$norm" \
         -e EUCLID_JOBS="$EUCLID_JOBS" \
         -e RENDER_VOXELS_ONLY="$RENDER_VOXELS_ONLY" \
         -- ./local_run/run_baseline.sh
@@ -149,6 +165,7 @@ echo "output  : $S3_OUTPUT_DIR"
 echo "folds   : ${FOLDS_LIST[*]}"
 echo "atlas   : ${ATLAS_LIST[*]}   (euclid=${S3_EUCLID_DATA_DIR}, own=${S3_ANNOTATION_FILE})"
 echo "w       : ${W_LIST[*]}"
+echo "norm    : ${NORM_LIST[*]}"
 echo "workers : $EUCLID_JOBS (cpu=$CPU mem=$MEM gpu=$GPU)"
 echo "renders : $RECON_LIPIDS_FILE  (render_voxels_only=$RENDER_VOXELS_ONLY)"
 echo "euclid  : $EUCLID_REPO (cloned on the pod if absent)"
@@ -160,9 +177,12 @@ for FOLD in "${FOLDS_LIST[@]}"; do
     fold_slug="${FOLD//fold-/f}"
     for atlas in "${ATLAS_LIST[@]}"; do
         for w in "${W_LIST[@]}"; do
-            # runai job names must be lowercase and DNS-safe.
-            submit_euclid "euclid-${atlas}-w${w}-${fold_slug}-${EXP_SUFFIX}" \
-                          "$FOLD_UPPER" "$SLICES_DATASET_FILE" "$w" "$atlas"
+            for norm in "${NORM_LIST[@]}"; do
+                # runai job names must be lowercase and DNS-safe.
+                nslug=""; [ "$norm" != "none" ] && nslug="-n${norm}"
+                submit_euclid "euclid-${atlas}-w${w}${nslug}-${fold_slug}-${EXP_SUFFIX}" \
+                              "$FOLD_UPPER" "$SLICES_DATASET_FILE" "$w" "$atlas" "$norm"
+            done
         done
     done
 done
@@ -180,7 +200,7 @@ echo "  atlas=euclid ~$(est 242) min/job   (leaf gate: ~1.6% of the donor sphere
 echo "                              so most candidates are rejected cheaply)"
 echo "  atlas=own    ~$(est 527) min/job   (level_15annot's root label covers 57% of tissue,"
 echo "                              so far more donors pass and get accumulated)"
-echo "Run dirs: <FOLD>-BASELINES-EUCLID-256[-w<W>]-<atlas>10   (all 32 distinct)"
+echo "Run dirs: <FOLD>-BASELINES-EUCLID-256[-w<W>][-norm<NORM>]-<atlas>10   (all distinct)"
 echo "            -w0                            intensity filter off (fair corr arm)"
 echo "            (no -w)                        w=50, EUCLID's default"
 echo "            -euclidatlas                   their 672-label leaf volumes"

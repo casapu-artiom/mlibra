@@ -59,6 +59,10 @@ fi
 : "${EUCLID_W:=50}"
 : "${EUCLID_JOBS:=25}"
 : "${EUCLID_ATLAS:=euclid}"
+# Intensity scale handed to their normalize_to_255. none = as-is (historical);
+# max = per-lipid divide by the TRAIN max so every lipid reaches 255 and W means
+# one thing; global = one constant making log(x) > 0. See --euclid-normalize.
+: "${EUCLID_NORM:=none}"
 # Dir holding EUCLID's two 100um .npy volumes, if they are staged outside the
 # code checkout (e.g. on S3). Empty = read them from $EUCLID_REPO.
 : "${EUCLID_DATA_DIR:=}"
@@ -72,7 +76,7 @@ if [ "$MODEL" = "euclid" ]; then
         git clone --depth 1 https://github.com/lamanno-epfl/EUCLID.git "$EUCLID_REPO" || {
             echo "run_baseline: FAILED to clone EUCLID into $EUCLID_REPO" >&2; exit 1; }
     fi
-    EUCLID_ARGS="--euclid-repo $EUCLID_REPO --euclid-w $EUCLID_W --euclid-jobs $EUCLID_JOBS"
+    EUCLID_ARGS="--euclid-repo $EUCLID_REPO --euclid-w $EUCLID_W --euclid-jobs $EUCLID_JOBS --euclid-normalize $EUCLID_NORM"
     # EUCLID_ATLAS picks which volumes drive their pipeline:
     #   euclid -> their 100um reference/annotation (the Allen 672-label leaf
     #             volume). Read from EUCLID_DATA_DIR if set, else the checkout.
@@ -154,13 +158,15 @@ if { [ "$MODEL" = "mlp_eigen" ] || [ "$MODEL" = "gcn_faiss" ]; } \
 fi
 
 # Every input that changes an EUCLID result goes in the name, so no two configs
-# can share a dir: the w threshold, and BOTH volumes (the annotation is the
+# can share a dir: the w threshold, the intensity prescale, and BOTH volumes
+# (the annotation is the
 # structure gate, the reference is the `reference < 4` background mask). The
 # atlas is named by its file stems rather than a mode word, so swapping
 # level_15annot for ccf_depth7annot also lands somewhere new. EUCLID_JOBS and
 # RENDER_VOXELS_ONLY are deliberately absent: neither changes a prediction.
 if [ "$MODEL" = "euclid" ]; then
     [ "$EUCLID_W" != "50" ] && EXP_NAME="$EXP_NAME-w$EUCLID_W"
+    [ "$EUCLID_NORM" != "none" ] && EXP_NAME="$EXP_NAME-norm$EUCLID_NORM"
     if [ "$EUCLID_ATLAS" = "own" ]; then
         EXP_NAME="$EXP_NAME-$(basename "$ANNOTATION_FILE" .npy)-$(basename "$REFERENCE_FILE" .npy)"
     else

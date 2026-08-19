@@ -208,6 +208,20 @@ def parse_args():
                              "--euclid-repo (the Allen 672-label leaf volume). "
                              "A coarser atlas weakens the gate: level_15annot's "
                              "root label alone covers 57%% of tissue.")
+    parser.add_argument("--euclid-normalize", dest="euclid_normalize", type=str,
+                        default="none", choices=["none", "max", "global"],
+                        help="Rescale intensities before handing them to EUCLID. "
+                             "Their normalize_to_255 assumes log(x) > 0 (uMAIA "
+                             "scale); ours are ~1e-4, so the rescale tops out at "
+                             "27-155 instead of 255 and --euclid-w 50 deletes "
+                             "16-100%% of the donors depending on the lipid. "
+                             "none = ship as-is. max = divide each lipid by its "
+                             "TRAIN max so every lipid reaches 255 and `w` means "
+                             "one thing (a no-op at w=0 by construction). "
+                             "global = one constant making log(x) > 0; reaches "
+                             "their scale but moves the data off the 0 their "
+                             "`reference < 4` sentinel sits on, so it changes the "
+                             "w=0 arm too. Fitted on TRAIN only.")
     parser.add_argument("--euclid-jobs", dest="euclid_jobs", type=int, default=1,
                         help="Processes to fan EUCLID's per-lipid kernel across "
                              "(~242 s/lipid single-threaded; 173 lipids = 11.6 h at 1). "
@@ -961,6 +975,7 @@ class EuclidBaseline:
         self.volume_dir = None
         self.exp_path = None
         self.affine = None            # (p, 2): slope, intercept
+        self.prescale = None          # (p,): intensity multiplier handed to EUCLID
         self.coord_mean = self.coord_std = None
         self.col_means = self.col_stds = None
         self.log_transform = True
@@ -995,7 +1010,7 @@ class EuclidBaseline:
     # -- fit ---------------------------------------------------------------
     def fit(self, coords_train, y_train, coords_test, y_test, args):
         from euclid_kernel import (run_anatomical_interpolation, sample_volumes,
-                                   verify_row_reduction)
+                                   prescale_intensities, verify_row_reduction)
         if self.coord_mean is None:
             raise RuntimeError("main() must call set_fit_context() before fit()")
 
@@ -1006,9 +1021,14 @@ class EuclidBaseline:
         mm_train, mm_test = self._mm(coords_train), self._mm(coords_test)
         raw_train = self._raw(y_train)
         w = float(args.get("euclid_w", 50))
+        # TRAIN-only, so the held-out rows cannot inform the scale. The per-lipid
+        # affine below undoes whatever multiplier this applies, which is why
+        # `max` leaves the w=0 metrics untouched -- see prescale_intensities.
+        norm = str(args.get("euclid_normalize", "none"))
+        raw_train, self.prescale = prescale_intensities(raw_train, norm)
         self.volume_dir = self.exp_path / "euclid_volumes"
         _phase(f"phase 1/5 inputs ready: {len(mm_train):,} train / {len(mm_test):,} "
-               f"test pixels, {len(self.lipids)} lipids, w={w}, "
+               f"test pixels, {len(self.lipids)} lipids, w={w}, normalize={norm}, "
                f"volumes -> {self.volume_dir}")
 
         if args.get("euclid_verify_reduction"):
@@ -1083,13 +1103,15 @@ class EuclidBaseline:
         # The volumes are already on disk where EUCLID wrote them (~10 MB each);
         # store the pointer, not a second copy.
         torch.save({"volume_dir": str(self.volume_dir), "lipids": self.lipids,
-                    "affine": self.affine, "coord_mean": self.coord_mean,
+                    "affine": self.affine, "prescale": self.prescale,
+                    "coord_mean": self.coord_mean,
                     "coord_std": self.coord_std}, path)
 
     def load(self, path, p, args):
         d = torch.load(path, map_location="cpu", weights_only=False)
         self.volume_dir = Path(d["volume_dir"])
         self.lipids, self.affine = d["lipids"], d["affine"]
+        self.prescale = d.get("prescale")   # absent in pre-knob checkpoints
         self.coord_mean, self.coord_std = d["coord_mean"], d["coord_std"]
         self.volumes = {lip: np.load(self.volume_dir / f"{lip}_interpolation_log.npy")
                         for lip in self.lipids}
