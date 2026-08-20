@@ -50,6 +50,7 @@
 13. [Testing](#13-testing)
 14. [Infrastructure & Deployment](#14-infrastructure--deployment)
 15. [Dependencies](#15-dependencies)
+16. [The EUCLID Baseline](#16-the-euclid-baseline)
 
 ---
 
@@ -144,6 +145,17 @@ mlibra/
 │   ├── slepc/, docker/          # MPI eigensolver; training/notebook images
 │   ├── benchmarks/, visualizations/, notebooks/, toy_example/
 │   └── README.md                # Full documentation for this module
+│
+├── baselines/                   # Non-GP baselines, same I/O contract as the GP runs
+│   ├── experiment_baselines.py  # mean / linear / xgboost / mlp / mlp_eigen / gcn / euclid
+│   └── euclid_kernel.py         # Runs EUCLID's anatomical_interpolation unmodified
+│
+├── sota/                        # Published 3-D reconstruction comparisons (NTF, Spa3D, ...)
+├── reports/                     # CV aggregation (lgp_report.py) + figures + notebooks
+│
+├── euclid/                      # Clone of github.com/lamanno-epfl/EUCLID (untracked)
+│                                #   supplies the source that euclid_kernel.py executes,
+│                                #   plus its 100 um reference/annotation volumes
 │
 ├── local_run/                   # In-container worker scripts (env -> CLI -> python)
 ├── submit/                      # RunAI submission sweeps + pod helpers
@@ -1234,6 +1246,71 @@ All training metrics are logged to **Weights & Biases** (`wandb`). The following
 | `torch_geometric` | Graph neural network utilities (potential future extension) |
 | `napari` + `napari-animation` | Interactive 3-D brain volume viewer and rotation video export |
 | `allensdk` | Allen Mouse Brain Atlas CCF template volume download |
+
+---
+
+## 16. The EUCLID Baseline
+
+[EUCLID](https://github.com/lamanno-epfl/EUCLID) is the Lipid Brain Atlas
+pipeline. Its `anatomical_interpolation`
+routine reconstructs a lipid's whole-brain volume, which makes it the closest
+published comparison to the models here — so it is wired in as
+`--model euclid` in `baselines/experiment_baselines.py`.
+
+**Nothing about the estimator is reimplemented.** `baselines/euclid_kernel.py`
+extracts three functions from a clone of their repo and executes them as
+written:
+
+| Function | Role |
+|---|---|
+| `anatomical_interpolation` | driver: log → per-voxel mean → rescale → `w` clip → interpolate → box fill |
+| `fill_array_interpolation` | the kernel: structure-gated `exp(-d)` weighted mean |
+| `normalize_to_255` | their per-lipid intensity rescale |
+
+We supply only an AnnData-shaped object for their driver to read and a sampler
+that reads the resulting volumes at held-out pixels. The clone is fetched
+automatically by `local_run/run_baseline.sh` if `$EUCLID_REPO` is absent.
+
+### What the method is
+
+For each 100 µm voxel, a weighted mean of the *measured* voxels within 26 voxels
+(2.6 mm) that carry the **same Allen leaf label**, weighted `exp(-d)` with `d` in
+voxel units; leftover holes take a 10³ box mean. There is nothing to train — no
+fitted lengthscale, no uncertainty. It is a fixed linear smoother whose sparsity
+pattern is set by the atlas.
+
+### Running it
+
+```bash
+# locally, one fold
+MODEL=euclid EUCLID_W=0 EUCLID_JOBS=16 \
+    EXP_PREFIX=FOLD-2 SLICES_DATASET_FILE=maldi/data/splits/fold_2.json \
+    sh local_run/run_baseline.sh --reconstruct whole_brain
+
+# the cluster sweep: atlas x fold x w x normalisation
+./submit/run_submit_euclid.sh                 # DRY_RUN=1 to preview
+```
+
+Their kernel is a single-threaded numba loop costing ~242 s per lipid, so
+`EUCLID_JOBS` (one process per lipid) is the only speed lever; 173 lipids take
+~11.6 h serially and ~30 min at 25-way. Completed per-lipid volumes are written
+to `<run>/euclid_volumes/` and are **resumable** — a re-run skips lipids whose
+volume already exists, and truncated files (from a killed job) are detected and
+recomputed.
+
+### Two caveats that matter for interpretation
+
+**Their `w` default is a rendering threshold, not a modelling one.** `w=50`
+drops voxels below that value on their 0–255 rescale; it is calibrated for
+uMAIA-normalised intensities. At this dataset's scale every `log(x)` is
+negative, the rescale never reaches 255, and `w=50` removes ~92 % of donor
+voxels. Use `EUCLID_W=0` for a like-for-like comparison.
+
+**`anatomical_interpolation` is not the paper's imputation claim.** In EUCLID it
+feeds the 3-D rendering code; their imputation of failed acquisitions is
+`xgboost_feature_restoration`, which is cross-lipid (predict a lipid from the
+other lipids at the same pixel), not spatial. Describe the comparison as against
+EUCLID's *anatomical interpolation*, not against "EUCLID's imputation".
 
 ---
 
