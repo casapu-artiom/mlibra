@@ -58,8 +58,9 @@ the result is identical to a full run.
 Provenance: originally a throwaway written into a session scratchpad on
 2026-07-26 and never saved; the PNGs in this directory came from it. Restored
 here so the figures can be reproduced -- appearance is unchanged from those
-originals (verified pixel-identical). EUCLID is absent from GROUPS because it
-postdates them; add it with --models once its runs are staged.
+originals (verified pixel-identical). EUCLID has since been added to the
+`baselines` group, so combined_baselines.png gains a row relative to the
+committed PNG; pass --models to reproduce the original six-row version.
 """
 
 from __future__ import annotations
@@ -89,7 +90,8 @@ ZF, XF = 0.55, 0.55
 
 GROUPS = {
     "baselines": [("mean", "Mean"), ("linear", "Linear"), ("xgboost", "XGBoost"),
-                  ("mlp", "MLP"), ("mlp_eigen", "MLP-eigen"), ("gcn", "GCN")],
+                  ("mlp", "MLP"), ("mlp_eigen", "MLP-eigen"), ("gcn", "GCN"),
+                  ("euclid", "EUCLID")],
     "sota": [("ntf", "NTF"), ("spa3d", "Spa3D"), ("deepspatial", "DeepSpatial"),
              ("gplfr", "GPLFR")],
     "gps": [("lgp", "Euclidean GP"), ("manifold", "Manifold GP"),
